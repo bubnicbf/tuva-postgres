@@ -15,6 +15,7 @@ export PGOPTIONS="--search_path=${PG_SCHEMA},public"
 declare -a tables=(
   "practitioner"
   "patient"
+  "encounter"
 )
 
 # Use \copy so the CSV can be read by the client (no server-side paths needed)

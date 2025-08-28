@@ -5,3 +5,4 @@ TODO:
 - Column mapping catalog: a docs/mapping.md that pins Tuva CSV column → table.column mapping for maintainability
 - add a compact summary view that collects all test results into a single table (for CI parsing), or wire a GitHub Actions job that brings up a Postgres service and runs make create-db load test
 - add the same NPI validator as a check on encounter.attending_provider_id → practitioner.npi join (for data hygiene)
+- add a matrix to test Postgres 14/15/16 to CI YAML

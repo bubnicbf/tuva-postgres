@@ -67,13 +67,13 @@ WHERE ABS(duration - mins_calc) > 1.0;
 -- 10) terminology: appointment type (source & normalized) must exist when present
 SELECT 'appt_source_type_known' AS test, COUNT(*) = 0 AS pass, COUNT(*) AS unknown_code_count
 FROM appointment a
-LEFT JOIN :"terminology_schema".appointment_type_code t
+LEFT JOIN :"terminology_schema".appointment_type t
   ON a.source_appointment_type_code = t.code
 WHERE a.source_appointment_type_code IS NOT NULL AND t.code IS NULL;
 
 SELECT 'appt_normalized_type_known' AS test, COUNT(*) = 0 AS pass, COUNT(*) AS unknown_code_count
 FROM appointment a
-LEFT JOIN :"terminology_schema".appointment_type_code t
+LEFT JOIN :"terminology_schema".appointment_type t
   ON a.normalized_appointment_type_code = t.code
 WHERE a.normalized_appointment_type_code IS NOT NULL AND t.code IS NULL;
 

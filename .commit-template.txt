@@ -1,0 +1,11 @@
+<type>(<scope>): <short summary>
+
+[context]
+Why:
+What:
+How:
+
+Refs: #issue-id (optional)
+---
+Types: feat|fix|docs|chore|refactor|perf|test|build|ci
+Scopes: db|data|etl|docs|ci|deps|repo

@@ -53,16 +53,16 @@ WHERE recorded_date IS NOT NULL
 -- 9) terminology: source_code_type must exist (when present)
 SELECT 'condition_source_code_type_known' AS test, COUNT(*) = 0 AS pass, COUNT(*) AS unknown_code_type_count
 FROM condition c
-LEFT JOIN :"terminology_schema".condition_code_type t
-  ON c.source_code_type = t.code
+LEFT JOIN :"terminology_schema".code_type t
+  ON c.source_code_type = t.code_type
 WHERE c.source_code_type IS NOT NULL
   AND t.code IS NULL;
 
 -- 10) terminology: normalized_code_type must exist (when present)
 SELECT 'condition_normalized_code_type_known' AS test, COUNT(*) = 0 AS pass, COUNT(*) AS unknown_code_type_count
 FROM condition c
-LEFT JOIN :"terminology_schema".condition_code_type t
-  ON c.normalized_code_type = t.code
+LEFT JOIN :"terminology_schema".code_type t
+  ON c.normalized_code_type = t.code_type
 WHERE c.normalized_code_type IS NOT NULL
   AND t.code IS NULL;
 

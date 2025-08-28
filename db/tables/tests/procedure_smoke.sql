@@ -96,3 +96,24 @@ SELECT 'procedure_tuva_last_run_not_future' AS test, COUNT(*) = 0 AS pass, COUNT
 FROM procedure
 WHERE tuva_last_run IS NOT NULL
   AND tuva_last_run > (NOW()::timestamp without time zone);
+
+-- 13) (soft) duplicates on (person_id, procedure_date, normalized_code, data_source)
+WITH dupes AS (
+  SELECT
+    person_id,
+    procedure_date,
+    normalized_code,
+    data_source,
+    COUNT(*) AS cnt
+  FROM procedure
+  WHERE person_id IS NOT NULL
+    AND procedure_date IS NOT NULL
+    AND normalized_code IS NOT NULL
+    AND data_source IS NOT NULL
+  GROUP BY 1,2,3,4
+  HAVING COUNT(*) > 1
+)
+SELECT 'procedure_soft_dupe_person_date_normcode' AS test,
+       COUNT(*) = 0 AS pass,
+       COUNT(*) AS dup_group_count
+FROM dupes;

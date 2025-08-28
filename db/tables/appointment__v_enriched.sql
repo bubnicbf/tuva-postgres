@@ -4,11 +4,11 @@ SELECT
   a.*,
   tat.display  AS source_type_display,
   nat.display  AS normalized_type_display,
-  st.display   AS source_status_display,
-  nst.display  AS normalized_status_display,
+  -- replaced former *status_display* with booleans to avoid relying on a description
+  (st.code  IS NOT NULL) AS source_status_known,
+  (nst.code IS NOT NULL) AS normalized_status_known,
   rct.display  AS source_reason_code_type_display,
   nrct.display AS normalized_reason_code_type_display,
-  -- NEW: human-readable cancellation reasons (source & normalized)
   scr.description  AS source_cancellation_reason_description_term,
   ncr.description  AS normalized_cancellation_reason_description_term
 FROM :"schema".appointment a
@@ -24,7 +24,6 @@ LEFT JOIN :"terminology_schema".appointment_reason_code_type rct
        ON a.source_reason_code_type = rct.code
 LEFT JOIN :"terminology_schema".appointment_reason_code_type nrct
        ON a.normalized_reason_code_type = nrct.code
--- NEW joins to value set (safe if not populated yet)
 LEFT JOIN :"terminology_schema".appointment_cancellation_reason scr
        ON a.source_cancellation_reason_code = scr.code
 LEFT JOIN :"terminology_schema".appointment_cancellation_reason ncr

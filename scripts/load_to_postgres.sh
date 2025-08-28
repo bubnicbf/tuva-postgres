@@ -13,14 +13,7 @@ export PGOPTIONS="--search_path=${PG_SCHEMA},public"
 
 # Example: load standard Tuva tables (adjust names to actual Tuva seed set)
 declare -a tables=(
-  "patient"
-  "payer"
-  "provider"
-  "encounter"
-  "claim"
-  "claim_line"
-  "diagnosis"
-  "procedure"
+  "practitioner"
 )
 
 # Use \copy so the CSV can be read by the client (no server-side paths needed)

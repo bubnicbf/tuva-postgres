@@ -2,3 +2,4 @@
 export PG_DSN="postgresql://postgres:postgres@localhost:5432/tuva"
 export PG_SCHEMA="tuva"       # schema to create/use
 export DATA_DIR="data"        # where CSVs live
+export TERMINOLOGY_SCHEMA="tuva_term"  # optional; defaults to ${PG_SCHEMA}_term

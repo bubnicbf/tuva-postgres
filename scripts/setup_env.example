@@ -1,0 +1,4 @@
+# Copy to .env and fill in
+export PG_DSN="postgresql://postgres:postgres@localhost:5432/tuva"
+export PG_SCHEMA="tuva"       # schema to create/use
+export DATA_DIR="data"        # where CSVs live

@@ -1,21 +1,66 @@
-[tool.sqlfluff]
-# Parser
-dialect = "postgres"         # Target dialect
-templater = "raw"            # We pass real files through a tiny wrapper (below)
+[tool.sqlfluff.core]
+dialect = "postgres"
+templater = "jinja"
 max_line_length = 120
 
-# Output & runtime
-nocolor = true
-ignore = "templating,parsing"  # we’ll still fail on rule violations; wrapper avoids parser trips
+# Templater & indentation style for readable JOINs / ON
+[tool.sqlfluff.indentation]
+indented_joins = false
+indented_using_on = true
+template_blocks_indent = false  # keep Jinja blocks flush. :contentReference[oaicite:0]{index=0}
 
-# Rules: keep it light & conventional
+[tool.sqlfluff.templater]
+unwrap_wrapped_queries = true
+
+[tool.sqlfluff.templater.jinja]
+apply_dbt_builtins = true  # makes {{ ref() }}, {{ var() }} etc. safe if you add dbt later. :contentReference[oaicite:1]{index=1}
+
+# Global rule knobs (common conveniences)
 [tool.sqlfluff.rules]
-# Trailing commas in column lists, consistent indentation, spacing, etc.
-# (We lean on defaults; explicitly pin a couple of common preferences.)
-[tool.sqlfluff.rules.L016]
-comma_style = "trailing"
+single_table_references = "consistent"  # aligns with L028
+unquoted_identifiers_policy = "all"     # allow linting all unquoted idents. :contentReference[oaicite:2]{index=2}
 
-[tool.sqlfluff.rules.L010]
-capitalisation_policy = "upper"   # UPPERCASE keywords (matches your style)
+# Casing
+[tool.sqlfluff.rules.capitalisation.keywords]   # L010
+capitalisation_policy = "upper"                  # SELECT, FROM, etc. :contentReference[oaicite:3]{index=3}
 
-# You can tweak/extend later (e.g., identifier casing, aliasing, Jinja blocks, etc.)
+[tool.sqlfluff.rules.capitalisation.identifiers]  # L014
+extended_capitalisation_policy = "snake"          # e.g., encounter_id, tuva_last_run. :contentReference[oaicite:4]{index=4}
+
+# Line length / layout
+[tool.sqlfluff.rules.layout.long_lines] # L016
+ignore_comment_lines = true             # keep long comment lines out of the way. :contentReference[oaicite:5]{index=5}
+
+[tool.sqlfluff.rules.layout.commas]     # L019
+comma_style = "trailing"                # consistent trailing commas. :contentReference[oaicite:6]{index=6}
+
+[tool.sqlfluff.rules.layout.functions]  # L017
+# (no extra opts) enforce sum(a) not sum (a). :contentReference[oaicite:7]{index=7}
+
+[tool.sqlfluff.rules.layout.cte_bracket]  # L018
+# WITH (...) newline alignment. :contentReference[oaicite:8]{index=8}
+
+[tool.sqlfluff.rules.layout.cte_newline]  # L022
+# blank line after CTE. :contentReference[oaicite:9]{index=9}
+
+[tool.sqlfluff.rules.layout.select_modifiers]  # L041
+# SELECT DISTINCT on same line. :contentReference[oaicite:10]{index=10}
+
+[tool.sqlfluff.rules.layout.select_targets]    # L036
+wildcard_policy = "single"   # keep * usage sane. :contentReference[oaicite:11]{index=11}
+
+[tool.sqlfluff.rules.layout.set_operators]     # L065
+# UNION/EXCEPT on their own lines. :contentReference[oaicite:12]{index=12}
+
+# References & joins
+[tool.sqlfluff.rules.references.qualification]    # L027
+# qualify columns if >1 table in SELECT. :contentReference[oaicite:13]{index=13}
+
+[tool.sqlfluff.rules.references.consistent]       # L028
+single_table_references = "consistent"            # consistent qualifying in 1-table queries. :contentReference[oaicite:14]{index=14}
+
+[tool.sqlfluff.rules.references.quoting]          # L059
+prefer_quoted_identifiers = false                 # only quote when necessary. :contentReference[oaicite:15]{index=15}
+
+[tool.sqlfluff.rules.structure.subquery]          # L042
+forbid_subquery_in = "join"                       # prefer CTEs vs subqueries in JOINs. :contentReference[oaicite:16]{index=16}

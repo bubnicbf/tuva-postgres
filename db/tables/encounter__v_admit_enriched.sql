@@ -2,11 +2,12 @@
 CREATE OR REPLACE VIEW :"schema".v_encounter_admit_enriched AS
 SELECT
   e.*,
-  a.admit_source_description AS admit_source_description_term,
+  at.admit_type_description AS admit_type_description_term,
+  -- Flag if the in-row description disagrees with terminology (soft)
   CASE
-    WHEN e.admit_type_code IN ('4','04') THEN a.newborn_description
-    ELSE NULL
-  END AS admit_source_newborn_description
+    WHEN e.admit_type_description IS NULL OR at.admit_type_description IS NULL THEN FALSE
+    ELSE (e.admit_type_description <> at.admit_type_description)
+  END AS admit_type_desc_mismatch
 FROM :"schema".encounter e
-LEFT JOIN :"terminology_schema".admit_source a
-  ON e.admit_source_code = a.admit_source_code;
+LEFT JOIN :"terminology_schema".admit_type at
+  ON e.admit_type_code = at.admit_type_code;

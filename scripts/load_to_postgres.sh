@@ -14,6 +14,7 @@ export PGOPTIONS="--search_path=${PG_SCHEMA},public"
 # Example: load standard Tuva tables (adjust names to actual Tuva seed set)
 declare -a tables=(
   "practitioner"
+  "location"
   "patient"
   "encounter"
   "person_id_crosswalk"

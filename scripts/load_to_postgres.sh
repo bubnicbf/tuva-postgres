@@ -17,6 +17,7 @@ declare -a tables=(
   "patient"
   "encounter"
   "person_id_crosswalk"
+  "medical_claim"
 )
 
 # Use \copy so the CSV can be read by the client (no server-side paths needed)

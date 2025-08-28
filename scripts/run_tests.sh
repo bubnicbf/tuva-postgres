@@ -60,3 +60,10 @@ psql "$PG_DSN" -v ON_ERROR_STOP=1 -At -c "\
 
 echo "Per-suite breakdown:"
 psql "$PG_DSN" -v ON_ERROR_STOP=1 -c "SELECT * FROM ${PG_SCHEMA}.v_test_summary WHERE run_id = '${RUN_ID}' ORDER BY suite;"
+
+# Run on a nightly schedule
+on:
+  schedule:
+    - cron: "0 6 * * *"  # 06:00 UTC daily
+  push:
+  pull_request:

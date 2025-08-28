@@ -1,0 +1,22 @@
+repos:
+  - repo: https://github.com/sqlfluff/sqlfluff
+    rev: 3.0.7
+    hooks:
+      # Keep an upstream hook around for files that don't need the wrapper.
+      # We scope it narrowly to avoid double-linting.
+      - id: sqlfluff-lint
+        name: sqlfluff-lint (direct, non-psql)
+        args: [--dialect, postgres]
+        files: ^(migrations/|analysis/).+\.sql$
+        additional_dependencies: []
+
+  - repo: local
+    hooks:
+      - id: sqlfluff-psql-wrapper
+        name: sqlfluff-lint (psql-aware wrapper)
+        entry: bash scripts/sqlfluff_psql_wrapper.sh lint
+        language: system
+        pass_filenames: true
+        files: \.sql$
+        # Exclude any directories you truly don't want to lint:
+        # exclude: ^(vendor/|.venv/|target/)

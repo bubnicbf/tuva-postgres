@@ -1,0 +1,21 @@
+[tool.sqlfluff]
+# Parser
+dialect = "postgres"         # Target dialect
+templater = "raw"            # We pass real files through a tiny wrapper (below)
+max_line_length = 120
+
+# Output & runtime
+nocolor = true
+ignore = "templating,parsing"  # we’ll still fail on rule violations; wrapper avoids parser trips
+
+# Rules: keep it light & conventional
+[tool.sqlfluff.rules]
+# Trailing commas in column lists, consistent indentation, spacing, etc.
+# (We lean on defaults; explicitly pin a couple of common preferences.)
+[tool.sqlfluff.rules.L016]
+comma_style = "trailing"
+
+[tool.sqlfluff.rules.L010]
+capitalisation_policy = "upper"   # UPPERCASE keywords (matches your style)
+
+# You can tweak/extend later (e.g., identifier casing, aliasing, Jinja blocks, etc.)

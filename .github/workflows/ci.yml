@@ -115,3 +115,9 @@ jobs:
           else
             echo "✅ All tests passed."
           fi
+
+      - name: Lint SQL
+        run: |
+          pip install sqlfluff
+          bash scripts/sqlfluff_psql_wrapper.sh lint $(git ls-files '*.sql')
+

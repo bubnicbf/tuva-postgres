@@ -2,19 +2,23 @@
 CREATE OR REPLACE VIEW :"schema".v_appointment_enriched AS
 SELECT
   a.*,
-  tat.display  AS source_type_display,
-  nat.display  AS normalized_type_display,
-  -- replaced former *status_display* with booleans to avoid relying on a description
+  -- Appointment type descriptions from new terminology table
+  tat.description AS source_type_description_term,
+  nat.description AS normalized_type_description_term,
+
+  -- Status (code-only set): expose booleans for presence
   (st.code  IS NOT NULL) AS source_status_known,
   (nst.code IS NOT NULL) AS normalized_status_known,
+
   rct.display  AS source_reason_code_type_display,
   nrct.display AS normalized_reason_code_type_display,
+
   scr.description  AS source_cancellation_reason_description_term,
   ncr.description  AS normalized_cancellation_reason_description_term
 FROM :"schema".appointment a
-LEFT JOIN :"terminology_schema".appointment_type_code tat
+LEFT JOIN :"terminology_schema".appointment_type tat
        ON a.source_appointment_type_code = tat.code
-LEFT JOIN :"terminology_schema".appointment_type_code nat
+LEFT JOIN :"terminology_schema".appointment_type nat
        ON a.normalized_appointment_type_code = nat.code
 LEFT JOIN :"terminology_schema".appointment_status st
        ON a.source_status = st.code

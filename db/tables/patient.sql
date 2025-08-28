@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS :"schema".patient (
   last_name               varchar,
 
   -- Coded fields (joinable to terminology)
-  sex                     varchar,
+  gender                  varchar,
   race                    varchar,
   ethnicity               varchar,
 

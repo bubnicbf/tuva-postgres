@@ -43,3 +43,9 @@ SELECT 'practitioner_tuva_last_run_not_future' AS test, COUNT(*) = 0 AS pass, CO
 FROM practitioner
 WHERE tuva_last_run IS NOT NULL
   AND tuva_last_run > (NOW()::timestamp without time zone);
+
+-- 8) NPI Luhn check (when present)
+SELECT 'practitioner_npi_luhn_valid' AS test, COUNT(*) = 0 AS pass, COUNT(*) AS fail_count
+FROM practitioner
+WHERE npi IS NOT NULL
+  AND (NOT :"schema".is_valid_npi(npi));

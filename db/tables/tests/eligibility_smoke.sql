@@ -134,3 +134,37 @@ WHERE e.member_id IS NOT NULL
 SELECT 'elig_tuva_last_run_not_blank' AS test, COUNT(*) = 0 AS pass, COUNT(*) AS fail_count
 FROM eligibility
 WHERE tuva_last_run IS NOT NULL AND BTRIM(tuva_last_run) = '';
+
+-- 13) (soft) coverage continuity: detect gaps per member_id+payer+plan+data_source
+--     Treat end dates as inclusive; a next start of prev_end + 1 day is continuous.
+WITH spans AS (
+  SELECT
+    eligibility_id,
+    member_id, payer, plan, data_source,
+    enrollment_start_date AS s,
+    enrollment_end_date   AS e
+  FROM eligibility
+  WHERE member_id   IS NOT NULL
+    AND payer       IS NOT NULL
+    AND plan        IS NOT NULL
+    AND data_source IS NOT NULL
+),
+seq AS (
+  SELECT
+    *,
+    LAG(e) OVER (PARTITION BY member_id, payer, plan, data_source ORDER BY s NULLS LAST) AS prev_e
+  FROM spans
+),
+gaps AS (
+  SELECT
+    eligibility_id, member_id, payer, plan, data_source, s, e, prev_e,
+    (s - prev_e) - 1 AS gap_days
+  FROM seq
+  WHERE s IS NOT NULL
+    AND prev_e IS NOT NULL
+    AND s > (prev_e + INTERVAL '1 day')   -- gap strictly greater than 1-day continuity
+)
+SELECT 'elig_coverage_gaps_member_plan' AS test,
+       COUNT(*) = 0 AS pass,
+       COUNT(*) AS gap_row_count
+FROM gaps;

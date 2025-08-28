@@ -7,7 +7,7 @@ init:
 	cp -n scripts/setup_env.example .env || true
 
 create-db:
-	. .env && psql "$$PG_DSN" -v ON_ERROR_STOP=1 -f db/schema.sql
+	. .env && bash scripts/apply_schema.sh
 
 load:
 	. .env && bash scripts/load_to_postgres.sh

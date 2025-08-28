@@ -1,5 +1,5 @@
 -- db/tests/medical_claim_smoke.sql
--- Expects psql var: :"schema"
+-- Expects psql vars: :"schema" (and uses :"terminology_schema" for a join)
 SET search_path TO :"schema", public;
 
 -- 1) table has rows
@@ -143,3 +143,11 @@ SELECT 'medical_claim_tuva_last_run_not_future' AS test, COUNT(*) = 0 AS pass, C
 FROM medical_claim
 WHERE tuva_last_run IS NOT NULL
   AND tuva_last_run > (NOW()::timestamp without time zone);
+
+-- 18) NEW: claim_type must exist in terminology (when present)
+SELECT 'medical_claim_claim_type_known' AS test, COUNT(*) = 0 AS pass, COUNT(*) AS unknown_code_count
+FROM medical_claim m
+LEFT JOIN :"terminology_schema".claim_type t
+  ON m.claim_type = t.claim_type
+WHERE m.claim_type IS NOT NULL
+  AND t.claim_type IS NULL;

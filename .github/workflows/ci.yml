@@ -1,0 +1,117 @@
+name: CI (Postgres + SQL smoke tests)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  sql-tests:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tuva
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tuva"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: tuva
+      PG_DSN: postgresql://postgres:postgres@localhost:5432/tuva
+      PG_SCHEMA: tuva
+      TERMINOLOGY_SCHEMA: tuva_term
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools (psql + python)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client python3
+
+      - name: Ensure scripts are executable
+        run: |
+          chmod +x scripts/*.sh || true
+          chmod +x scripts/*.py || true
+
+      - name: Create .env for Makefile/scripts
+        run: |
+          cat > .env << 'EOF'
+          export PG_DSN="postgresql://postgres:postgres@localhost:5432/tuva"
+          export PG_SCHEMA="tuva"
+          export TERMINOLOGY_SCHEMA="tuva_term"
+          export DATA_DIR="data"
+          EOF
+          cat .env
+
+      - name: Wait for Postgres & sanity check
+        run: |
+          for i in {1..30}; do
+            pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" && break
+            sleep 1
+          done
+          psql "$PG_DSN" -c "SELECT version();"
+
+      - name: Apply schemas
+        run: make create-db
+
+      - name: Load seeds (if present)
+        run: make load
+
+      - name: Run smoke tests (aggregated)
+        run: make test
+
+      - name: Publish summary to job log
+        run: |
+          echo "RUN_ID (latest):"
+          psql "$PG_DSN" -c "SELECT run_id FROM ${PG_SCHEMA}.test_results ORDER BY executed_at DESC LIMIT 1;"
+
+          echo "## SQL Test Summary" >> $GITHUB_STEP_SUMMARY
+          {
+            echo ""
+            echo "### Per-suite breakdown"
+            echo ""
+            echo '```'
+            psql "$PG_DSN" -c "SELECT * FROM ${PG_SCHEMA}.v_test_summary ORDER BY run_id DESC, suite;"
+            echo '```'
+            echo ""
+            echo "### Failures (if any)"
+            echo ""
+            echo '```'
+            psql "$PG_DSN" -c "SELECT * FROM ${PG_SCHEMA}.v_test_failures ORDER BY run_id DESC, suite, test LIMIT 200;"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: |
+            tmp/test_results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail if any tests failed
+        run: |
+          LATEST_RUN_ID=$(psql "$PG_DSN" -At -c "SELECT run_id FROM ${PG_SCHEMA}.test_results ORDER BY executed_at DESC LIMIT 1;")
+          FAILS=$(psql "$PG_DSN" -At -c "SELECT COUNT(*) FROM ${PG_SCHEMA}.test_results WHERE run_id='${LATEST_RUN_ID}' AND pass = false;")
+          echo "Latest run: ${LATEST_RUN_ID} | Failures: ${FAILS}"
+          if [ "${FAILS}" -gt 0 ]; then
+            echo "❌ Some tests failed. Listing failures:"
+            psql "$PG_DSN" -c "SELECT * FROM ${PG_SCHEMA}.v_test_failures WHERE run_id='${LATEST_RUN_ID}';"
+            exit 1
+          else
+            echo "✅ All tests passed."
+          fi

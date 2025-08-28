@@ -13,7 +13,7 @@ load:
 	. .env && bash scripts/load_to_postgres.sh
 
 test:
-	. .env && psql "$$PG_DSN" -v ON_ERROR_STOP=1 -f db/tests.sql
+	. .env && bash scripts/run_tests.sh
 
 lint:
 	pre-commit run --all-files

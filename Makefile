@@ -14,6 +14,7 @@ load:
 
 test-shell:
 	bash scripts/tests/test_apply_schema_terminology_path.sh
+	bash scripts/tests/test_run_tests_path.sh
 
 test: test-shell
 	. .env && bash scripts/run_tests.sh

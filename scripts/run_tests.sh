@@ -11,14 +11,14 @@ TMP_DIR="tmp/test_results"
 mkdir -p "$TMP_DIR"
 
 # Ensure results table & views exist
-psql "$PG_DSN" -v ON_ERROR_STOP=1 -v schema="$PG_SCHEMA" -f db/tests/zz_results.sql
+psql "$PG_DSN" -v ON_ERROR_STOP=1 -v schema="$PG_SCHEMA" -f db/tables/tests/zz_results.sql
 
 # Execute each test file to CSV
 shopt -s nullglob
-mapfile -t files < <(ls -1 db/tests/*.sql | sort)
+mapfile -t files < <(ls -1 db/tables/tests/*.sql | sort)
 
 if [[ ${#files[@]} -eq 0 ]]; then
-  echo "No SQL tests found in db/tests/"
+  echo "No SQL tests found in db/tables/tests/"
   exit 0
 fi
 
@@ -60,10 +60,3 @@ psql "$PG_DSN" -v ON_ERROR_STOP=1 -At -c "\
 
 echo "Per-suite breakdown:"
 psql "$PG_DSN" -v ON_ERROR_STOP=1 -c "SELECT * FROM ${PG_SCHEMA}.v_test_summary WHERE run_id = '${RUN_ID}' ORDER BY suite;"
-
-# Run on a nightly schedule
-on:
-  schedule:
-    - cron: "0 6 * * *"  # 06:00 UTC daily
-  push:
-  pull_request:

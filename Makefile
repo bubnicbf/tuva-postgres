@@ -1,4 +1,4 @@
-.PHONY: init create-db load test lint fmt
+.PHONY: init create-db load test test-shell lint fmt
 
 init:
 	python3 -m venv .venv && . .venv/bin/activate && pip install -U pip pre-commit
@@ -12,7 +12,10 @@ create-db:
 load:
 	. .env && bash scripts/load_to_postgres.sh
 
-test:
+test-shell:
+	bash scripts/tests/test_apply_schema_terminology_path.sh
+
+test: test-shell
 	. .env && bash scripts/run_tests.sh
 
 lint:

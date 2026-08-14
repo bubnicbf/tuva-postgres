@@ -29,6 +29,6 @@ apply_folder() {
 apply_folder "db/tables"        -v schema="$PG_SCHEMA"
 
 # Terminology schema files
-apply_folder "db/terminology"   -v terminology_schema="$TERMINOLOGY_SCHEMA"
+apply_folder "db/tables/terminology" -v terminology_schema="$TERMINOLOGY_SCHEMA"
 
 echo "Schema applied to ${PG_SCHEMA}; terminology applied to ${TERMINOLOGY_SCHEMA}."

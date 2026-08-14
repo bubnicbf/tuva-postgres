@@ -42,7 +42,4 @@ for t in "${tables[@]}"; do
   fi
 done
 
-echo "Running post-load seed.sql (keys, indexes, constraints)…"
-psql "$PG_DSN" -v ON_ERROR_STOP=1 -f db/seed.sql
-
 echo "Load complete."

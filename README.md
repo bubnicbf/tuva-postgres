@@ -11,6 +11,55 @@ make load
 make test
 ```
 
+## Python tooling (SQLFluff, pre-commit)
+
+The application scripts under `scripts/` use only the Python standard
+library -- there are no runtime dependencies. SQLFluff and pre-commit are
+dev/tooling dependencies, declared with exact pins in `pyproject.toml` and
+locked (with all transitive dependencies) in the committed `uv.lock`, so
+local and CI runs always resolve the identical versions.
+
+Prerequisites:
+- Python 3.12 (selected in `.python-version`; `requires-python = ">=3.12"`
+  in `pyproject.toml`)
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+
+Setup:
+```bash
+make init          # uv sync --locked && uv run pre-commit install
+```
+or, equivalently, without also installing the git hook:
+```bash
+uv sync --locked
+```
+
+Both create/update `.venv` from `uv.lock` exactly -- never an unpinned
+`pip install sqlfluff` / `pip install pre-commit`.
+
+Running lint (all `.pre-commit-config.yaml` hooks, via the locked
+environment):
+```bash
+make lint           # uv run pre-commit run --all-files
+```
+
+Running the manual-only SQL formatter:
+```bash
+make fmt             # uv run pre-commit run --hook-stage manual sqlfluff-psql-fix --all-files
+```
+
+Verifying the locked toolchain is current and installable (no database
+required):
+```bash
+make check-python-deps
+```
+
+**Updating a pinned dependency (SQLFluff, pre-commit, or a transitive
+package) intentionally:**
+1. Edit the direct pin(s) in `pyproject.toml` (`[dependency-groups] dev`).
+2. Regenerate the lockfile: `uv lock`.
+3. Validate the result installs cleanly: `uv sync --locked`.
+4. Commit `pyproject.toml` and `uv.lock` together in the same commit.
+
 ## Notes
 
 - Put CSVs in data/ with headers matching db/schema.sql.

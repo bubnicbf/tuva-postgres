@@ -43,6 +43,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client python3
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python (from .python-version)
+        run: uv python install
+
+      - name: Install locked Python tooling (sqlfluff, pre-commit)
+        run: uv sync --locked
+
+      - name: Verify locked Python toolchain
+        run: make check-python-deps
+
       - name: Ensure scripts are executable
         run: |
           chmod +x scripts/*.sh || true
@@ -120,6 +135,5 @@ jobs:
 
       - name: Lint SQL
         run: |
-          pip install sqlfluff
-          bash scripts/sqlfluff_psql_wrapper.sh lint $(git ls-files '*.sql')
+          uv run bash scripts/sqlfluff_psql_wrapper.sh lint $(git ls-files '*.sql')
 

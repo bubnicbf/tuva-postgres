@@ -1,3 +1,20 @@
+[project]
+name = "tuva-postgres"
+version = "0.1.0"
+description = "Reproducible PostgreSQL load of Tuva seed datasets"
+requires-python = ">=3.12"
+dependencies = []
+
+# Dev/tooling only: the application scripts under scripts/ use only the
+# Python standard library. SQLFluff and pre-commit are declared here (not
+# as runtime dependencies) with exact pins so local and CI environments
+# resolve the identical versions via the committed uv.lock.
+[dependency-groups]
+dev = [
+  "pre-commit==4.6.2",
+  "sqlfluff==4.3.0",
+]
+
 [tool.sqlfluff.core]
 dialect = "postgres"
 templater = "jinja"

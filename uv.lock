@@ -36,6 +36,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "pre-commit", specifier = "==4.6.2" },
+    { name = "pyyaml", specifier = "==6.0.3" },
     { name = "sqlfluff", specifier = "==4.3.0" },
 ]
 

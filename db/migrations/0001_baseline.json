@@ -1,6 +1,7 @@
 {
   "version": "0001",
   "description": "Baseline: core managed tables, enriched views, and terminology reference tables",
+  "execution": "one_time",
   "vars": {
     "schema": "PG_SCHEMA",
     "terminology_schema": "TERMINOLOGY_SCHEMA"

@@ -65,6 +65,7 @@ test-shell:
 	bash scripts/tests/test_patient_gender_index.sh
 	bash scripts/tests/test_no_legacy_root_sql_files.sh
 	bash scripts/tests/test_versioned_migration_layout.sh
+	bash scripts/tests/test_migration_execution_modes.sh
 	bash scripts/tests/test_sql_test_layout.sh
 	python3 scripts/tests/test_constraint_idempotency_guards.py
 	python3 scripts/tests/test_pre_commit_config.py

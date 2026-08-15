@@ -88,23 +88,57 @@ repository.
   may only reference files inside its own version-owned directory; the
   runner rejects references to `db/tables/`, another migration's
   directory, or anything outside the repository (path traversal).
-- **Applied migrations are immutable.** Once a migration has shipped,
-  its files and manifest `files` order must never change. Each
-  migration's checksum is a SHA-256 over its ordered files' basenames,
-  byte lengths, and contents; the runner refuses to proceed if an
-  already-applied migration's checksum no longer matches (see "Migration
-  failure handling" below). Moving a file without changing its basename
-  or bytes preserves its checksum -- this is how migrations 0001 and
-  0002 were reorganized from a flat `db/tables/*.sql` layout into
-  version-owned directories without invalidating any database that had
-  already applied them.
+- **Every manifest declares exactly one execution mode**, via a required
+  `"execution"` field -- `discover()` rejects a manifest with a missing,
+  unknown, or wrong-typed value; the mode is never inferred from a
+  migration's filename, content, version, or description.
+  - `"one_time"` -- applied at most once. Migrations `0001` and `0002`
+    are both `one_time`, and this is the right choice for schema changes:
+    creating/altering a table, adding a column, adding a constraint.
+  - `"repeatable"` -- applied on first discovery, then transactionally
+    reapplied whenever its checksum changes, and skipped otherwise
+    (standard checksum-driven semantics -- a changed repeatable migration
+    is *pending work*, never rerun unconditionally on every invocation).
+    Use this for idempotently-written SQL you want to keep current --
+    `CREATE OR REPLACE VIEW`, `CREATE OR REPLACE FUNCTION`, and similar
+    -- never a one-off schema change. The runner does not parse or verify
+    SQL idempotency itself; write repeatable SQL so reapplying it is safe.
+- **Applied migrations are immutable** -- both their SQL and their
+  declared execution mode. Once a migration has shipped, its files and
+  manifest `files` order must never change, and neither may its
+  `"execution"` value. Each migration's checksum is a SHA-256 over its
+  ordered files' basenames, byte lengths, and contents (manifest
+  metadata, including `execution`, never affects the checksum); the
+  runner refuses to proceed -- for *any* pending migration, not just the
+  affected one -- if an already-applied `one_time` migration's checksum
+  no longer matches, or if any applied migration's execution mode no
+  longer matches its history (see "Migration failure handling" below).
+  Moving a file without changing its basename or bytes preserves its
+  checksum -- this is how migrations 0001 and 0002 were reorganized from
+  a flat `db/tables/*.sql` layout into version-owned directories, and
+  later had `"execution": "one_time"` added to their manifests, without
+  ever invalidating a database that had already applied them.
+- **Ordering:** within a single run, all pending `one_time` migrations
+  apply first (ascending version), then all pending `repeatable`
+  migrations (initial application or reapplication, ascending version)
+  -- regardless of how versions happen to interleave. This lets a
+  repeatable view or function safely depend on a schema object a pending
+  `one_time` migration is about to create.
 - Database changes always go into a **new** migration at the next unused
   numeric version. Never edit an existing, applied migration.
 - Migrations run transactionally (one migration's DDL + its
-  `schema_migrations` insert commit or roll back together) and are
-  recorded in `{OPS_SCHEMA}.schema_migrations`. Forward migrations only
-  -- there is no automatic down-migration/rollback mechanism (see "Image
-  rollback" below for how this repository handles rollback instead).
+  `schema_migrations` insert/update commit or roll back together) and are
+  recorded in `{OPS_SCHEMA}.schema_migrations`, which additionally tracks
+  `execution` and `execution_count` per migration (added via an additive,
+  idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` upgrade the first
+  time `apply_pending()` runs against an older database -- pre-existing
+  rows are backfilled as `one_time` with `execution_count = 1`, and their
+  version/checksum/applied-at/description are never touched).
+  `migration-status` (and `status()` generally) is read-only and works
+  unmodified against either table shape -- it never runs that upgrade.
+  Forward migrations only -- there is no automatic down-migration/
+  rollback mechanism (see "Image rollback" below for how this repository
+  handles rollback instead).
 - SQL data-quality/validation queries (the smoke tests and add-on checks
   `scripts/run_tests.sh` runs after a load) are a **separate concern**
   and live under `db/tests/`, not `db/migrations/` -- they are read-only
@@ -125,27 +159,39 @@ repository.
 
 1. Pick the next unused numeric version (check `make migration-status`
    or the highest existing `db/migrations/000N_*.json`), e.g. `0003`.
-2. Create `db/migrations/0003_{slug}.json` with `version: "0003"`, a
-   clear `description`, any `vars` your SQL needs (identifier
-   placeholders only -- see `_validate_identifier` in
-   `tuva_postgres/migrations.py`), and an ordered `files` list.
-3. Add the SQL under `db/migrations/sql/0003_{slug}/`, split into
+2. Decide its execution mode: `"one_time"` for a schema change (new
+   table, new column, new constraint); `"repeatable"` only for
+   idempotently-written SQL you want kept current (`CREATE OR REPLACE
+   VIEW`/function). Most new migrations are `one_time`.
+3. Create `db/migrations/0003_{slug}.json` with `version: "0003"`, a
+   clear `description`, the required `"execution"` field from step 2,
+   any `vars` your SQL needs (identifier placeholders only -- see
+   `_validate_identifier` in `tuva_postgres/migrations.py`), and an
+   ordered `files` list.
+4. Add the SQL under `db/migrations/sql/0003_{slug}/`, split into
    multiple files if that helps readability -- list them in
    `files` in dependency-safe order (e.g. a table before a view that
-   selects from it).
-4. Run `make migration-status` to confirm it shows up as pending, then
-   `make migrate` (or `make create-db`) against a disposable database to
-   apply and verify it.
-5. Add unit test coverage in `tests/unit/test_migrations.py` if the
-   change exercises new discovery/checksum behavior, and integration
-   coverage in `tests/integration/test_pipeline_integration.py` if it
-   changes runtime behavior (e.g. new managed tables). Extend
+   selects from it). If `"repeatable"`, write the SQL so reapplying it is
+   safe (`CREATE OR REPLACE ...`, not a plain `CREATE ...`).
+5. Run `make migration-status` to confirm it shows up as pending in the
+   right section (one-time vs. repeatable), then `make migrate` (or
+   `make create-db`) against a disposable database to apply and verify
+   it. For a repeatable migration, edit its SQL and rerun `make migrate`
+   to confirm it reapplies and `execution_count` increments; a second,
+   unchanged run must show it as current, not reapplied.
+6. Add unit test coverage in `tests/unit/test_migrations.py` if the
+   change exercises new discovery/checksum/execution-mode behavior, and
+   integration coverage in `tests/integration/test_pipeline_integration.py`
+   if it changes runtime behavior (e.g. new managed tables). Extend
    `scripts/tests/test_schema_constraint_idempotency.sh` if it adds new
    foreign keys or catalog invariants worth pinning.
-6. Never modify `db/migrations/0001_baseline.json`,
+7. Never modify `db/migrations/0001_baseline.json`,
    `db/migrations/0002_operational_schema.json`, or any file under their
-   version-owned directories -- add `0003` (or the next open version)
-   instead, even for a one-line fix.
+   version-owned directories -- including their `"execution"` value --
+   add `0003` (or the next open version) instead, even for a one-line
+   fix. Execution mode is immutable once a migration is applied; changing
+   it on an already-applied migration is a hard error the runner refuses
+   to proceed past.
 
 ## Manual run
 
@@ -195,11 +241,14 @@ Two independent guards prevent overlapping runs:
 make health                     # or: uv run tuva-postgres healthcheck
 ```
 
-Checks, in order: PostgreSQL connectivity, migration state (nothing
-pending, no checksum mismatches), and freshness of the last successful
-run against `PIPELINE_MAX_SUCCESS_AGE_HOURS`. Exit `0` when healthy,
-`1` otherwise. Never prints `PG_DSN`/tokens. This is also the container's
-`HEALTHCHECK` command (`Dockerfile`).
+Checks, in order: PostgreSQL connectivity, migration state (unhealthy on
+any one-time checksum mismatch, any execution-mode mismatch, or anything
+pending -- including a repeatable migration awaiting its initial
+application or a reapplication because its checksum changed), and
+freshness of the last successful run against
+`PIPELINE_MAX_SUCCESS_AGE_HOURS`. Exit `0` when healthy, `1` otherwise.
+Never prints `PG_DSN`/tokens. This is also the container's `HEALTHCHECK`
+command (`Dockerfile`).
 
 ## Viewing structured logs
 
@@ -285,13 +334,18 @@ manifest entry are different problems).
 ## Migration failure handling
 
 A migration failure aborts within a single transaction (the whole
-migration's DDL + its `schema_migrations` insert commit or roll back
-together) and stops before applying any later migration. Fix the
+migration's DDL + its `schema_migrations` insert/update commit or roll
+back together) and stops before applying any later migration. Fix the
 underlying issue (a conflicting object left over from a manual change is
 the most common cause), then re-run `tuva-postgres migrate`. **Do not**
-edit an already-applied migration's referenced file(s) to "fix" it --
-that produces a checksum mismatch, which the runner correctly refuses to
-proceed past. Add a new migration instead.
+edit an already-applied `one_time` migration's referenced file(s) to "fix"
+it, and never change an already-applied migration's `"execution"` value
+-- either one produces a mismatch (checksum or execution-mode,
+respectively), which the runner correctly refuses to proceed past for
+*any* pending migration until resolved. Add a new migration instead. A
+`repeatable` migration whose checksum has changed is not a failure at all
+-- it is normal pending work, and the next `tuva-postgres migrate` simply
+reapplies it.
 
 ## Image rollback
 

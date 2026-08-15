@@ -78,6 +78,7 @@ RESERVED_SCHEMA_NAMES = {"public", "tuva", "tuva_term", "tuva_ops", "information
 if HAVE_PSYCOPG:
     from tuva_postgres import db, migrations
     from tuva_postgres.config import PipelineConfig
+    from tuva_postgres.errors import MigrationError
     from tuva_postgres.landing import RawLandingLayer
     from tuva_postgres.manifest import MANAGED_TABLES
     from tuva_postgres.orchestrator import EXIT_FAILURE, EXIT_SUCCESS, run_pipeline
@@ -300,7 +301,9 @@ class TestPipelineIntegration(unittest.TestCase):
 
         result = migrations.status(self.conn, config)
         self.assertEqual(result.pending, ())
-        self.assertEqual(result.checksum_mismatches, ())
+        self.assertEqual(result.one_time_mismatches, ())
+        self.assertEqual(result.mode_mismatches, ())
+        self.assertFalse(result.has_integrity_failures)
 
     # --- full pipeline ------------------------------------------------------
     def test_full_pipeline_twice_no_duplicate_rows_and_operational_records(self):
@@ -371,6 +374,277 @@ class TestPipelineIntegration(unittest.TestCase):
             row = cur.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row[0], "failed")
+
+
+def _write_fixture_migration(fixture_root: Path, version: str, slug: str, execution: str, sql: str) -> None:
+    """Write one fixture manifest + its SQL file, mirroring the real
+    db/migrations/{version}_{slug}.json + db/migrations/sql/{version}_{slug}/
+    layout that discover() requires. SQL may reference `:"ops_schema"`
+    (psql-style identifier substitution -- see db.substitute_psql_vars),
+    resolved from the PipelineConfig's ops_schema attribute exactly like
+    the real 0002 manifest does."""
+    manifests_dir = fixture_root / "db" / "migrations"
+    sql_dir = manifests_dir / "sql" / f"{version}_{slug}"
+    sql_dir.mkdir(parents=True, exist_ok=True)
+    sql_path = sql_dir / f"{slug}.sql"
+    sql_path.write_text(sql, encoding="utf-8")
+
+    manifest = {
+        "version": version,
+        "description": f"fixture migration {version}_{slug}",
+        "execution": execution,
+        "vars": {"ops_schema": "OPS_SCHEMA"},
+        "files": [f"db/migrations/sql/{version}_{slug}/{slug}.sql"],
+    }
+    (manifests_dir / f"{version}_{slug}.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@unittest.skipUnless(HAVE_PSYCOPG, "psycopg is not installed in this environment")
+@unittest.skipUnless(PG_DSN, "PG_DSN is not set -- this integration test requires a real, DISPOSABLE PostgreSQL database")
+class TestMigrationExecutionModesIntegration(unittest.TestCase):
+    """Proves one_time/repeatable execution-mode semantics against a real
+    PostgreSQL database, using fixture migrations built fresh per test
+    under a temporary directory and pointed at via the `migrations_dir`/
+    `repo_root` dependency-injection kwargs on status()/apply_pending() --
+    the real, committed migrations under db/migrations/ are never touched
+    or referenced by any test in this class."""
+
+    def setUp(self):
+        suffix = secrets.token_hex(4)
+        self.pg_schema = f"tuva_it_{suffix}_pg"
+        self.ops_schema = f"tuva_it_{suffix}_ops"
+        for name in (self.pg_schema, self.ops_schema):
+            self.assertNotIn(name, RESERVED_SCHEMA_NAMES)
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fixture_root = Path(self._tmp.name)
+        (self.fixture_root / "db" / "migrations" / "sql").mkdir(parents=True, exist_ok=True)
+
+        self.conn = db.connect(PG_DSN)
+        self.addCleanup(self.conn.close)
+
+        env = {
+            "TUVA_API_MANIFEST_URL": "http://unused.invalid/manifest.json",
+            "TUVA_API_TOKEN": "integration-test-token",
+            "TUVA_API_ALLOW_INSECURE_HTTP": "1",
+            "RAW_DATA_DIR": str(self.fixture_root / "raw"),
+            "PG_DSN": PG_DSN,
+            "PG_SCHEMA": self.pg_schema,
+            "TERMINOLOGY_SCHEMA": f"{self.pg_schema}_term",
+            "OPS_SCHEMA": self.ops_schema,
+            "PIPELINE_ENVIRONMENT": "integration-test",
+        }
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            self.config = PipelineConfig.load()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def tearDown(self):
+        try:
+            with self.conn.cursor() as cur:
+                for name in (self.pg_schema, f"{self.pg_schema}_term", self.ops_schema):
+                    cur.execute(f'DROP SCHEMA IF EXISTS "{name}" CASCADE')
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _migration_kwargs(self) -> dict:
+        return {
+            "migrations_dir": self.fixture_root / "db" / "migrations",
+            "repo_root": self.fixture_root,
+        }
+
+    def _write(self, version: str, slug: str, execution: str, sql: str) -> None:
+        _write_fixture_migration(self.fixture_root, version, slug, execution, sql)
+
+    # --- ordering: all pending one_time migrations apply before any
+    #     repeatable migration, regardless of version interleaving --------
+    def test_one_time_migrations_apply_before_repeatable_regardless_of_version_order(self):
+        # Deliberately numbered so naive version-ascending execution would
+        # run the repeatable migration FIRST (it would then fail: the
+        # table it depends on does not exist yet).
+        self._write(
+            "0001", "ft_view", "repeatable",
+            'CREATE OR REPLACE VIEW :"ops_schema".ft_view AS SELECT * FROM :"ops_schema".ft_table;',
+        )
+        self._write("0002", "ft_table", "one_time", 'CREATE TABLE :"ops_schema".ft_table (id int);')
+
+        applied = migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual([a.version for a in applied], ["0002", "0001"])
+
+        result = migrations.status(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual([m.version for m in result.applied_one_time], ["0002"])
+        self.assertEqual([m.version for m in result.applied_repeatable_current], ["0001"])
+        self.assertFalse(result.has_integrity_failures)
+        self.assertEqual(result.pending, ())
+
+    # --- repeatable: initial apply, skip-when-unchanged, reapply-when-
+    #     checksum-changes ----------------------------------------------
+    def test_repeatable_migration_skips_unchanged_and_reapplies_on_checksum_change(self):
+        self._write("0001", "ft_base", "one_time", 'CREATE TABLE :"ops_schema".ft_base (id int);')
+        self._write(
+            "0002", "ft_view", "repeatable",
+            'CREATE OR REPLACE VIEW :"ops_schema".ft_view AS SELECT id, 1 AS marker FROM :"ops_schema".ft_base;',
+        )
+
+        first = migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual({a.version for a in first}, {"0001", "0002"})
+        first_repeatable = next(a for a in first if a.version == "0002")
+        self.assertEqual(first_repeatable.execution_count, 1)
+
+        # Unchanged rerun: nothing pending, execution_count does not move.
+        second = migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual(second, [])
+        status_after_noop = migrations.status(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual(status_after_noop.pending, ())
+        current = status_after_noop.applied_repeatable_current[0]
+        self.assertEqual(current.execution_count, 1)
+
+        # Change the repeatable migration's SQL: it must now show up as
+        # pending (checksum changed -- NOT an integrity failure), and
+        # reapplying must bump execution_count and change the live object.
+        self._write(
+            "0002", "ft_view", "repeatable",
+            'CREATE OR REPLACE VIEW :"ops_schema".ft_view AS SELECT id, 2 AS marker FROM :"ops_schema".ft_base;',
+        )
+        status_after_edit = migrations.status(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual([m.version for m in status_after_edit.pending_repeatable_changed], ["0002"])
+        self.assertFalse(status_after_edit.has_integrity_failures)
+
+        third = migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual([a.version for a in third], ["0002"])
+        self.assertEqual(third[0].execution_count, 2)
+
+        with self.conn.cursor() as cur:
+            cur.execute(f'SELECT marker FROM "{self.ops_schema}".ft_view LIMIT 0')
+            colnames = [d.name for d in cur.description]
+        self.assertIn("marker", colnames)
+
+    # --- one_time immutability: a changed one_time migration is a hard
+    #     error that blocks the whole run, before anything is applied ----
+    def test_one_time_checksum_drift_blocks_all_pending_work(self):
+        self._write("0001", "ft_fixed", "one_time", 'CREATE TABLE :"ops_schema".ft_fixed (id int);')
+        migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+
+        # Simulate drift: edit the already-applied one_time migration's SQL
+        # in place (never done in the real repo -- this is exactly the
+        # violation the runner must catch).
+        sql_path = self.fixture_root / "db" / "migrations" / "sql" / "0001_ft_fixed" / "ft_fixed.sql"
+        sql_path.write_text('CREATE TABLE :"ops_schema".ft_fixed (id int, extra_column int);', encoding="utf-8")
+
+        # Add a second, otherwise-valid pending migration to prove it is
+        # never applied once drift is detected.
+        self._write("0002", "ft_other", "one_time", 'CREATE TABLE :"ops_schema".ft_other (id int);')
+
+        status_result = migrations.status(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual(status_result.one_time_mismatches, ("0001",))
+        self.assertTrue(status_result.has_integrity_failures)
+
+        with self.assertRaises(MigrationError):
+            migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = 'ft_other'",
+                (self.ops_schema,),
+            )
+            self.assertIsNone(cur.fetchone(), "a pending migration must never apply while drift is unresolved")
+
+    # --- execution mode immutability: a manifest that changes its
+    #     declared mode after being applied is a hard error -------------
+    def test_execution_mode_change_after_apply_blocks_all_pending_work(self):
+        self._write("0001", "ft_mode", "one_time", 'CREATE TABLE :"ops_schema".ft_mode (id int);')
+        migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+
+        # Same SQL/checksum, but the manifest now claims a different mode.
+        self._write("0001", "ft_mode", "repeatable", 'CREATE TABLE :"ops_schema".ft_mode (id int);')
+
+        status_result = migrations.status(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual(status_result.mode_mismatches, ("0001",))
+        self.assertTrue(status_result.has_integrity_failures)
+
+        with self.assertRaises(MigrationError):
+            migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+
+    # --- history-table metadata upgrade: additive, idempotent, and never
+    #     mutates a pre-existing row's version/checksum/applied_at -------
+    def test_history_table_upgrades_from_pre_execution_mode_shape(self):
+        self._write("0001", "ft_legacy", "one_time", 'CREATE TABLE :"ops_schema".ft_legacy (id int);')
+        all_migrations = migrations.discover(
+            self.fixture_root / "db" / "migrations", self.fixture_root
+        )
+        legacy_checksum = migrations.compute_checksum(all_migrations[0])
+        legacy_applied_at = "2026-01-01T00:00:00+00:00"
+
+        # Manually create the OLD six-column schema_migrations shape (no
+        # execution/execution_count columns) and seed it with a row, as if
+        # this database applied 0001 before execution-mode tracking
+        # existed -- bypassing ensure_history_table() entirely.
+        with self.conn.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.ops_schema}"')
+            cur.execute(
+                f'CREATE TABLE "{self.ops_schema}".schema_migrations ('
+                f"  version text PRIMARY KEY, description text NOT NULL, checksum text NOT NULL,"
+                f"  applied_at timestamptz NOT NULL, duration_ms double precision NOT NULL,"
+                f"  app_version text NOT NULL)"
+            )
+            cur.execute(f'CREATE TABLE "{self.ops_schema}".ft_legacy (id int)')
+            cur.execute(
+                f'INSERT INTO "{self.ops_schema}".schema_migrations '
+                f"(version, description, checksum, applied_at, duration_ms, app_version) "
+                f"VALUES (%s, %s, %s, %s, %s, %s)",
+                ("0001", "legacy row", legacy_checksum, legacy_applied_at, 12.5, "0.0.0-legacy"),
+            )
+        self.conn.commit()
+
+        # status() is read-only and must interpret the old-shaped table
+        # correctly WITHOUT upgrading it.
+        pre_upgrade_status = migrations.status(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual([m.version for m in pre_upgrade_status.applied_one_time], ["0001"])
+        self.assertEqual(pre_upgrade_status.applied_one_time[0].execution_count, 1)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = 'schema_migrations' AND column_name = 'execution'",
+                (self.ops_schema,),
+            )
+            self.assertIsNone(cur.fetchone(), "status() must never mutate/upgrade the history table")
+
+        # Add a second, new-style pending migration and apply -- this is
+        # what triggers ensure_history_table()'s additive upgrade.
+        self._write("0002", "ft_new", "repeatable", 'CREATE OR REPLACE VIEW :"ops_schema".ft_new AS SELECT 1;')
+        applied = migrations.apply_pending(self.conn, self.config, **self._migration_kwargs())
+        self.assertEqual([a.version for a in applied], ["0002"])
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f'SELECT version, description, checksum, applied_at, duration_ms, app_version, '
+                f'execution, execution_count FROM "{self.ops_schema}".schema_migrations WHERE version = %s',
+                ("0001",),
+            )
+            row = cur.fetchone()
+        self.assertIsNotNone(row)
+        version, description, checksum, applied_at, duration_ms, app_version, execution, execution_count = row
+        # The pre-existing row's own data is completely untouched...
+        self.assertEqual(description, "legacy row")
+        self.assertEqual(checksum, legacy_checksum)
+        self.assertEqual(duration_ms, 12.5)
+        self.assertEqual(app_version, "0.0.0-legacy")
+        # ...only backfilled with execution-mode tracking.
+        self.assertEqual(execution, "one_time")
+        self.assertEqual(execution_count, 1)
+
+        post_upgrade_status = migrations.status(self.conn, self.config, **self._migration_kwargs())
+        self.assertFalse(post_upgrade_status.has_integrity_failures)
+        self.assertEqual(post_upgrade_status.pending, ())
 
 
 if __name__ == "__main__":

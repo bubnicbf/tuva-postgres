@@ -11,13 +11,45 @@ make load
 make test
 ```
 
-## Python tooling (SQLFluff, pre-commit)
+## Production ingestion pipeline
 
-The application scripts under `scripts/` use only the Python standard
-library -- there are no runtime dependencies. SQLFluff and pre-commit are
-dev/tooling dependencies, declared with exact pins in `pyproject.toml` and
-locked (with all transitive dependencies) in the committed `uv.lock`, so
-local and CI runs always resolve the identical versions.
+Beyond the plain CSV loader above, `src/tuva_postgres/` is a full
+production pipeline: an authenticated API client speaking a versioned
+JSON manifest contract, an immutable raw landing layer, tracked database
+migrations, an observable orchestrator (`fetch -> migrate -> load ->
+test`), a production container, and a scheduled Kubernetes `CronJob`.
+
+```bash
+uv sync --locked                        # installs requests + psycopg (see below)
+cp scripts/setup_env.example .env       # fill in TUVA_API_MANIFEST_URL/TOKEN, PG_DSN, etc.
+make migrate                            # or: uv run tuva-postgres migrate
+make pipeline                           # or: uv run tuva-postgres run
+make health                             # or: uv run tuva-postgres healthcheck
+```
+
+See **`docs/RUNBOOK.md`** for the full operations guide (required
+config, scheduled runs, reading structured logs, querying run/artifact
+history, handling checksum/migration failures, retention, and
+recommended alerts), **`docs/API_MANIFEST.md`** for the manifest contract
+the API client speaks, and **`deploy/kubernetes/README.md`** for the
+(not-applied-by-this-repo) Kubernetes deployment. Local container
+development: `docker compose up --build` (see `compose.yaml`).
+
+New Makefile targets: `deps`, `fetch`, `migrate`, `migration-status`,
+`pipeline`, `health`, `test-unit`, `test-integration` (requires a
+disposable `PG_DSN`), `test-container`, `test-deploy`, `docker-build`,
+`compose-up`, `compose-down`.
+
+## Python tooling (SQLFluff, pre-commit, requests, psycopg)
+
+`src/tuva_postgres/` has two runtime dependencies -- `requests` (the API
+client) and `psycopg[binary]` (migrations, the orchestrator's database
+access) -- both exact-pinned in `pyproject.toml`. The plain shell scripts
+under `scripts/` still use only the Python standard library. SQLFluff and
+pre-commit are dev/tooling-only dependencies. All of the above are
+declared with exact pins in `pyproject.toml` and locked (with every
+transitive dependency) in the committed `uv.lock`, so local and CI runs
+always resolve the identical versions.
 
 Prerequisites:
 - Python 3.12 (selected in `.python-version`; `requires-python = ">=3.12"`

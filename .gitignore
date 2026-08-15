@@ -8,7 +8,13 @@ __pycache__/
 # data & temp
 data/*.zip
 data/*.tmp
+# raw landing snapshots (immutable, operator/PVC-owned; never committed --
+# see src/tuva_postgres/landing.py and RAW_DATA_DIR)
+data/raw/
+tmp/
 # logs
 logs/
+# operational metrics textfile output (see METRICS_FILE)
+*.prom
 # macOS
 .DS_Store

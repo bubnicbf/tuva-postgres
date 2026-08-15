@@ -1,0 +1,27 @@
+# Assembles the tuva-postgres CronJob deployment. Not applied by this
+# repository -- see README.md in this directory.
+#
+# secret.example.yaml is deliberately NOT listed here (it is a template,
+# not a real Secret); supply a real `tuva-postgres-secret` through your
+# cluster's own secret-management process before applying this
+# kustomization.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - cronjob.yaml
+
+# Replace REGISTRY_PLACEHOLDER/TAG_PLACEHOLDER (see cronjob.yaml) with a
+# real, pushed image before applying anywhere, e.g.:
+#
+# images:
+#   - name: REGISTRY_PLACEHOLDER/tuva-postgres
+#     newName: your-registry.example.com/tuva-postgres
+#     newTag: "2026.08.15"
+images:
+  - name: REGISTRY_PLACEHOLDER/tuva-postgres
+    newName: REGISTRY_PLACEHOLDER/tuva-postgres
+    newTag: TAG_PLACEHOLDER

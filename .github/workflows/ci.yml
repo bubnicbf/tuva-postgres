@@ -69,9 +69,13 @@ jobs:
           export PG_DSN="postgresql://postgres:postgres@localhost:5432/tuva"
           export PG_SCHEMA="tuva"
           export TERMINOLOGY_SCHEMA="tuva_term"
+          export OPS_SCHEMA="tuva_ops"
           export DATA_DIR="data"
           EOF
           cat .env
+
+      - name: Run Python unit tests (tuva_postgres package)
+        run: make test-unit
 
       - name: Wait for Postgres & sanity check
         run: |
@@ -83,6 +87,9 @@ jobs:
 
       - name: Apply schemas
         run: make create-db
+
+      - name: Print migration status
+        run: make migration-status
 
       - name: Load seeds (if present)
         run: make load
@@ -132,6 +139,20 @@ jobs:
           else
             echo "✅ All tests passed."
           fi
+
+      - name: Run migration + mock-API pipeline integration tests
+        run: make test-integration
+
+      - name: Build production image and run container smoke test
+        run: make test-container
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.30.0"
+
+      - name: Validate Kubernetes deployment manifests (structural + client dry-run, never applied)
+        run: make test-deploy
 
       - name: Lint SQL
         run: |

@@ -1,5 +1,27 @@
-# Copy to .env and fill in
+# Copy to .env and fill in. Never commit the real .env (see .gitignore).
+
+# --- Database -----------------------------------------------------------
 export PG_DSN="postgresql://postgres:postgres@localhost:5432/tuva"
-export PG_SCHEMA="tuva"       # schema to create/use
-export DATA_DIR="data"        # where CSVs live
-export TERMINOLOGY_SCHEMA="tuva_term"  # optional; defaults to ${PG_SCHEMA}_term
+export PG_SCHEMA="tuva"                 # core data schema
+export TERMINOLOGY_SCHEMA="tuva_term"   # optional; defaults to ${PG_SCHEMA}_term
+export OPS_SCHEMA="tuva_ops"            # operational tables: pipeline_runs, pipeline_artifacts, schema_migrations
+export DATA_DIR="data"                  # legacy: where CSVs live for the plain scripts/load_to_postgres.sh path
+
+# --- API client (fetch) --------------------------------------------------
+# TUVA_API_MANIFEST_URL points at a versioned JSON manifest -- see
+# docs/API_MANIFEST.md for the full contract. HTTPS is required unless
+# TUVA_API_ALLOW_INSECURE_HTTP=1 (local mock-server tests only).
+export TUVA_API_MANIFEST_URL="https://example.invalid/snapshots/latest/manifest.json"
+export TUVA_API_TOKEN="replace-with-a-real-bearer-token"   # NEVER commit a real token
+export TUVA_API_TIMEOUT_SECONDS="30"
+export TUVA_API_MAX_RETRIES="5"
+export TUVA_API_ALLOW_INSECURE_HTTP="0"  # set to 1 only for local http:// mock-server tests
+
+# --- Raw landing ----------------------------------------------------------
+export RAW_DATA_DIR="data/raw"   # immutable landing directory; see docs/API_MANIFEST.md
+
+# --- Pipeline / observability ---------------------------------------------
+export PIPELINE_ENVIRONMENT="local"        # local | staging | production
+export PIPELINE_MAX_SUCCESS_AGE_HOURS="30" # healthcheck fails if the last successful run is older than this
+export LOG_LEVEL="INFO"                    # DEBUG | INFO | WARNING | ERROR | CRITICAL
+export METRICS_FILE="tmp/tuva_postgres_metrics.prom"  # optional Prometheus textfile output; unset to disable

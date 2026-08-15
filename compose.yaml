@@ -1,0 +1,73 @@
+# Local development/testing stack: a disposable Postgres + the pipeline
+# container built from ./Dockerfile. NOT for production use -- the
+# Postgres credentials below are example-only, local-only placeholders
+# (clearly marked), and there is no TLS, backup, or persistence guarantee
+# here. See docs/RUNBOOK.md for production deployment (deploy/kubernetes).
+#
+# Usage:
+#   docker compose up --build postgres        # start just the database
+#   docker compose run --rm pipeline migrate  # apply migrations (safe: DB-only)
+#   docker compose run --rm pipeline healthcheck
+#   TUVA_API_MANIFEST_URL=... TUVA_API_TOKEN=... docker compose run --rm pipeline run
+#
+# `pipeline run` additionally requires a real (or locally-mocked)
+# TUVA_API_MANIFEST_URL -- this compose file does not stand one up, since
+# the point of the manifest contract (docs/API_MANIFEST.md) is that it's
+# vendor-agnostic and this repo does not assume a specific upstream host.
+# For an end-to-end local rehearsal of `run`, point TUVA_API_MANIFEST_URL
+# at an in-process mock server the way tests/unit/test_orchestrator.py
+# and tests/integration do.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      # LOCAL-ONLY EXAMPLE CREDENTIALS -- never used outside this compose
+      # file's disposable container; production credentials are supplied
+      # via a Kubernetes Secret (see deploy/kubernetes/secret.example.yaml)
+      # and are never committed anywhere.
+      POSTGRES_USER: tuva_local
+      POSTGRES_PASSWORD: local-only-example-password-change-me
+      POSTGRES_DB: tuva
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tuva_local -d tuva"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_DSN: postgresql://tuva_local:local-only-example-password-change-me@postgres:5432/tuva
+      PG_SCHEMA: tuva
+      TERMINOLOGY_SCHEMA: tuva_term
+      OPS_SCHEMA: tuva_ops
+      PIPELINE_ENVIRONMENT: local
+      PIPELINE_MAX_SUCCESS_AGE_HOURS: "30"
+      LOG_LEVEL: INFO
+      RAW_DATA_DIR: /app/data/raw
+      METRICS_FILE: /app/data/metrics/tuva_postgres.prom
+      # Not set here on purpose (see usage note above): TUVA_API_MANIFEST_URL,
+      # TUVA_API_TOKEN. Supply them on the command line or a local .env
+      # file (never committed) to run `pipeline run` end to end.
+    volumes:
+      - raw-data:/app/data/raw
+      - metrics-data:/app/data/metrics
+    # Safe default for `docker compose up`: only needs the database, never
+    # the (unset-by-default) API credentials. Override with `run` once
+    # TUVA_API_MANIFEST_URL/TUVA_API_TOKEN are supplied.
+    command: ["healthcheck"]
+
+volumes:
+  pgdata:
+  raw-data:
+  metrics-data:

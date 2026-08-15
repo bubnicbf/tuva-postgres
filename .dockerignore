@@ -1,0 +1,31 @@
+# Version control / CI
+.git/
+.github/
+
+# Secrets -- never baked into an image
+.env
+*.env
+
+# Local data, temp, and generated artifacts
+data/
+tmp/
+logs/
+*.part
+report.pdf
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Tests and docs are not needed at runtime (they still ship in the git
+# repo/CI checkout, just not in the image)
+tests/
+docs/
+
+# Editor/OS cruft
+.DS_Store
+
+# Kubernetes manifests are applied by the cluster, not baked into the image
+deploy/

@@ -3,16 +3,44 @@ name = "tuva-postgres"
 version = "0.1.0"
 description = "Reproducible PostgreSQL load of Tuva seed datasets"
 requires-python = ">=3.12"
-dependencies = []
+# Minimal, deliberate runtime dependency set for the src/tuva_postgres
+# ingestion pipeline (API client + streaming downloads, PostgreSQL driver
+# for migrations/orchestration). Structured logging and the CLI are
+# stdlib-only (argparse + the json logging module) -- see
+# src/tuva_postgres/logging_utils.py and cli.py.
+dependencies = [
+  "requests==2.34.2",
+  "psycopg[binary]==3.2.3",
+]
 
-# Dev/tooling only: the application scripts under scripts/ use only the
-# Python standard library. SQLFluff and pre-commit are declared here (not
-# as runtime dependencies) with exact pins so local and CI environments
-# resolve the identical versions via the committed uv.lock.
+[project.scripts]
+tuva-postgres = "tuva_postgres.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Dev/tooling only. SQLFluff and pre-commit are declared here (not as
+# runtime dependencies) with exact pins so local and CI environments
+# resolve the identical versions via the committed uv.lock. PyYAML is
+# also declared directly (it was already a transitive dependency of both
+# sqlfluff and pre-commit -- see uv.lock -- so this adds no new package,
+# only a direct, version-pinned reference) so the structural tests that
+# parse compose.yaml / deploy/kubernetes/*.yaml / ci.yml
+# (tests/unit/test_container_structure.py, test_kubernetes_structure.py,
+# test_makefile_and_ci.py) run for real via `make test-unit` / CI instead
+# of skipping.
 [dependency-groups]
 dev = [
   "pre-commit==4.6.2",
   "sqlfluff==4.3.0",
+  "pyyaml==6.0.3",
 ]
 
 [tool.sqlfluff.core]

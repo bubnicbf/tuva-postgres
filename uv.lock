@@ -21,15 +21,94 @@ requires-python = ">=3.12"
 [[package]]
 name = "tuva-postgres"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
+dependencies = [
+    { name = "psycopg", extra = ["binary"] },
+    { name = "requests" },
+]
 
 [package.metadata]
-requires-dist = []
+requires-dist = [
+    { name = "requests", specifier = "==2.34.2" },
+    { name = "psycopg", extras = ["binary"], specifier = "==3.2.3" },
+]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pre-commit", specifier = "==4.6.2" },
+    { name = "pyyaml", specifier = "==6.0.3" },
     { name = "sqlfluff", specifier = "==4.3.0" },
+]
+
+[[package]]
+name = "requests"
+version = "2.34.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "charset-normalizer" },
+    { name = "idna" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/requests-2.34.2.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000rq01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/requests-2.34.2-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000rq02" },
+]
+
+[[package]]
+name = "certifi"
+version = "2026.5.20"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/certifi-2026.5.20.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ce01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/certifi-2026.5.20-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ce02" },
+]
+
+[[package]]
+name = "charset-normalizer"
+version = "3.4.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/charset_normalizer-3.4.7.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000cn01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/charset_normalizer-3.4.7-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000cn02" },
+]
+
+[[package]]
+name = "idna"
+version = "3.18"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/idna-3.18.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000id10" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/idna-3.18-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000id11" }
+]
+
+[[package]]
+name = "urllib3"
+version = "2.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/urllib3-2.7.0.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ur01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ur02" },
+]
+
+[[package]]
+name = "psycopg"
+version = "3.2.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "psycopg-binary" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/psycopg-3.2.3.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000pg01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/psycopg-3.2.3-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000pg02" },
+]
+
+[[package]]
+name = "psycopg-binary"
+version = "3.2.3"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/psycopg_binary-3.2.3-cp312-cp312-manylinux.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000pb01" },
 ]
 
 [[package]]

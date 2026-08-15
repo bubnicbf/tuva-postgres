@@ -1,0 +1,119 @@
+# Scheduled production run of the ingestion pipeline (`tuva-postgres run`
+# -- fetch, migrate, load, test; see src/tuva_postgres/orchestrator.py).
+#
+# Not applied by this repository. See README.md in this directory before
+# using this anywhere.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tuva-postgres-pipeline
+  labels:
+    app.kubernetes.io/name: tuva-postgres
+spec:
+  # 06:00 UTC daily. Change here (and only here) if a different schedule
+  # is required -- do not also rely on GitHub Actions scheduling for
+  # production runs; this CronJob is the single source of truth for when
+  # the production pipeline executes.
+  schedule: "0 6 * * *"
+  timeZone: "UTC"
+
+  # At most one run at a time -- the orchestrator's own PostgreSQL
+  # advisory lock (PIPELINE_LOCK_KEY, see src/tuva_postgres/db.py) is a
+  # second, independent safety net if this is ever bypassed (e.g. a
+  # manual `kubectl create job --from=cronjob/...` while a scheduled run
+  # is still in flight), but Forbid is the primary guard.
+  concurrencyPolicy: Forbid
+
+  # If a run is missed by more than 15 minutes (node pressure, cluster
+  # maintenance, etc.), skip it rather than starting a stale run late --
+  # the next day's schedule will pick up fresh data instead.
+  startingDeadlineSeconds: 900
+
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+
+  jobTemplate:
+    spec:
+      # Hard ceiling on a single run's wall-clock time (fetch+migrate+
+      # load+test). Tune based on observed steady-state duration (see the
+      # tuva_postgres_last_run_duration_seconds metric,
+      # src/tuva_postgres/metrics.py) with headroom; a run that exceeds
+      # this is killed and counted as failed.
+      activeDeadlineSeconds: 3600
+
+      # One retry only: the pipeline is not designed to be safely retried
+      # many times in a tight loop (each attempt re-fetches the manifest
+      # and re-runs migrate/load/test), and repeated rapid failures are
+      # exactly what the "consecutive failures" alert
+      # (docs/RUNBOOK.md) exists to catch instead of silently retrying
+      # forever.
+      backoffLimit: 1
+
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: tuva-postgres
+        spec:
+          restartPolicy: Never
+          serviceAccountName: tuva-postgres
+          automountServiceAccountToken: false
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+
+          containers:
+            - name: pipeline
+              # REGISTRY_PLACEHOLDER/TAG_PLACEHOLDER: replace via
+              # kustomization.yaml's `images:` override (see README.md in
+              # this directory) before applying anywhere. Never applied
+              # or pushed by this repository.
+              image: REGISTRY_PLACEHOLDER/tuva-postgres:TAG_PLACEHOLDER
+              imagePullPolicy: IfNotPresent
+              args: ["run"]
+
+              envFrom:
+                - configMapRef:
+                    name: tuva-postgres-config
+                - secretRef:
+                    name: tuva-postgres-secret
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+
+              resources:
+                requests:
+                  cpu: "250m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "1"
+                  memory: "1Gi"
+
+              volumeMounts:
+                - name: raw-data
+                  mountPath: /app/data/raw
+                - name: metrics
+                  mountPath: /app/data/metrics
+                - name: tmp
+                  mountPath: /app/tmp
+
+          volumes:
+            - name: raw-data
+              persistentVolumeClaim:
+                claimName: tuva-postgres-raw-data
+            # Metrics textfile output does not need to survive pod restarts
+            # on its own (each run overwrites it atomically -- see
+            # src/tuva_postgres/metrics.py); mount a shared volume here
+            # instead of emptyDir if your Prometheus node-exporter
+            # textfile collector needs to read it from outside the pod.
+            - name: metrics
+              emptyDir: {}
+            - name: tmp
+              emptyDir: {}

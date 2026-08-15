@@ -1,0 +1,10 @@
+{
+  "version": "0002",
+  "description": "Operational schema: pipeline_runs and pipeline_artifacts tables",
+  "vars": {
+    "ops_schema": "OPS_SCHEMA"
+  },
+  "files": [
+    "db/migrations/sql/0002_operational_schema.sql"
+  ]
+}

@@ -86,15 +86,44 @@ CREATE TABLE IF NOT EXISTS :"schema".encounter (
 );
 
 -- Foreign keys (enable if your load order guarantees referential presence)
-ALTER TABLE :"schema".encounter
-  ADD CONSTRAINT encounter_person_fk
-  FOREIGN KEY (person_id) REFERENCES :"schema".patient(person_id)
-  DEFERRABLE INITIALLY DEFERRED;
+-- Guarded so re-running this file after the constraints already exist is a no-op.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'encounter_person_fk'
+      AND r.relname = 'encounter'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.encounter ADD CONSTRAINT encounter_person_fk FOREIGN KEY (person_id) REFERENCES %I.patient(person_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
-ALTER TABLE :"schema".encounter
-  ADD CONSTRAINT encounter_attending_pr_fk
-  FOREIGN KEY (attending_provider_id) REFERENCES :"schema".practitioner(practitioner_id)
-  DEFERRABLE INITIALLY DEFERRED;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'encounter_attending_pr_fk'
+      AND r.relname = 'encounter'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.encounter ADD CONSTRAINT encounter_attending_pr_fk FOREIGN KEY (attending_provider_id) REFERENCES %I.practitioner(practitioner_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
 -- Helpful indexes
 CREATE INDEX IF NOT EXISTS enc_person_idx            ON :"schema".encounter (person_id);

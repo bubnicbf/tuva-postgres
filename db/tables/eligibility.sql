@@ -50,10 +50,25 @@ CREATE TABLE IF NOT EXISTS :"schema".eligibility (
 );
 
 -- Foreign key (deferrable so load order is flexible)
-ALTER TABLE :"schema".eligibility
-  ADD CONSTRAINT elig_person_fk
-  FOREIGN KEY (person_id) REFERENCES :"schema".patient(person_id)
-  DEFERRABLE INITIALLY DEFERRED;
+-- Guarded so re-running this file after the constraint already exists is a no-op.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'elig_person_fk'
+      AND r.relname = 'eligibility'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.eligibility ADD CONSTRAINT elig_person_fk FOREIGN KEY (person_id) REFERENCES %I.patient(person_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
 -- Helpful indexes
 CREATE INDEX IF NOT EXISTS elig_person_idx         ON :"schema".eligibility (person_id);

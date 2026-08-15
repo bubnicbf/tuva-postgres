@@ -102,15 +102,44 @@ CREATE TABLE IF NOT EXISTS :"schema".medical_claim (
 );
 
 -- Foreign keys (deferrable so you can load in any order)
-ALTER TABLE :"schema".medical_claim
-  ADD CONSTRAINT mc_person_fk
-  FOREIGN KEY (person_id) REFERENCES :"schema".patient(person_id)
-  DEFERRABLE INITIALLY DEFERRED;
+-- Guarded so re-running this file after the constraints already exist is a no-op.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'mc_person_fk'
+      AND r.relname = 'medical_claim'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.medical_claim ADD CONSTRAINT mc_person_fk FOREIGN KEY (person_id) REFERENCES %I.patient(person_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
-ALTER TABLE :"schema".medical_claim
-  ADD CONSTRAINT mc_encounter_fk
-  FOREIGN KEY (encounter_id) REFERENCES :"schema".encounter(encounter_id)
-  DEFERRABLE INITIALLY DEFERRED;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'mc_encounter_fk'
+      AND r.relname = 'medical_claim'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.medical_claim ADD CONSTRAINT mc_encounter_fk FOREIGN KEY (encounter_id) REFERENCES %I.encounter(encounter_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
 -- Helpful indexes
 CREATE INDEX IF NOT EXISTS mc_claim_header_idx   ON :"schema".medical_claim (claim_id, claim_line_number);

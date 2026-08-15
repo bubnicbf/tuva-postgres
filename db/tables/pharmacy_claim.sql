@@ -66,10 +66,25 @@ CREATE TABLE IF NOT EXISTS :"schema".pharmacy_claim (
 );
 
 -- Foreign key (deferrable so load order is flexible)
-ALTER TABLE :"schema".pharmacy_claim
-  ADD CONSTRAINT rx_person_fk
-  FOREIGN KEY (person_id) REFERENCES :"schema".patient(person_id)
-  DEFERRABLE INITIALLY DEFERRED;
+-- Guarded so re-running this file after the constraint already exists is a no-op.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'rx_person_fk'
+      AND r.relname = 'pharmacy_claim'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.pharmacy_claim ADD CONSTRAINT rx_person_fk FOREIGN KEY (person_id) REFERENCES %I.patient(person_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
 -- Helpful indexes
 CREATE INDEX IF NOT EXISTS rx_person_idx            ON :"schema".pharmacy_claim (person_id);

@@ -70,20 +70,63 @@ CREATE TABLE IF NOT EXISTS :"schema".appointment (
 );
 
 -- Foreign keys (deferrable so load order is flexible)
-ALTER TABLE :"schema".appointment
-  ADD CONSTRAINT appt_person_fk
-  FOREIGN KEY (person_id) REFERENCES :"schema".patient(person_id)
-  DEFERRABLE INITIALLY DEFERRED;
+-- Guarded so re-running this file after the constraints already exist is a no-op.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'appt_person_fk'
+      AND r.relname = 'appointment'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.appointment ADD CONSTRAINT appt_person_fk FOREIGN KEY (person_id) REFERENCES %I.patient(person_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
-ALTER TABLE :"schema".appointment
-  ADD CONSTRAINT appt_encounter_fk
-  FOREIGN KEY (encounter_id) REFERENCES :"schema".encounter(encounter_id)
-  DEFERRABLE INITIALLY DEFERRED;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'appt_encounter_fk'
+      AND r.relname = 'appointment'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.appointment ADD CONSTRAINT appt_encounter_fk FOREIGN KEY (encounter_id) REFERENCES %I.encounter(encounter_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
-ALTER TABLE :"schema".appointment
-  ADD CONSTRAINT appt_practitioner_fk
-  FOREIGN KEY (practitioner_id) REFERENCES :"schema".practitioner(practitioner_id)
-  DEFERRABLE INITIALLY DEFERRED;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conname = 'appt_practitioner_fk'
+      AND r.relname = 'appointment'
+      AND n.nspname = :'schema'
+  ) THEN
+    EXECUTE format(
+      'ALTER TABLE %I.appointment ADD CONSTRAINT appt_practitioner_fk FOREIGN KEY (practitioner_id) REFERENCES %I.practitioner(practitioner_id) DEFERRABLE INITIALLY DEFERRED',
+      :'schema', :'schema'
+    );
+  END IF;
+END$$;
 
 -- Helpful indexes
 CREATE INDEX IF NOT EXISTS appt_person_idx          ON :"schema".appointment (person_id);

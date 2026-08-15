@@ -109,6 +109,17 @@ repository.
   `scripts/run_tests.sh` runs after a load) are a **separate concern**
   and live under `db/tests/`, not `db/migrations/` -- they are read-only
   checks, never deployable DDL, and are not part of migration discovery.
+  `db/tests/zz_results.sql` is test-harness setup (creates/refreshes the
+  `test_results` table and summary views) and is applied exactly once,
+  before any validation case runs -- it is never itself treated as a
+  validation case. Every other `db/tests/*.sql` file is a validation case,
+  executed in deterministic filename order. `scripts/run_tests.sh` is the
+  authoritative runner for this suite (`make test` invokes it and requires
+  the configured database; `make test-shell` is the database-free
+  counterpart that validates migration and SQL-test-runner structure and
+  behavior via stubbed `psql`/`python3`, with no real Postgres needed).
+  Add new SQL validation tests under `db/tests/`; new deployable DDL
+  instead always goes into a new migration, per the walkthrough below.
 
 ### Adding a new migration
 

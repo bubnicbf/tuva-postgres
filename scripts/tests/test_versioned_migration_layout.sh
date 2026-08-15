@@ -173,6 +173,13 @@ else:
     failures.append("migration 0002 not found")
 
 # --- 13) validation SQL under db/tests/ is not discovered as migration DDL --
+# (This is the one migration-organization-relevant assertion this test
+# keeps about db/tests/. Broader SQL-validation-layout assertions --
+# whether scripts/run_tests.sh resolves db/tests/ correctly, whether it
+# still references the retired db/tables/tests/ path, unique basenames,
+# zz_results.sql setup/exclusion behavior, etc. -- are this test's sibling
+# scripts/tests/test_sql_test_layout.sh's responsibility, to keep each
+# test focused on one organizational concern.)
 db_tests_dir = (repo_root / "db" / "tests").resolve()
 check(db_tests_dir.is_dir(), f"expected validation SQL directory not found: {db_tests_dir}")
 for f in all_referenced:
@@ -180,14 +187,6 @@ for f in all_referenced:
         not f.is_relative_to(db_tests_dir),
         f"a migration manifest references a file under db/tests/ (validation SQL, not DDL): {f}",
     )
-
-# --- 14) the active SQL test runner uses db/tests/, not db/tables/tests/ ----
-run_tests_sh = (repo_root / "scripts" / "run_tests.sh").read_text(encoding="utf-8")
-check("db/tests/" in run_tests_sh, "scripts/run_tests.sh does not reference db/tests/")
-check(
-    "db/tables/tests" not in run_tests_sh,
-    "scripts/run_tests.sh still references the retired db/tables/tests/ path",
-)
 
 if failures:
     print("FAIL: versioned migration layout violations found:\n")
@@ -202,8 +201,9 @@ print(
     "version-owned db/migrations/sql/ directory with no orphans or "
     "duplicate references, no manifest references db/tables/, db/tables/ "
     "no longer exists, db/tests/ validation SQL is never discovered as "
-    "migration DDL, scripts/run_tests.sh uses db/tests/, and migrations "
-    "0001/0002 checksums exactly match their pre-refactor values:"
+    "migration DDL, and migrations 0001/0002 checksums exactly match their "
+    "pre-refactor values (see scripts/tests/test_sql_test_layout.sh for "
+    "broader SQL-validation-layout assertions):"
 )
 print(f"  0001 = {expected_0001}")
 print(f"  0002 = {expected_0002}")

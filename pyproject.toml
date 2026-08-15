@@ -3,11 +3,31 @@ name = "tuva-postgres"
 version = "0.1.0"
 description = "Reproducible PostgreSQL load of Tuva seed datasets"
 requires-python = ">=3.12"
-dependencies = []
+# Minimal, deliberate runtime dependency set for the src/tuva_postgres
+# ingestion pipeline (API client + streaming downloads, PostgreSQL driver
+# for migrations/orchestration). Structured logging and the CLI are
+# stdlib-only (argparse + the json logging module) -- see
+# src/tuva_postgres/logging_utils.py and cli.py.
+dependencies = [
+  "requests==2.34.2",
+  "psycopg[binary]==3.2.3",
+]
 
-# Dev/tooling only: the application scripts under scripts/ use only the
-# Python standard library. SQLFluff and pre-commit are declared here (not
-# as runtime dependencies) with exact pins so local and CI environments
+[project.scripts]
+tuva-postgres = "tuva_postgres.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Dev/tooling only. SQLFluff and pre-commit are declared here (not as
+# runtime dependencies) with exact pins so local and CI environments
 # resolve the identical versions via the committed uv.lock.
 [dependency-groups]
 dev = [

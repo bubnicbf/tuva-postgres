@@ -10,7 +10,14 @@ immutable raw landing layer, database migrations, and the orchestrated
   `TUVA_API_MANIFEST_URL`).
 - `deploy/kubernetes/README.md` -- what the Kubernetes manifests are and
   are not (nothing is applied by this repository).
-- `README.md` -- local dev quickstart, SQL tooling, `uv` setup.
+- `README.md` -- local dev quickstart, SQL tooling, `uv` setup, and the
+  Docker Compose local PostgreSQL workflow (`compose.yaml`, `make
+  local-db-*`). **That local stack is a development convenience only --
+  it is not applied to, or used by, production.** Everything below this
+  point in this runbook is about the real, `deploy/kubernetes/`-based
+  production deployment; if you're looking for a disposable local
+  database instead, see README.md's "Local PostgreSQL with Docker
+  Compose" section and stop reading here.
 
 ## Required secrets and configuration
 

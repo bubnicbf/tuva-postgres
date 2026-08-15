@@ -32,13 +32,146 @@ config, scheduled runs, reading structured logs, querying run/artifact
 history, handling checksum/migration failures, retention, and
 recommended alerts), **`docs/API_MANIFEST.md`** for the manifest contract
 the API client speaks, and **`deploy/kubernetes/README.md`** for the
-(not-applied-by-this-repo) Kubernetes deployment. Local container
-development: `docker compose up --build` (see `compose.yaml`).
+(not-applied-by-this-repo) Kubernetes deployment.
 
 New Makefile targets: `deps`, `fetch`, `migrate`, `migration-status`,
 `pipeline`, `health`, `test-unit`, `test-integration` (requires a
 disposable `PG_DSN`), `test-container`, `test-deploy`, `docker-build`,
-`compose-up`, `compose-down`.
+`compose-up`, `compose-down`, and the `local-db-*`/`test-compose-integration`
+targets below.
+
+## Local PostgreSQL with Docker Compose
+
+A disposable, one-command local PostgreSQL database for development --
+this is a separate concern from three other things this repository also
+has, and it's worth being clear about which is which:
+
+- **Local PostgreSQL (this section, `compose.yaml`)** -- a throwaway
+  database on your machine for day-to-day development. Local-only
+  example credentials, no TLS, no backups, no HA.
+- **The application pipeline container (`Dockerfile`, the `pipeline`
+  service in `compose.yaml`)** -- the same production image, runnable
+  locally against that disposable database for `healthcheck`/`migrate`,
+  or a full `run` if you also supply `TUVA_API_MANIFEST_URL`/
+  `TUVA_API_TOKEN`.
+- **Production Kubernetes deployment (`deploy/kubernetes/`)** -- what
+  actually runs in production; see `docs/RUNBOOK.md`. Nothing in
+  `compose.yaml` is applied to, or used by, production -- Compose is a
+  local development convenience only.
+
+### Prerequisites
+
+- Docker Engine or Docker Desktop
+- Docker Compose v2 (the `docker compose` subcommand, not the standalone
+  `docker-compose` v1 binary)
+
+### One-command startup
+
+```bash
+make local-db-ready
+```
+
+Starts Postgres (detached), waits for it to report healthy, then applies
+every migration through the repository's real migration runner (`tuva-
+postgres migrate` -- the exact same code path as `make migrate` against
+any other database; nothing is duplicated into a Postgres init script).
+Safe to rerun any time; it never requires `TUVA_API_MANIFEST_URL`/
+`TUVA_API_TOKEN`, and never deletes existing data.
+
+### Host connection information
+
+The command above prints the host DSN when it finishes. It matches
+`compose.yaml`'s local-only example credentials exactly:
+
+```
+postgresql://tuva_local:local-only-example-password-change-me@127.0.0.1:5432/tuva
+```
+
+**The password above is intentionally not a secret.** It is a clearly
+labeled, local-development-only placeholder baked into `compose.yaml`
+for convenience -- never reuse it anywhere outside your own machine, and
+never treat it as if it protects anything.
+
+Load host-side environment variables (schemas included) into your shell:
+
+```bash
+cp scripts/setup_local_postgres.example .env   # or scripts/setup_env.example
+. .env
+```
+
+Both example files already match `compose.yaml`'s credentials, database
+name, and schemas (`tuva` / `tuva_term` / `tuva_ops`) -- see
+`scripts/setup_local_postgres.example` for the full explanation of how
+Compose's own `${VAR:-default}` interpolation and shell-sourcing a `.env`
+file are two different mechanisms that happen to use similar syntax.
+
+### Everyday commands
+
+```bash
+make local-db-status   # container state + migration status (read-only)
+make local-db-migrate  # (re)apply migrations -- safe to rerun, exits nonzero on failure
+make local-db-shell    # psql against the local database (no host psql required)
+make local-db-logs     # follow Postgres logs (Ctrl-C to stop following)
+```
+
+### Stopping and restarting (data preserved)
+
+```bash
+make local-db-down     # stops containers; the Postgres data volume is preserved
+make local-db-ready     # starts again -- your data is exactly as you left it
+```
+
+Routine shutdown (`make local-db-down`, and `make compose-down`) never
+passes `-v` to `docker compose down` -- local database data survives an
+ordinary stop/start cycle.
+
+### Resetting all local data (destructive)
+
+```bash
+make local-db-reset
+```
+
+This **permanently deletes** the local Postgres data volume (and this
+stack's other local-only volumes). It requires either an interactive
+`yes` confirmation, or `CONFIRM_LOCAL_DB_RESET=yes` for scripted/
+noninteractive use:
+
+```bash
+CONFIRM_LOCAL_DB_RESET=yes make local-db-reset
+```
+
+It only ever touches this Compose project's own resources -- never
+`docker system prune`, never another project's containers or volumes.
+
+### Changing the host port
+
+If port 5432 is already in use on your machine, set `POSTGRES_PORT`
+before starting the stack:
+
+```bash
+POSTGRES_PORT=5433 make local-db-ready
+```
+
+The container-side port always stays Postgres's normal 5432; only the
+host-side publish port changes. Update `PG_DSN`/`.env` accordingly if you
+load one (`scripts/setup_local_postgres.example` already references
+`${POSTGRES_PORT:-5432}`).
+
+### Running the Compose integration smoke test
+
+```bash
+make test-compose-integration
+```
+
+Spins up an **isolated**, uniquely-named Compose project (never your own
+`local-db-*` stack) on a dynamically chosen port, proves the whole
+workflow end to end against a real Postgres (config rendering, health,
+migrations, expected schemas, idempotent reapply, stop/start data
+persistence), and cleans up fully on exit. Requires Docker; prints a
+clear `SKIPPED` message and exits successfully if Docker isn't available.
+The database-free structural counterpart (`tests/unit/
+test_local_postgres_compose.py`, run via `make test-unit`) always runs,
+with or without Docker.
 
 ## Database migrations
 

@@ -1,7 +1,22 @@
 # Copy to .env and fill in. Never commit the real .env (see .gitignore).
+#
+# This file is shell-sourced (`. .env`, see the Makefile) -- a completely
+# different mechanism from Docker Compose's own `${VAR:-default}`
+# interpolation in compose.yaml, which Compose resolves from your shell
+# environment or a `.env` file *at `docker compose` invocation time*, not
+# by sourcing this file. If you're pointing this .env at the local
+# Compose database (see "Database" below and README.md's "Local
+# PostgreSQL with Docker Compose" section), the two files must simply
+# agree on user/password/database/port -- one is not loaded by the other.
 
-# --- Database -----------------------------------------------------------
-export PG_DSN="postgresql://postgres:postgres@localhost:5432/tuva"
+# --- Database -------------------------------------------------------------
+# Defaults below match compose.yaml's local-only Postgres service out of
+# the box (`make local-db-ready`), connected from the HOST (127.0.0.1),
+# not from inside another container. If you're running Postgres some
+# other way (a system install, a different container, a shared dev
+# database), replace PG_DSN accordingly -- nothing here is Compose-
+# specific except the default value itself.
+export PG_DSN="postgresql://tuva_local:local-only-example-password-change-me@127.0.0.1:${POSTGRES_PORT:-5432}/tuva"
 export PG_SCHEMA="tuva"                 # core data schema
 export TERMINOLOGY_SCHEMA="tuva_term"   # optional; defaults to ${PG_SCHEMA}_term
 export OPS_SCHEMA="tuva_ops"            # operational tables: pipeline_runs, pipeline_artifacts, schema_migrations

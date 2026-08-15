@@ -1,4 +1,4 @@
-.PHONY: init create-db load test test-shell test-schema-idempotency lint fmt
+.PHONY: init create-db load test test-shell test-schema-idempotency test-load-integration lint fmt
 
 init:
 	python3 -m venv .venv && . .venv/bin/activate && pip install -U pip pre-commit
@@ -17,6 +17,7 @@ test-shell:
 	bash scripts/tests/test_run_tests_path.sh
 	bash scripts/tests/test_run_tests_no_embedded_workflow.sh
 	bash scripts/tests/test_load_to_postgres_no_legacy_seed.sh
+	bash scripts/tests/test_load_to_postgres_atomic.sh
 	bash scripts/tests/test_patient_gender_index.sh
 	python3 scripts/tests/test_constraint_idempotency_guards.py
 
@@ -25,6 +26,14 @@ test-shell:
 # that it creates and drops itself. Never run against production.
 test-schema-idempotency:
 	. .env && bash scripts/tests/test_schema_constraint_idempotency.sh
+
+# Requires a real, DISPOSABLE PostgreSQL test database via PG_DSN (see .env).
+# Loads a complete CSV snapshot into a uniquely-named temporary schema
+# twice (proving retries don't duplicate rows), then loads an invalid
+# snapshot and confirms the prior snapshot survives intact. Creates and
+# drops its own temporary schema. Never run against production.
+test-load-integration:
+	. .env && bash scripts/tests/test_load_to_postgres_atomic_integration.sh
 
 test: test-shell
 	. .env && bash scripts/run_tests.sh

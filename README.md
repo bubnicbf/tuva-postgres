@@ -40,6 +40,37 @@ New Makefile targets: `deps`, `fetch`, `migrate`, `migration-status`,
 disposable `PG_DSN`), `test-container`, `test-deploy`, `docker-build`,
 `compose-up`, `compose-down`.
 
+## Database migrations
+
+`db/migrations/` is the **sole authoritative home for deployable DDL** --
+there is no other place a table, view, or constraint definition lives.
+Each migration is a versioned JSON manifest (`db/migrations/{version}_
+{slug}.json`) plus one or more SQL files it owns exclusively, under
+`db/migrations/sql/{version}_{slug}/` (see `db/migrations/0001_baseline.json`
+/ `db/migrations/sql/0001_baseline/{core,views,terminology}/` and
+`db/migrations/0002_operational_schema.json` /
+`db/migrations/sql/0002_operational_schema/`). The manifest's `files` list
+is the authoritative execution order -- never filesystem traversal order.
+
+Applied migrations are immutable: never edit an existing migration's
+files or reorder its manifest once it has shipped. `src/tuva_postgres/
+migrations.py` computes each migration's checksum from its ordered
+files' basenames, byte lengths, and contents, and refuses to proceed if
+an already-applied migration's checksum has changed. Database changes
+always go into a **new** migration at the next unused numeric version
+(`0003`, `0004`, ...) -- see `docs/RUNBOOK.md`'s "Adding a new migration"
+section for the full walkthrough.
+
+SQL data-quality/validation queries (the smoke tests and add-on checks
+`scripts/run_tests.sh` runs after a load) are a separate concern and live
+under `db/tests/`, not `db/migrations/` -- they are never treated as
+deployable DDL.
+
+`make create-db` / `make migrate` apply pending migrations transactionally
+(see `scripts/apply_schema.sh` -> `tuva_postgres.migrations`);
+`make migration-status` reports applied, pending, and checksum-mismatch
+states without applying anything.
+
 ## Python tooling (SQLFluff, pre-commit, requests, psycopg)
 
 `src/tuva_postgres/` has two runtime dependencies -- `requests` (the API
@@ -95,8 +126,11 @@ package) intentionally:**
 ## Notes
 
 - Put CSVs in data/ with headers matching the applicable table definitions
-  under db/tables/*.sql (see db/migrations/0001_baseline.json for the full,
-  ordered list).
+  in the baseline migration DDL under db/migrations/sql/0001_baseline/core/
+  and db/migrations/sql/0001_baseline/terminology/ (see
+  db/migrations/0001_baseline.json for the full, ordered list -- see
+  "Database migrations" below for why db/migrations/ is the only place to
+  look).
 - Adjust table/column names to the Tuva release you use.
 - scripts/load_to_postgres.sh uses \copy, so no server-side file access needed.
 

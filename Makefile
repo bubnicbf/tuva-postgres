@@ -64,6 +64,7 @@ test-shell:
 	bash scripts/tests/test_load_to_postgres_atomic.sh
 	bash scripts/tests/test_patient_gender_index.sh
 	bash scripts/tests/test_no_legacy_root_sql_files.sh
+	bash scripts/tests/test_versioned_migration_layout.sh
 	python3 scripts/tests/test_constraint_idempotency_guards.py
 	python3 scripts/tests/test_pre_commit_config.py
 	python3 scripts/tests/test_python_dependencies.py

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Structural regression test for db/tables/*.sql constraint idempotency.
+"""Structural regression test for migration 0001's core-table DDL
+constraint idempotency (db/migrations/sql/0001_baseline/core/*.sql and
+db/migrations/sql/0001_baseline/terminology/*.sql).
 
 PostgreSQL has no `ADD CONSTRAINT IF NOT EXISTS`. Several core table files
-under db/tables/ used to run unconditional statements like:
+under what is now db/migrations/sql/0001_baseline/core/ used to run
+unconditional statements like:
 
     ALTER TABLE :"schema".appointment
       ADD CONSTRAINT appt_person_fk
@@ -290,12 +293,15 @@ def main() -> int:
     default_repo_root = script_dir.parent.parent
     repo_root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else default_repo_root
 
-    tables_dir = repo_root / "db" / "tables"
-    if not tables_dir.is_dir():
-        print(f"FAIL: expected directory not found: {tables_dir}", file=sys.stderr)
+    baseline_dir = repo_root / "db" / "migrations" / "sql" / "0001_baseline"
+    if not baseline_dir.is_dir():
+        print(f"FAIL: expected directory not found: {baseline_dir}", file=sys.stderr)
         return 1
 
-    sql_files = sorted(tables_dir.glob("*.sql")) + sorted((tables_dir / "terminology").glob("*.sql"))
+    sql_files = (
+        sorted((baseline_dir / "core").glob("*.sql"))
+        + sorted((baseline_dir / "terminology").glob("*.sql"))
+    )
 
     all_failures: list[str] = []
     found_fk: set[tuple[str, str]] = set()
@@ -327,8 +333,8 @@ def main() -> int:
         return 1
 
     print(
-        "PASS: all active ALTER TABLE ... ADD CONSTRAINT statements under db/tables/ "
-        "are guarded by a schema/table"
+        "PASS: all active ALTER TABLE ... ADD CONSTRAINT statements under "
+        "db/migrations/sql/0001_baseline/ are guarded by a schema/table"
         + ("/constraint-name" if total_fk else "")
         + "-scoped existence check."
     )

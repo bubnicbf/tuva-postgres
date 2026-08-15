@@ -5,7 +5,7 @@
 # reintroduced into the loader. That file belonged to a legacy schema
 # model (tuva.claim, tuva.claim_line, payer_id, charge_amt, paid_amt,
 # tuva.v_claim_summary) that no longer matches the current per-table
-# definitions under db/tables/ (medical_claim, pharmacy_claim,
+# definitions under db/migrations/sql/0001_baseline/ (medical_claim, pharmacy_claim,
 # eligibility, etc). Running it after loading current CSVs could fail
 # against nonexistent legacy tables/columns.
 #

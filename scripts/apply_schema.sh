@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Compatibility wrapper: delegates to the migration runner
-# (src/tuva_postgres/migrations.py) instead of applying db/tables/*.sql
-# directly. This is the single authoritative schema-deployment path --
-# `make create-db`, `tuva-postgres migrate`, and this script all end up
-# here. See db/migrations/ and docs/RUNBOOK.md.
+# (src/tuva_postgres/migrations.py), which applies the version-owned DDL
+# under db/migrations/sql/ referenced by db/migrations/*.json manifests.
+# This is the single authoritative schema-deployment path -- `make
+# create-db`, `tuva-postgres migrate`, and this script all end up here.
+# See db/migrations/ and docs/RUNBOOK.md.
 #
 # Usage:
 #   bash scripts/apply_schema.sh                    # apply pending migrations

@@ -5,6 +5,6 @@
     "ops_schema": "OPS_SCHEMA"
   },
   "files": [
-    "db/migrations/sql/0002_operational_schema.sql"
+    "db/migrations/sql/0002_operational_schema/0002_operational_schema.sql"
   ]
 }

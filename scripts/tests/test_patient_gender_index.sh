@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Regression test for db/tables/patient.sql and
-# db/tables/tests/patient_gender_addon.sql
+# Regression test for db/migrations/sql/0001_baseline/core/patient.sql and
+# db/tests/patient_gender_addon.sql
 #
 # Guards against the patient table's index drifting out of sync with its
 # column model. patient.sql defines "gender varchar" (there is no "sex"
@@ -27,8 +27,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TARGET_ROOT="${1:-$REPO_ROOT}"
 
-PATIENT_SQL="$TARGET_ROOT/db/tables/patient.sql"
-ADDON_SQL="$TARGET_ROOT/db/tables/tests/patient_gender_addon.sql"
+PATIENT_SQL="$TARGET_ROOT/db/migrations/sql/0001_baseline/core/patient.sql"
+ADDON_SQL="$TARGET_ROOT/db/tests/patient_gender_addon.sql"
 
 fail() {
   echo "FAIL: $1" >&2

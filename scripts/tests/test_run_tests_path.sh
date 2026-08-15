@@ -3,10 +3,11 @@
 #
 # Verifies (by behavior, not by grepping the script source) that
 # run_tests.sh loads its results-table setup and SQL test files from
-# db/tables/tests. This test would FAIL against the old, buggy "db/tests"
-# path: that directory does not exist, so the setup psql call would target
-# a missing file and the *.sql discovery glob would never see a file under
-# db/tables/tests.
+# db/tests -- validation/query SQL, kept separate from the deployable DDL
+# under db/migrations/. This test would FAIL against the old, retired
+# "db/tables/tests" path: that directory no longer exists, so the setup
+# psql call would target a missing file and the *.sql discovery glob would
+# never see a file under db/tests.
 #
 # No real PostgreSQL server is required: stub `psql` and `python3`
 # executables are put first on PATH.
@@ -37,17 +38,17 @@ mkdir -p "$STUB_BIN_DIR"
 : > "$PSQL_LOG"
 
 # --- Build a scratch repo root with just what run_tests.sh needs --------
-# (its own db/tables/tests/*.sql fixtures + the scripts it shells out to),
-# so the script's repository-relative paths resolve consistently and any
-# files it writes (tmp/test_results/*) live entirely under $TMP_DIR.
+# (its own db/tests/*.sql fixtures + the scripts it shells out to), so the
+# script's repository-relative paths resolve consistently and any files it
+# writes (tmp/test_results/*) live entirely under $TMP_DIR.
 mkdir -p "$SCRATCH_REPO/scripts"
-mkdir -p "$SCRATCH_REPO/db/tables/tests"
+mkdir -p "$SCRATCH_REPO/db/tests"
 cp "$REPO_ROOT/scripts/run_tests.sh" "$SCRATCH_REPO/scripts/run_tests.sh"
 cp "$REPO_ROOT/scripts/ingest_test_csv.py" "$SCRATCH_REPO/scripts/ingest_test_csv.py"
-cp "$REPO_ROOT"/db/tables/tests/*.sql "$SCRATCH_REPO/db/tables/tests/"
+cp "$REPO_ROOT"/db/tests/*.sql "$SCRATCH_REPO/db/tests/"
 
-if [[ ! -f "$SCRATCH_REPO/db/tables/tests/zz_results.sql" ]]; then
-  echo "FAIL: fixture setup problem -- db/tables/tests/zz_results.sql not found in the real repo." >&2
+if [[ ! -f "$SCRATCH_REPO/db/tests/zz_results.sql" ]]; then
+  echo "FAIL: fixture setup problem -- db/tests/zz_results.sql not found in the real repo." >&2
   exit 1
 fi
 
@@ -110,32 +111,32 @@ if [[ $RUN_STATUS -ne 0 ]]; then
   fail "scripts/run_tests.sh exited with status $RUN_STATUS"
 fi
 
-# 2) The results-table setup must load db/tables/tests/zz_results.sql.
-if ! grep -qF -- "-f db/tables/tests/zz_results.sql" "$PSQL_LOG"; then
-  fail "no psql invocation loaded db/tables/tests/zz_results.sql"
+# 2) The results-table setup must load db/tests/zz_results.sql.
+if ! grep -qF -- "-f db/tests/zz_results.sql" "$PSQL_LOG"; then
+  fail "no psql invocation loaded db/tests/zz_results.sql"
 fi
 
-# 3) At least one SQL test file under db/tables/tests/ must be applied.
-TEST_FILE_INVOCATIONS="$(grep -F -- "-f db/tables/tests/" "$PSQL_LOG" || true)"
+# 3) At least one SQL test file under db/tests/ must be applied.
+TEST_FILE_INVOCATIONS="$(grep -F -- "-f db/tests/" "$PSQL_LOG" || true)"
 if [[ -z "$TEST_FILE_INVOCATIONS" ]]; then
-  fail "no psql invocation applied a SQL file under db/tables/tests/"
+  fail "no psql invocation applied a SQL file under db/tests/"
 fi
 
 # 4) Those invocations must carry the configured schema variable.
 if ! grep -qF -- "-v schema=${EXPECTED_SCHEMA}" <<<"$TEST_FILE_INVOCATIONS"; then
-  fail "psql invocations for db/tables/tests did not include -v schema=${EXPECTED_SCHEMA}"
+  fail "psql invocations for db/tests did not include -v schema=${EXPECTED_SCHEMA}"
 fi
 
 # 5) Those invocations must carry the configured terminology schema variable.
 if ! grep -qF -- "-v terminology_schema=${EXPECTED_TERM_SCHEMA}" <<<"$TEST_FILE_INVOCATIONS"; then
-  fail "psql invocations for db/tables/tests did not include -v terminology_schema=${EXPECTED_TERM_SCHEMA}"
+  fail "psql invocations for db/tests did not include -v terminology_schema=${EXPECTED_TERM_SCHEMA}"
 fi
 
-# 6) No invocation may reference the obsolete db/tests/ path.
-if grep -qF -- "db/tests/" "$PSQL_LOG"; then
-  fail "found a psql invocation referencing the obsolete db/tests/ path"
+# 6) No invocation may reference the obsolete db/tables/tests/ path.
+if grep -qF -- "db/tables/tests/" "$PSQL_LOG"; then
+  fail "found a psql invocation referencing the obsolete db/tables/tests/ path"
 fi
 
-echo "PASS: run_tests.sh loads db/tables/tests/zz_results.sql and applies SQL"
-echo "      test files from db/tables/tests/ with -v schema=${EXPECTED_SCHEMA}"
+echo "PASS: run_tests.sh loads db/tests/zz_results.sql and applies SQL"
+echo "      test files from db/tests/ with -v schema=${EXPECTED_SCHEMA}"
 echo "      and -v terminology_schema=${EXPECTED_TERM_SCHEMA}."

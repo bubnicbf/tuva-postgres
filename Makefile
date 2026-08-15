@@ -20,6 +20,7 @@ test-shell:
 	bash scripts/tests/test_load_to_postgres_atomic.sh
 	bash scripts/tests/test_patient_gender_index.sh
 	python3 scripts/tests/test_constraint_idempotency_guards.py
+	python3 scripts/tests/test_pre_commit_config.py
 
 # Requires a real, DISPOSABLE PostgreSQL test database via PG_DSN (see .env).
 # Applies the core table DDL twice into a uniquely-named temporary schema

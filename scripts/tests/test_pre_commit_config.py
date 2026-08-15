@@ -42,7 +42,29 @@ EXPECTED_HOOK_IDS = [
     "check-merge-conflict",
     "check-toml",
     "check-yaml",
+    "ruff-lint",
+    "ruff-format-check",
+    "mypy",
+    "sqlfluff-lint",
     "sqlfluff-psql-fix",
+]
+
+# Local hooks that must run the locked uv-managed toolchain (entry
+# starting with "uv run ..."), rather than a separately-installed copy of
+# the same tool -- see the "no duplicate independent tool installations"
+# check in validate() below, which additionally confirms no remote repo
+# (e.g. astral-sh/ruff-pre-commit, pre-commit/mirrors-mypy) supplies any
+# of these.
+UV_MANAGED_LOCAL_HOOK_IDS = ["ruff-lint", "ruff-format-check", "mypy", "sqlfluff-lint", "sqlfluff-psql-fix"]
+
+# Remote repo URL substrings that would indicate a second, independently
+# versioned installation of a tool this repository already manages via
+# uv.lock -- must never appear as a `repo:` value.
+FORBIDDEN_REMOTE_TOOL_REPO_SUBSTRINGS = [
+    "ruff-pre-commit",
+    "mirrors-mypy",
+    "sqlfluff",
+    "pre-commit/mirrors-pytest",
 ]
 
 TOP_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_\-]*):\s*(.*)$")
@@ -50,6 +72,11 @@ REPO_ITEM_RE = re.compile(r"^-\s*repo:\s*(\S+)\s*$")
 HOOKS_KEY_RE = re.compile(r"^hooks:\s*$")
 HOOK_ID_ITEM_RE = re.compile(r"^-\s*id:\s*(\S+)\s*$")
 STAGES_KEY_RE = re.compile(r"^stages:\s*(.*)$")
+ENTRY_KEY_RE = re.compile(r"^entry:\s*(.*)$")
+LANGUAGE_KEY_RE = re.compile(r"^language:\s*(.*)$")
+FILES_KEY_RE = re.compile(r"^files:\s*(.*)$")
+TYPES_KEY_RE = re.compile(r"^types:\s*(.*)$")
+PASS_FILENAMES_KEY_RE = re.compile(r"^pass_filenames:\s*(.*)$")
 
 
 class ConfigError(Exception):
@@ -190,13 +217,29 @@ def hook_is_manual_only(hook_lines):
     return False
 
 
+def hook_field(hook_lines, key_re):
+    """Return the first matching value for a `key: value` field within one
+    hook item's lines (e.g. `entry:`, `language:`, `files:`, `types:`,
+    `pass_filenames:`), or None if the hook doesn't declare that key."""
+    for _, _, content in hook_lines:
+        m = key_re.match(content)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def validate(path: Path):
     """Validate `path` as a pre-commit config. Returns diagnostic strings.
 
     Raises ConfigError (with a clear, specific message) on any structural
     problem: duplicate/missing top-level `repos` key, a `repos` value that
     isn't a sequence, missing/duplicate hook IDs, a missing or duplicated
-    `repo: local` entry, or a non-manual-only sqlfluff-psql-fix hook.
+    `repo: local` entry, a non-manual-only sqlfluff-psql-fix hook, a local
+    tool hook that doesn't run through the locked uv environment, a mypy
+    hook that relies on passed filenames instead of the configured
+    production source set, a Ruff/SQLFluff hook not scoped to its
+    language's files, or a remote repo entry that would install a second,
+    independently-versioned copy of a uv-managed tool.
     """
     if not path.is_file():
         raise ConfigError(f"config file not found: {path}")
@@ -244,12 +287,11 @@ def validate(path: Path):
         raise ConfigError(f"expected exactly one 'repo: local' entry, found {len(local_entries)}")
 
     all_hook_ids = []
-    sqlfluff_hook_lines = None
+    hooks_by_id = {}
     for entry in entries:
         for item in find_hook_items(entry["lines"], entry["indent"]):
             all_hook_ids.append(item["id"])
-            if item["id"] == "sqlfluff-psql-fix":
-                sqlfluff_hook_lines = item["lines"]
+            hooks_by_id[item["id"]] = item["lines"]
 
     counts = {}
     for hid in all_hook_ids:
@@ -265,6 +307,7 @@ def validate(path: Path):
     if missing:
         raise ConfigError("missing required hook ID(s): " + ", ".join(missing))
 
+    sqlfluff_hook_lines = hooks_by_id.get("sqlfluff-psql-fix")
     if sqlfluff_hook_lines is None:
         raise ConfigError("sqlfluff-psql-fix hook not found")
     if not hook_is_manual_only(sqlfluff_hook_lines):
@@ -272,12 +315,75 @@ def validate(path: Path):
             "sqlfluff-psql-fix hook is not manual-only (expected 'stages: [manual]')"
         )
 
+    # --- local hooks run through the locked uv environment ------------------
+    for hook_id in UV_MANAGED_LOCAL_HOOK_IDS:
+        hook_lines = hooks_by_id[hook_id]
+        language = hook_field(hook_lines, LANGUAGE_KEY_RE)
+        entry_cmd = hook_field(hook_lines, ENTRY_KEY_RE)
+        if language != "system":
+            raise ConfigError(f"hook {hook_id!r} must use 'language: system', found {language!r}")
+        if not entry_cmd or not entry_cmd.startswith("uv run "):
+            raise ConfigError(
+                f"hook {hook_id!r} entry {entry_cmd!r} does not start with 'uv run ' -- local "
+                "tool hooks must resolve the locked uv environment directly in their entry "
+                "command, regardless of how pre-commit itself was invoked"
+            )
+
+    # --- mypy checks the configured production source set, not passed
+    #     filenames -----------------------------------------------------------
+    mypy_lines = hooks_by_id["mypy"]
+    mypy_pass_filenames = hook_field(mypy_lines, PASS_FILENAMES_KEY_RE)
+    if mypy_pass_filenames != "false":
+        raise ConfigError(
+            f"'mypy' hook must set 'pass_filenames: false' (found {mypy_pass_filenames!r}) -- it "
+            "must check the configured production source set, not an arbitrary subset of "
+            "passed filenames"
+        )
+    mypy_entry = hook_field(mypy_lines, ENTRY_KEY_RE)
+    if not mypy_entry or "src/tuva_postgres" not in mypy_entry:
+        raise ConfigError(
+            f"'mypy' hook entry {mypy_entry!r} does not target src/tuva_postgres explicitly"
+        )
+
+    # --- Ruff hooks scoped to Python files; SQLFluff hooks scoped to SQL
+    #     files -------------------------------------------------------------
+    for hook_id in ("ruff-lint", "ruff-format-check"):
+        types_value = hook_field(hooks_by_id[hook_id], TYPES_KEY_RE)
+        if types_value != "[python]":
+            raise ConfigError(f"hook {hook_id!r} must set 'types: [python]', found {types_value!r}")
+
+    for hook_id in ("sqlfluff-lint", "sqlfluff-psql-fix"):
+        files_value = hook_field(hooks_by_id[hook_id], FILES_KEY_RE)
+        if files_value != r"\.sql$":
+            raise ConfigError(
+                f"hook {hook_id!r} must be scoped to SQL files via 'files: \\.sql$', "
+                f"found {files_value!r}"
+            )
+
+    # --- no duplicate, independently-versioned remote tool installations ---
+    for entry in entries:
+        if entry["repo"] == "local":
+            continue
+        for bad_substring in FORBIDDEN_REMOTE_TOOL_REPO_SUBSTRINGS:
+            if bad_substring.lower() in entry["repo"].lower():
+                raise ConfigError(
+                    f"remote repo {entry['repo']!r} appears to install its own copy of a "
+                    "uv-managed tool -- Ruff/mypy/pytest/SQLFluff must only ever run through "
+                    "the local, uv-managed hooks above, never a second pre-commit-managed "
+                    "installation with an independently pinned version"
+                )
+
     return [
         f"Top-level 'repos' key: exactly one, at line {repos_line_no}.",
         f"Repo entries ({len(entries)}): {', '.join(e['repo'] for e in entries)}.",
         f"'repo: local' entries: {len(local_entries)}.",
         f"Hook IDs found ({len(counts)}): {', '.join(sorted(counts))}.",
         "sqlfluff-psql-fix: manual-only (stages: [manual]).",
+        f"Local uv-managed hooks (entry starts 'uv run ', language: system): "
+        f"{', '.join(UV_MANAGED_LOCAL_HOOK_IDS)}.",
+        "mypy: pass_filenames: false, targets src/tuva_postgres explicitly.",
+        "ruff-lint/ruff-format-check: types: [python]. sqlfluff-lint/sqlfluff-psql-fix: files: \\.sql$.",
+        "No remote repo installs an independent copy of a uv-managed tool.",
     ]
 
 
@@ -301,7 +407,11 @@ def main(argv):
         f"PASS: {path} has exactly one top-level 'repos' key containing every required hook "
         "exactly once,"
     )
-    print("      exactly one 'repo: local' entry, and sqlfluff-psql-fix remains manual-only.")
+    print(
+        "      exactly one 'repo: local' entry, sqlfluff-psql-fix remains manual-only, and "
+        "every local Ruff/mypy/SQLFluff hook runs through the locked uv environment with no "
+        "duplicate remote tool installation."
+    )
     for d in diagnostics:
         print(f"  - {d}")
     return 0

@@ -1,14 +1,18 @@
 .PHONY: init deps create-db migrate migration-status load fetch pipeline health \
-        test test-shell test-unit test-integration test-schema-idempotency \
+        test test-shell test-unit test-integration test-python test-schema-idempotency \
         test-load-integration test-container test-deploy check-python-deps \
         docker-build compose-up compose-down lint fmt \
+        lint-python format-python format-python-check typecheck lint-sql quality \
         local-db-up local-db-migrate local-db-ready local-db-status \
         local-db-shell local-db-logs local-db-down local-db-reset \
         test-compose-integration
 
 # Requires uv (https://docs.astral.sh/uv/). Creates/updates .venv from the
 # committed uv.lock (exact, hash-locked versions -- no ad hoc `pip install`)
-# and installs the pre-commit git hook via that same locked environment.
+# for the FULL locked toolchain (runtime deps + Ruff/mypy/pytest/SQLFluff/
+# pre-commit -- see pyproject.toml's [dependency-groups] dev and README.md's
+# "Python development and quality tooling" section) and installs the
+# pre-commit git hook via that same locked environment.
 init:
 	uv sync --locked
 	uv run pre-commit install
@@ -88,22 +92,39 @@ test-schema-idempotency:
 test-load-integration:
 	. .env && bash scripts/tests/test_load_to_postgres_atomic_integration.sh
 
-# Python unit tests for the src/tuva_postgres package (tests/unit/). No
-# database, Docker, or network required -- DB-touching code paths are
-# exercised against fakes/an in-process mock HTTP server (see
-# tests/unit/test_orchestrator.py's module docstring). Safe to run
-# anywhere `uv sync` has been run.
+# Python unit tests for the src/tuva_postgres package (tests/unit/), run
+# through pytest (see [tool.pytest.ini_options] in pyproject.toml --
+# pytest collects and runs these unittest.TestCase suites natively, no
+# rewrite required). No database, Docker, or network required --
+# DB-touching code paths are exercised against fakes/an in-process mock
+# HTTP server (see tests/unit/test_orchestrator.py's module docstring).
+# Safe to run anywhere `uv sync --locked` has been run. Scoped to
+# tests/unit ONLY -- never tests/integration -- so a plain unit-test run
+# can never accidentally depend on, or connect to, a database.
 test-unit:
-	uv run python3 -m unittest discover -s tests/unit -v
+	uv run pytest tests/unit
 
 # Requires a real, DISPOSABLE PostgreSQL test database via PG_DSN (see
 # .env). Applies migrations, runs the full pipeline twice against an
 # in-process mock manifest server, and injects a corrupt artifact -- see
 # tests/integration/test_pipeline_integration.py's module docstring for
 # exactly what this proves. Creates and drops its own uniquely-suffixed
-# schemas only. Never run against production.
+# schemas only. Never run against production. Run through pytest, scoped
+# to tests/integration ONLY (marked `integration` in pyproject.toml's
+# pytest markers, for anyone filtering with `-m`).
 test-integration:
-	. .env && uv run python3 -m unittest discover -s tests/integration -v
+	. .env && uv run pytest tests/integration
+
+# The complete pytest suite in one command, still database-free by
+# default: collects both tests/unit and tests/integration but deselects
+# anything marked `integration` (see [tool.pytest.ini_options] in
+# pyproject.toml), so this is safe to run without PG_DSN/a database --
+# it's the pytest-native equivalent of `test-unit`, useful for confirming
+# collection across the whole tests/ tree (import errors, marker typos,
+# duplicate test IDs) in one pass. Use `test-integration` (above) to
+# actually exercise the database-dependent suite.
+test-python:
+	uv run pytest tests -m "not integration"
 
 test: test-shell
 	. .env && bash scripts/run_tests.sh
@@ -114,20 +135,72 @@ test: test-shell
 check-python-deps:
 	uv lock --check
 	uv sync --locked
+	uv run ruff --version
+	uv run mypy --version
+	uv run pytest --version
 	uv run sqlfluff --version
 	uv run pre-commit --version
 
-# The local sqlfluff-psql-fix hook uses `language: system`, so it relies on
-# whatever `sqlfluff` is first on PATH -- `uv run` puts the locked .venv on
-# PATH for the duration of the command, which is what makes pre-commit find
-# the locked SQLFluff install here instead of whatever (if anything) is on
-# the system PATH.
+# Ruff lint, in check mode (no autofix) -- see [tool.ruff]/[tool.ruff.lint]
+# in pyproject.toml for the configured rule set and per-file ignores.
+lint-python:
+	uv run ruff check src tests scripts
+
+# Applies Ruff's formatter in place. NEVER run this against db/ -- Ruff
+# only touches *.py files, so SQL is never at risk from this target, but
+# it's still meant for src/tests/scripts, not a blanket repo-wide format.
+format-python:
+	uv run ruff format src tests scripts
+
+# Same as format-python, but fails instead of rewriting -- what CI and
+# the pre-commit ruff-format-check hook actually run.
+format-python-check:
+	uv run ruff format --check src tests scripts
+
+# Static type checking for the production package only (see [tool.mypy]'s
+# `files = ["src/tuva_postgres"]` in pyproject.toml) -- must match what
+# CI and the pre-commit mypy hook check. Test/script code is not held to
+# the same typing bar.
+typecheck:
+	uv run mypy src/tuva_postgres
+
+# SQLFluff lint (read-only) through the psql-aware wrapper, against every
+# tracked *.sql file (migrations under db/migrations/ included -- see the
+# wrapper's psql-variable normalization, which lets checksum-protected
+# migration SQL lint cleanly without ever touching its actual content;
+# and db/tests/, which is linted the same way). Distinct from `fmt`
+# below, which is fix/format and manual-only.
+lint-sql:
+	uv run bash scripts/sqlfluff_psql_wrapper.sh lint $$(git ls-files '*.sql')
+
+# Database-free quality gate: dependency-lock validation, Ruff lint, Ruff
+# format check, mypy, the unit test suite, and SQLFluff lint. Does not
+# require PG_DSN, Docker, or a running Postgres. This is what a developer
+# (and CI) should run before every push.
+quality: check-python-deps lint-python format-python-check typecheck test-unit lint-sql
+	@echo "quality: dependency lock, Ruff (lint + format check), mypy, pytest unit suite, and SQLFluff lint all passed."
+
+# The local Ruff/mypy/SQLFluff-lint hooks use `language: system` with
+# their entry commands prefixed `uv run ...` directly (see
+# .pre-commit-config.yaml), so every local hook resolves the locked .venv
+# regardless of how pre-commit itself was invoked (via `make lint` below,
+# or via the installed git hook triggered directly by `git commit`) --
+# the committed uv.lock remains the sole tool-version source either way.
 lint:
 	uv run pre-commit run --all-files
 
-# Runs the manual-only sqlfluff-psql-fix hook (see .pre-commit-config.yaml)
-# against every file it's scoped to, via the same locked environment.
+# Ruff formatting (rewrites src/tests/scripts/*.py in place) plus the
+# existing manual-only SQLFluff formatter/fixer.
+#
+# WARNING: db/migrations/ SQL is checksum-protected (see
+# src/tuva_postgres/migrations.py) -- the sqlfluff-psql-fix hook only
+# ever PREVIEWS fixes to stdout (see scripts/sqlfluff_psql_wrapper.sh's
+# "format" mode; it never writes back to any file), but you must still
+# never manually copy its suggested output back into an already-applied
+# migration file. New, not-yet-applied SQL (a new migration, or anything
+# under db/tests/) is the safe place to actually apply suggested fixes.
 fmt:
+	uv run ruff format src tests scripts
 	uv run pre-commit run --hook-stage manual sqlfluff-psql-fix --all-files
 
 # Structural checks on Dockerfile/.dockerignore/compose.yaml (always run,

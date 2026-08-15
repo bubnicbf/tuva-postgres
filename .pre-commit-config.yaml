@@ -14,9 +14,50 @@ repos:
       - id: check-yaml
   - repo: local
     hooks:
+      # Every hook below is `language: system` with its entry prefixed
+      # `uv run ...` directly, so it resolves the committed uv.lock's
+      # locked tool versions regardless of how pre-commit itself was
+      # invoked (`make lint`, or the installed git hook running directly
+      # off `git commit`) -- Ruff/mypy/SQLFluff are never separately
+      # installed/managed by pre-commit itself (no
+      # https://github.com/astral-sh/ruff-pre-commit or
+      # https://github.com/pre-commit/mirrors-mypy entries here), which
+      # would risk a second, independently-versioned copy of the same
+      # tools drifting from uv.lock.
+      - id: ruff-lint
+        name: ruff check (uv-managed)
+        entry: uv run ruff check
+        language: system
+        types: [python]
+
+      - id: ruff-format-check
+        name: ruff format --check (uv-managed)
+        entry: uv run ruff format --check
+        language: system
+        types: [python]
+
+      - id: mypy
+        name: mypy (uv-managed; checks src/tuva_postgres, not passed filenames)
+        # Deliberately ignores whatever filenames pre-commit would pass
+        # (pass_filenames: false + always_run: true) -- mypy needs the
+        # whole configured production source set (see [tool.mypy]'s
+        # `files` in pyproject.toml) for its cross-module analysis to be
+        # meaningful, not an arbitrary subset of changed files.
+        entry: uv run mypy src/tuva_postgres
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: sqlfluff-lint
+        name: sqlfluff lint (psql-aware wrapper)
+        entry: uv run bash scripts/sqlfluff_psql_wrapper.sh lint
+        language: system
+        pass_filenames: true
+        files: \.sql$
+
       - id: sqlfluff-psql-fix
         name: sqlfluff-fix (psql-aware wrapper; manual only)
-        entry: bash scripts/sqlfluff_psql_wrapper.sh format
+        entry: uv run bash scripts/sqlfluff_psql_wrapper.sh format
         language: system
         pass_filenames: true
         stages: [manual]

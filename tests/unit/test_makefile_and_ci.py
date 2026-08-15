@@ -48,6 +48,82 @@ class TestMakefileTargets(unittest.TestCase):
         self.assertNotIn("kubectl apply -f", self.text)  # only --dry-run=client apply is present
         self.assertIn("--dry-run=client", self.text)
 
+    def test_local_postgres_lifecycle_targets_present(self):
+        for target in (
+            "local-db-up", "local-db-migrate", "local-db-ready", "local-db-status",
+            "local-db-shell", "local-db-logs", "local-db-down", "local-db-reset",
+            "test-compose-integration",
+        ):
+            self.assertRegex(self.text, rf"(?m)^{re.escape(target)}:", f"missing Makefile target {target!r}")
+
+    def _recipe(self, target: str) -> str:
+        match = re.search(rf"(?m)^{re.escape(target)}:.*?\n((?:\t.*\n?)*)", self.text)
+        self.assertIsNotNone(match, f"could not locate recipe body for target {target!r}")
+        return match.group(1)
+
+    def test_compose_down_and_local_db_down_never_pass_dash_v(self):
+        # Routine shutdown must never delete the Postgres data volume --
+        # only the explicit, guarded reset target may use `down -v`.
+        for target in ("compose-down", "local-db-down"):
+            recipe = self._recipe(target)
+            self.assertIn("docker compose down", recipe)
+            self.assertNotRegex(recipe, r"down\s+-v\b", f"{target} must not pass -v to 'docker compose down'")
+
+    def test_only_local_db_reset_uses_down_dash_v(self):
+        # local-db-reset is the sole ordinary target permitted to delete
+        # the local Postgres data volume.
+        targets_using_down_v = [
+            target
+            for target in (
+                "compose-up", "compose-down", "local-db-up", "local-db-migrate",
+                "local-db-ready", "local-db-status", "local-db-shell", "local-db-logs",
+                "local-db-down", "local-db-reset",
+            )
+            if re.search(r"down\s+-v\b", self._recipe(target))
+        ]
+        self.assertEqual(targets_using_down_v, ["local-db-reset"])
+
+    def test_local_db_reset_is_visibly_marked_destructive_and_guarded(self):
+        # The comment block immediately preceding the target, plus the
+        # recipe body itself, must call out that this is destructive.
+        target_idx = self.text.index("local-db-reset:")
+        preceding_comment_block = self.text[:target_idx].splitlines()[-10:]
+        recipe = self._recipe("local-db-reset")
+        self.assertTrue(
+            any("DESTRUCTIVE" in line for line in preceding_comment_block),
+            "local-db-reset's preceding comment block does not say DESTRUCTIVE",
+        )
+        self.assertIn("PERMANENTLY DELETE", recipe)
+        # Guarded: requires either the explicit opt-in var or an
+        # interactive confirmation prompt -- never unconditional.
+        self.assertIn("CONFIRM_LOCAL_DB_RESET", recipe)
+        self.assertIn("read -r -p", recipe)
+
+    def test_local_db_migrate_and_status_use_real_migration_runner_via_compose(self):
+        migrate_recipe = self._recipe("local-db-migrate")
+        self.assertIn("docker compose run", migrate_recipe)
+        self.assertIn("migrate", migrate_recipe)
+
+        status_recipe = self._recipe("local-db-status")
+        self.assertIn("docker compose", status_recipe)
+        self.assertIn("migrate --status", status_recipe)
+
+    def test_local_db_shell_uses_compose_container_not_host_psql(self):
+        recipe = self._recipe("local-db-shell")
+        self.assertIn("docker compose exec", recipe)
+        self.assertIn("psql", recipe)
+
+    def test_local_db_up_waits_for_health(self):
+        recipe = self._recipe("local-db-up")
+        self.assertIn("docker compose up", recipe)
+        self.assertIn("--wait", recipe)
+
+    def test_local_db_ready_composes_up_then_migrate(self):
+        recipe_line = re.search(r"(?m)^local-db-ready:\s*(.*)$", self.text)
+        self.assertIsNotNone(recipe_line)
+        self.assertIn("local-db-up", recipe_line.group(1))
+        self.assertIn("local-db-migrate", recipe_line.group(1))
+
 
 @unittest.skipUnless(HAVE_YAML, "PyYAML is not installed in this environment")
 class TestCiWorkflow(unittest.TestCase):

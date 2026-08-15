@@ -1,0 +1,39 @@
+# Focused, non-secret example: HOST-side environment variables for the
+# local Docker Compose PostgreSQL stack (see compose.yaml and README.md's
+# "Local PostgreSQL with Docker Compose" section). This is a narrower
+# companion to scripts/setup_env.example (which now defaults to the same
+# values) -- use whichever you find clearer; they must never disagree.
+#
+# Load it the same way as the main env template:
+#
+#   cp scripts/setup_local_postgres.example .env
+#   . .env
+#
+# Two different mechanisms are at play, and this file only participates
+# in one of them:
+#   - Shell sourcing (`. .env`, what the Makefile's `local-db-*` and
+#     other targets do): plain bash variable assignment/expansion,
+#     evaluated when you run `. .env` yourself.
+#   - Compose interpolation (`${POSTGRES_PORT:-5432}` inside
+#     compose.yaml itself): resolved by `docker compose` directly from
+#     your shell environment (or a `.env` file *Compose* reads from the
+#     project directory) at `docker compose ...` invocation time.
+# `POSTGRES_PORT` in this file affects both, since bash and Compose both
+# understand `${VAR:-default}` -- export it before running `docker
+# compose` if you've changed it from the default 5432 (see README.md's
+# "changing the host port" instructions), and it will be picked up by
+# both this file's PG_DSN and Compose's own port mapping consistently.
+
+# --- Container-side (informational only -- this is what's already baked
+#     into compose.yaml's `pipeline`/`migrate` services; you do not set
+#     this yourself) ---------------------------------------------------
+# PG_DSN=postgresql://tuva_local:local-only-example-password-change-me@postgres:5432/tuva
+
+# --- Host-side (what you actually load) -----------------------------------
+# Matches compose.yaml's `postgres` service credentials exactly. This is
+# a clearly-labeled LOCAL-ONLY placeholder password -- never a real
+# secret, and never valid against any non-local database.
+export PG_DSN="postgresql://tuva_local:local-only-example-password-change-me@127.0.0.1:${POSTGRES_PORT:-5432}/tuva"
+export PG_SCHEMA="tuva"
+export TERMINOLOGY_SCHEMA="tuva_term"
+export OPS_SCHEMA="tuva_ops"

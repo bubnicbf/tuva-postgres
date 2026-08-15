@@ -67,7 +67,8 @@ psql "$PG_DSN" -v ON_ERROR_STOP=1 -c "CREATE SCHEMA \"${SCHEMA_NAME}\";"
 # --- 6)-7) Minimal fixture tables using the managed table names -------------
 # Simplified on purpose: this test validates loader transaction behavior
 # (truncate-together, single-session commit/rollback, retry safety), not
-# the full real column/constraint set from db/tables/*.sql. Every table
+# the full real column/constraint set from the migration 0001 baseline DDL
+# under db/migrations/sql/0001_baseline/. Every table
 # the loader manages gets a fixture row; only patient/encounter/
 # practitioner are referenced by foreign keys, matching the real schema's
 # reference graph. All FKs are DEFERRABLE INITIALLY DEFERRED, matching the

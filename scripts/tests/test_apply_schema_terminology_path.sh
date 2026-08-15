@@ -2,7 +2,9 @@
 # Regression test for scripts/apply_schema.sh
 #
 # apply_schema.sh used to shell out to `psql` directly, applying
-# db/tables/*.sql files itself. It is now a compatibility wrapper that
+# db/tables/*.sql files itself (before db/tables/ was retired in favor of
+# version-owned migration directories under db/migrations/sql/). It is
+# now a compatibility wrapper that
 # delegates to the migration runner (`python3 -m tuva_postgres.migrations`,
 # see db/migrations/ and src/tuva_postgres/migrations.py) -- the single
 # authoritative schema-deployment path. This test verifies that

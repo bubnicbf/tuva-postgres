@@ -11,14 +11,14 @@ TMP_DIR="tmp/test_results"
 mkdir -p "$TMP_DIR"
 
 # Ensure results table & views exist
-psql "$PG_DSN" -v ON_ERROR_STOP=1 -v schema="$PG_SCHEMA" -f db/tables/tests/zz_results.sql
+psql "$PG_DSN" -v ON_ERROR_STOP=1 -v schema="$PG_SCHEMA" -f db/tests/zz_results.sql
 
 # Execute each test file to CSV
 shopt -s nullglob
-mapfile -t files < <(ls -1 db/tables/tests/*.sql | sort)
+mapfile -t files < <(ls -1 db/tests/*.sql | sort)
 
 if [[ ${#files[@]} -eq 0 ]]; then
-  echo "No SQL tests found in db/tables/tests/"
+  echo "No SQL tests found in db/tests/"
   exit 0
 fi
 

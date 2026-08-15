@@ -42,9 +42,9 @@ def substitute_psql_vars(sql_text: str, variables: dict[str, str]) -> str:
       :"name"   -> a double-quoted SQL identifier (embedded " doubled)
       :'name'   -> a single-quoted SQL string literal (embedded ' doubled)
 
-    This lets migrations execute the existing db/tables/*.sql files
-    (written for psql's `-f` + `-v`) through a plain psycopg connection,
-    without shelling out to the `psql` binary.
+    This lets migrations execute the version-owned DDL files under
+    db/migrations/sql/ (written for psql's `-f` + `-v`) through a plain
+    psycopg connection, without shelling out to the `psql` binary.
     """
     result = sql_text
     for name, value in variables.items():

@@ -67,6 +67,75 @@ Check status any time without applying anything:
 make migration-status           # or: uv run tuva-postgres migrate --status
 ```
 
+## Database migrations architecture
+
+`db/migrations/` is the **sole authoritative home for deployable DDL**.
+No table, view, or constraint definition lives anywhere else in this
+repository.
+
+- Each migration is a versioned JSON manifest --
+  `db/migrations/{version}_{slug}.json` -- declaring its `version`
+  (a numeric string like `"0001"`), a `description`, `vars` (SQL
+  identifier placeholders mapped to `PipelineConfig` attribute names,
+  e.g. `"schema": "PG_SCHEMA"`), and an ordered `files` list. That
+  `files` order is the migration's authoritative execution order --
+  `tuva_postgres.migrations.discover()` never relies on filesystem
+  traversal order.
+- Every migration owns an exclusive directory under
+  `db/migrations/sql/{version}_{slug}/` (named after its own manifest
+  filename), optionally organized into subdirectories for readability
+  (migration 0001 uses `core/`, `views/`, and `terminology/`). A manifest
+  may only reference files inside its own version-owned directory; the
+  runner rejects references to `db/tables/`, another migration's
+  directory, or anything outside the repository (path traversal).
+- **Applied migrations are immutable.** Once a migration has shipped,
+  its files and manifest `files` order must never change. Each
+  migration's checksum is a SHA-256 over its ordered files' basenames,
+  byte lengths, and contents; the runner refuses to proceed if an
+  already-applied migration's checksum no longer matches (see "Migration
+  failure handling" below). Moving a file without changing its basename
+  or bytes preserves its checksum -- this is how migrations 0001 and
+  0002 were reorganized from a flat `db/tables/*.sql` layout into
+  version-owned directories without invalidating any database that had
+  already applied them.
+- Database changes always go into a **new** migration at the next unused
+  numeric version. Never edit an existing, applied migration.
+- Migrations run transactionally (one migration's DDL + its
+  `schema_migrations` insert commit or roll back together) and are
+  recorded in `{OPS_SCHEMA}.schema_migrations`. Forward migrations only
+  -- there is no automatic down-migration/rollback mechanism (see "Image
+  rollback" below for how this repository handles rollback instead).
+- SQL data-quality/validation queries (the smoke tests and add-on checks
+  `scripts/run_tests.sh` runs after a load) are a **separate concern**
+  and live under `db/tests/`, not `db/migrations/` -- they are read-only
+  checks, never deployable DDL, and are not part of migration discovery.
+
+### Adding a new migration
+
+1. Pick the next unused numeric version (check `make migration-status`
+   or the highest existing `db/migrations/000N_*.json`), e.g. `0003`.
+2. Create `db/migrations/0003_{slug}.json` with `version: "0003"`, a
+   clear `description`, any `vars` your SQL needs (identifier
+   placeholders only -- see `_validate_identifier` in
+   `tuva_postgres/migrations.py`), and an ordered `files` list.
+3. Add the SQL under `db/migrations/sql/0003_{slug}/`, split into
+   multiple files if that helps readability -- list them in
+   `files` in dependency-safe order (e.g. a table before a view that
+   selects from it).
+4. Run `make migration-status` to confirm it shows up as pending, then
+   `make migrate` (or `make create-db`) against a disposable database to
+   apply and verify it.
+5. Add unit test coverage in `tests/unit/test_migrations.py` if the
+   change exercises new discovery/checksum behavior, and integration
+   coverage in `tests/integration/test_pipeline_integration.py` if it
+   changes runtime behavior (e.g. new managed tables). Extend
+   `scripts/tests/test_schema_constraint_idempotency.sh` if it adds new
+   foreign keys or catalog invariants worth pinning.
+6. Never modify `db/migrations/0001_baseline.json`,
+   `db/migrations/0002_operational_schema.json`, or any file under their
+   version-owned directories -- add `0003` (or the next open version)
+   instead, even for a one-line fix.
+
 ## Manual run
 
 ```bash

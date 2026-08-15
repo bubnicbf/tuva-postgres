@@ -10,7 +10,8 @@ be acquired) with a sanitized error and a nonzero process exit; the lock
 is always released.
 
 Why migrations run before the `running` record is created: pipeline_runs
-and pipeline_artifacts (see db/migrations/sql/0002_operational_schema.sql)
+and pipeline_artifacts (see
+db/migrations/sql/0002_operational_schema/0002_operational_schema.sql)
 are themselves created by a migration. On a virgin database there is no
 operational schema yet to record a run against, so this orchestrator
 applies pending migrations first -- on every run after the first this is

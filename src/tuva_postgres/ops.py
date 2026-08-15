@@ -1,5 +1,5 @@
 """Operational bookkeeping: pipeline_runs / pipeline_artifacts writes and
-reads (see db/migrations/sql/0002_operational_schema.sql).
+reads (see db/migrations/sql/0002_operational_schema/0002_operational_schema.sql).
 
 Every function here commits its own small write immediately, rather than
 participating in one long-lived transaction with the rest of the

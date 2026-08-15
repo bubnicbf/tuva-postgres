@@ -41,7 +41,7 @@ trap cleanup EXIT
 STUB_BIN_DIR="$TMP_DIR/bin"
 SCRATCH_REPO="$TMP_DIR/repo"
 PSQL_LOG="$TMP_DIR/psql_invocations.log"
-mkdir -p "$STUB_BIN_DIR" "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/db/tables/tests"
+mkdir -p "$STUB_BIN_DIR" "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/db/tests"
 : > "$PSQL_LOG"
 
 # --- Minimal scratch fixtures --------------------------------------------
@@ -50,12 +50,12 @@ mkdir -p "$STUB_BIN_DIR" "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/db/tables/tests"
 cp "$REAL_RUN_TESTS" "$SCRATCH_REPO/scripts/run_tests.sh"
 cp "$REPO_ROOT/scripts/ingest_test_csv.py" "$SCRATCH_REPO/scripts/ingest_test_csv.py"
 
-cat > "$SCRATCH_REPO/db/tables/tests/zz_results.sql" <<'SQL'
+cat > "$SCRATCH_REPO/db/tests/zz_results.sql" <<'SQL'
 -- Minimal stand-in for the real zz_results.sql results-table setup.
 SELECT 1;
 SQL
 
-cat > "$SCRATCH_REPO/db/tables/tests/sample_smoke.sql" <<'SQL'
+cat > "$SCRATCH_REPO/db/tests/sample_smoke.sql" <<'SQL'
 -- Minimal fixture SQL test with a "test" and "pass" column.
 SELECT 'sample_smoke' AS test, true AS pass;
 SQL

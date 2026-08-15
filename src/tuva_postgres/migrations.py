@@ -1,24 +1,41 @@
 """Migration history and runner.
 
+`db/migrations/` is the sole authoritative home for deployable DDL.
 Migrations are discovered from `db/migrations/*.json` manifests (NOT the
-`.sql` files directly -- a manifest lists, in a fixed deterministic order,
-which file(s) make up that migration). This lets migration "0001_baseline"
-reference the existing, already-reviewed `db/tables/*.sql` schema
-(dependency-safe ordered: see db/migrations/0001_baseline.json) without
-duplicating ~90 files into a second location -- there is exactly one
-source of truth for the DDL. Later migrations (0002+) are ordinary new
-`.sql` files under db/migrations/sql/.
+`.sql` files directly -- a manifest lists, in a fixed, deterministic
+order, which file(s) make up that migration). Every migration owns an
+exclusive directory under `db/migrations/sql/`, named after its manifest's
+filename (e.g. `0001_baseline.json` -> `db/migrations/sql/0001_baseline/`,
+itself organized into `core/`, `views/`, and `terminology/` subdirectories
+for readability -- see db/migrations/0001_baseline.json). `discover()`
+enforces this: every referenced file must resolve to a regular file
+inside the repository (no path traversal), under `db/migrations/sql/`,
+and specifically under the directory owned by that exact migration
+version -- a new migration can never reference or silently depend on
+another migration's already-applied SQL.
 
 Each migration's checksum is a SHA-256 over its ordered constituent
 files' contents (framed with path+length so reordering or truncation
 changes the hash); a later edit to any file a migration manifest
 references is therefore detected as a checksum mismatch on the next run,
-exactly like editing an already-applied migration file directly.
+exactly like editing an already-applied migration file directly. Applied
+migrations and their file layout are immutable: moving a file without
+changing its basename or bytes preserves its checksum (and is how
+migrations 0001/0002 were reorganized into version-owned directories
+without invalidating databases that already applied them), but editing
+content, reordering a manifest's `files` list, or changing which files a
+migration includes always changes the checksum.
 
 `schema_migrations` itself is bootstrapped directly by this module (not
 sourced from a migration file) -- it must exist before any migration can
 be tracked. Everything else migrations create (pipeline_runs,
 pipeline_artifacts, ...) is a normal tracked migration.
+
+Adding a new migration (see docs/RUNBOOK.md "Adding a new migration" for
+the full walkthrough): pick the next unused numeric version, add
+`db/migrations/{version}_{slug}.json` and its SQL under
+`db/migrations/sql/{version}_{slug}/`, and never edit an existing,
+applied migration's manifest or files -- add a new one instead.
 
 No `ON_ERROR_STOP` here (that's a psql-specific flag) -- the equivalent
 guarantee is structural: `cursor.execute()` raises on the first SQL
@@ -77,10 +94,16 @@ def _validate_identifier(name: str, value: str) -> None:
         raise MigrationError(f"{name}={value!r} is not a safe SQL identifier")
 
 
+MIGRATIONS_SQL_DIRNAME = "sql"
+
+
 def discover(migrations_dir: Path, repo_root: Path) -> list[MigrationDef]:
     manifest_paths = sorted(migrations_dir.glob("*.json"))
     if not manifest_paths:
         raise MigrationError(f"no migration manifests found under {migrations_dir}")
+
+    repo_root = repo_root.resolve()
+    sql_root = (migrations_dir / MIGRATIONS_SQL_DIRNAME).resolve()
 
     migrations: list[MigrationDef] = []
     seen_versions: dict[str, Path] = {}
@@ -108,11 +131,52 @@ def discover(migrations_dir: Path, repo_root: Path) -> list[MigrationDef]:
             )
         seen_versions[version] = manifest_path
 
+        # Every migration owns exactly one directory under
+        # db/migrations/sql/, named after its own manifest filename (e.g.
+        # "0001_baseline.json" -> ".../sql/0001_baseline/"). This is what
+        # makes a file's owning migration obvious from its path alone, and
+        # stops one migration's manifest from referencing (or silently
+        # depending on) another migration's already-applied SQL.
+        owned_dir = (sql_root / manifest_path.stem).resolve()
+
         resolved_files = []
         for rel in files:
+            if not isinstance(rel, str) or not rel.strip():
+                raise MigrationError(f"{manifest_path}: 'files' entries must be nonempty strings")
+
             path = (repo_root / rel).resolve()
+
+            # Path traversal safety: a manifest must never be able to
+            # reference a file outside the repository, regardless of how
+            # many "../" segments or absolute-looking paths it contains.
+            if not path.is_relative_to(repo_root):
+                raise MigrationError(
+                    f"{manifest_path}: referenced file {rel!r} resolves outside the repository "
+                    f"root ({path}) -- refusing to load it"
+                )
+
             if not path.is_file():
                 raise MigrationError(f"{manifest_path}: referenced file not found: {rel}")
+
+            # db/migrations/ is the sole authoritative home for deployable
+            # DDL: every referenced file must live under db/migrations/sql/
+            # (not a separate, mutable directory like the retired
+            # db/tables/), and specifically inside the directory owned by
+            # this exact migration version.
+            if not path.is_relative_to(sql_root):
+                raise MigrationError(
+                    f"{manifest_path}: referenced file {rel!r} is not under "
+                    f"{sql_root.relative_to(repo_root)}/ -- deployable migration SQL must live under "
+                    "db/migrations/sql/, never a separate mutable directory"
+                )
+            if not path.is_relative_to(owned_dir):
+                raise MigrationError(
+                    f"{manifest_path}: referenced file {rel!r} is outside this migration's own "
+                    f"directory ({owned_dir.relative_to(repo_root)}/) -- each migration's SQL must "
+                    "live under the directory owned by its version so ownership is obvious from the "
+                    "path alone; add a new migration instead of reaching into another one's directory"
+                )
+
             resolved_files.append(path)
 
         migrations.append(

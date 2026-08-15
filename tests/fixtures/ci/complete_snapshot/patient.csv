@@ -1,0 +1,2 @@
+person_id,name_suffix,first_name,middle_name,last_name,gender,race,ethnicity,birth_date,death_date,death_flag,social_security_number,address,city,state,zip_code,county,latitude,longitude,phone,email,data_source,age,age_group,tuva_last_run
+person-1,,Pat,,Patient,,,,1980-01-01,,0,,,San Francisco,CA,94105,,37.7749,-122.4194,,,ci-fixture,,,2024-01-15 00:00:00

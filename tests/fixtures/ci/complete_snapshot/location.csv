@@ -1,0 +1,2 @@
+location_id,npi,name,facility_type,parent_organization,address,city,state,zip_code,latitude,longitude,data_source,tuva_last_run
+location-1,1000000004,CI Fixture Clinic,,,,San Francisco,CA,94105,37.7749,-122.4194,ci-fixture,2024-01-15 00:00:00

@@ -232,16 +232,46 @@ migration and SQL-test-runner *structure and behavior* (via stubbed
 `make migration-status` reports applied, pending, and checksum-mismatch
 states without applying anything.
 
-## Python tooling (SQLFluff, pre-commit, requests, psycopg)
+## Python development and quality tooling
 
 `src/tuva_postgres/` has two runtime dependencies -- `requests` (the API
 client) and `psycopg[binary]` (migrations, the orchestrator's database
 access) -- both exact-pinned in `pyproject.toml`. The plain shell scripts
-under `scripts/` still use only the Python standard library. SQLFluff and
-pre-commit are dev/tooling-only dependencies. All of the above are
-declared with exact pins in `pyproject.toml` and locked (with every
-transitive dependency) in the committed `uv.lock`, so local and CI runs
-always resolve the identical versions.
+under `scripts/` still use only the Python standard library.
+
+Everything else is a single, locked dev/tooling toolchain, also
+exact-pinned in `pyproject.toml` (`[dependency-groups] dev`) and locked
+(with every transitive dependency) in the committed `uv.lock`, so local
+and CI runs always resolve the identical versions -- never an unpinned
+`pip install`:
+- **Ruff** -- lint (`ruff check`) and format (`ruff format`) for
+  `src/`, `tests/`, and `scripts/`. See `[tool.ruff]` /
+  `[tool.ruff.lint]` in `pyproject.toml` for the configured rule set
+  (`E4`, `E7`, `E9`, `F`, `I`, `UP`, `B`) and the narrow, justified
+  per-file ignores.
+- **mypy** -- static typing, scoped to the production package only
+  (`files = ["src/tuva_postgres"]` in `[tool.mypy]`). A strong-but-honest
+  configuration, not full strict mode: `check_untyped_defs`,
+  `no_implicit_optional`, `warn_redundant_casts`, `warn_unused_ignores`,
+  `warn_unreachable`, and `strict_equality` are all on, but there's no
+  blanket `ignore_errors`/`ignore_missing_imports` and no
+  `disallow_untyped_defs`.
+- **pytest** -- the test runner for both `tests/unit/` (database-free)
+  and `tests/integration/` (requires a disposable PostgreSQL database).
+  Both suites are `unittest.TestCase`-based; pytest collects and runs
+  them natively, no rewrite needed. See `[tool.pytest.ini_options]` in
+  `pyproject.toml` -- the `integration` marker is what keeps a plain
+  `pytest` run database-free by default.
+- **SQLFluff** -- SQL lint/format via the psql-aware wrapper
+  (`scripts/sqlfluff_psql_wrapper.sh`), which normalizes psql identifier
+  variables (`:"schema"`, `:"terminology_schema"`, `:"ops_schema"`) before
+  linting so checksum-protected migration SQL under `db/migrations/` can
+  be linted without ever modifying its committed content. **Migration
+  SQL is never rewritten by any tool** -- the SQLFluff fix hook only
+  previews suggested changes to stdout; see "Database migrations" above
+  for the checksum contract this protects.
+- **pre-commit** -- orchestrates all of the above (plus a few general
+  hygiene hooks) as local, `uv`-managed git hooks.
 
 Prerequisites:
 - Python 3.12 (selected in `.python-version`; `requires-python = ">=3.12"`
@@ -257,28 +287,29 @@ or, equivalently, without also installing the git hook:
 uv sync --locked
 ```
 
-Both create/update `.venv` from `uv.lock` exactly -- never an unpinned
-`pip install sqlfluff` / `pip install pre-commit`.
-
-Running lint (all `.pre-commit-config.yaml` hooks, via the locked
-environment):
+Day-to-day commands:
 ```bash
-make lint           # uv run pre-commit run --all-files
+make test-unit             # uv run pytest tests/unit (database-free)
+make test-integration       # uv run pytest tests/integration (requires PG_DSN)
+make lint-python             # uv run ruff check src tests scripts
+make format-python           # uv run ruff format src tests scripts (rewrites in place)
+make format-python-check     # uv run ruff format --check src tests scripts (CI-safe, no rewrite)
+make typecheck                # uv run mypy src/tuva_postgres
+make lint-sql                 # SQLFluff lint via the psql-aware wrapper, every tracked *.sql file
+make quality                  # check-python-deps + lint-python + format-python-check + typecheck + test-unit + lint-sql
+make lint                     # uv run pre-commit run --all-files (every hook, local uv-managed environment)
+make fmt                      # ruff format (rewrites) + the manual-only SQLFluff fixer (preview only, see above)
+make check-python-deps        # verify the locked toolchain is current and installable (no database required)
 ```
 
-Running the manual-only SQL formatter:
-```bash
-make fmt             # uv run pre-commit run --hook-stage manual sqlfluff-psql-fix --all-files
-```
+`make quality` is the single database-free gate to run before every push
+(and is what CI runs, via the same `make` targets -- see
+`.github/workflows/ci.yml`). Every local pre-commit hook's `entry:` is
+prefixed `uv run` directly, so hooks resolve the locked `.venv` correctly
+whether triggered via `make lint`, the installed git hook, or CI.
 
-Verifying the locked toolchain is current and installable (no database
-required):
-```bash
-make check-python-deps
-```
-
-**Updating a pinned dependency (SQLFluff, pre-commit, or a transitive
-package) intentionally:**
+**Updating a pinned dependency (Ruff, mypy, pytest, SQLFluff, pre-commit,
+or a transitive package) intentionally:**
 1. Edit the direct pin(s) in `pyproject.toml` (`[dependency-groups] dev`).
 2. Regenerate the lockfile: `uv lock`.
 3. Validate the result installs cleanly: `uv sync --locked`.

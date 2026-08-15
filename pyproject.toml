@@ -22,22 +22,36 @@ package = true
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Exact-pinned so the local package's own build (an editable install, via
+# `uv sync`/`uv sync --locked`) is reproducible too -- not just the
+# runtime/dev dependency set below. See the "all direct dependencies are
+# reproducible" contract described in README.md's Python tooling section.
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==75.6.0"]
 build-backend = "setuptools.build_meta"
 
-# Dev/tooling only. SQLFluff and pre-commit are declared here (not as
-# runtime dependencies) with exact pins so local and CI environments
-# resolve the identical versions via the committed uv.lock. PyYAML is
-# also declared directly (it was already a transitive dependency of both
-# sqlfluff and pre-commit -- see uv.lock -- so this adds no new package,
-# only a direct, version-pinned reference) so the structural tests that
-# parse compose.yaml / deploy/kubernetes/*.yaml / ci.yml
-# (tests/unit/test_container_structure.py, test_kubernetes_structure.py,
-# test_makefile_and_ci.py) run for real via `make test-unit` / CI instead
-# of skipping.
+# Dev/tooling only -- the full locked quality toolchain (see README.md's
+# "Python development and quality tooling" section for the day-to-day
+# commands): Ruff (lint + format), mypy (static typing), pytest (test
+# runner for both tests/unit and tests/integration -- see
+# [tool.pytest.ini_options] below), SQLFluff + pre-commit (already
+# present), and PyYAML (already a transitive dependency of both sqlfluff
+# and pre-commit -- see uv.lock -- declared directly only so the
+# structural tests that parse compose.yaml / deploy/kubernetes/*.yaml /
+# ci.yml run for real via `make test-unit` / CI instead of skipping).
+# types-requests is the one type-stub package mypy genuinely needs, for
+# the `requests` runtime dependency's public API surface used by
+# src/tuva_postgres/api_client.py.
+#
+# Every entry here is an exact `==` pin, resolved via `uv lock` and
+# installed only through `uv sync --locked` -- never an ad hoc
+# `pip install`. See README.md for the intentional-update procedure.
 [dependency-groups]
 dev = [
+  "ruff==0.14.4",
+  "mypy==1.19.0",
+  "pytest==8.4.2",
+  "types-requests==2.34.2.20250809",
   "pre-commit==4.6.2",
   "sqlfluff==4.3.0",
   "pyyaml==6.0.3",
@@ -109,3 +123,85 @@ prefer_quoted_identifiers = false                 # only quote when necessary. :
 
 [tool.sqlfluff.rules.structure.subquery]          # L042
 forbid_subquery_in = "join"                       # prefer CTEs vs subqueries in JOINs. :contentReference[oaicite:16]{index=16}
+
+# --- pytest --------------------------------------------------------------
+# pytest is the runner for both tests/unit (database-free) and
+# tests/integration (requires a disposable PostgreSQL database, see
+# tests/integration/test_pipeline_integration.py's module docstring).
+# Both suites are unittest.TestCase-based (pytest collects and runs them
+# natively -- see https://docs.pytest.org/en/stable/how-to/unittest.html
+# -- no rewrite needed); `make test-unit`/`make test-integration` invoke
+# pytest against each directory separately so a plain unit-test run can
+# never accidentally depend on, or connect to, a database.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-config", "--strict-markers", "-ra"]
+markers = [
+  "integration: requires a disposable PostgreSQL database (see tests/integration/test_pipeline_integration.py)",
+]
+
+# --- Ruff (lint + format) --------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["src", "tests", "scripts"]
+extend-exclude = [
+  ".venv",
+  "build",
+  "dist",
+  "*.egg-info",
+  "__pycache__",
+  ".git",
+  "tmp",
+  "data",
+]
+
+[tool.ruff.lint]
+# E4/E7/E9: pycodestyle import/statement/syntax errors. F: pyflakes
+# (undefined names, unused imports, etc.). I: import sorting (isort
+# rules). UP: pyupgrade (obsolete constructs for the declared py312
+# target-version). B: flake8-bugbear (likely bug patterns). Deliberately
+# not a huge, mostly-suppressed rule set -- this is the narrow,
+# meaningful starting point the task calls for; expand only when the
+# repository can support additions without unrelated churn.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests/**/*.py and scripts/tests/*.py deliberately do
+# `sys.path.insert(0, ...)` before importing tuva_postgres (see each
+# file's own module docstring/comment) -- this is how they find
+# src/tuva_postgres without requiring an editable install first, and is
+# load-bearing, not an oversight. E402 (module-level import not at top
+# of file) would otherwise flag every one of these files for a pattern
+# they use intentionally and consistently.
+"tests/**/*.py" = ["E402"]
+"scripts/tests/*.py" = ["E402"]
+
+[tool.ruff.format]
+# Explicit even though these match Ruff's own defaults, so the choice is
+# visible in configuration rather than implicit.
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# --- mypy ------------------------------------------------------------------
+# Applied primarily to production code (src/tuva_postgres) -- see `files`
+# below, which must match what `make typecheck`/CI/pre-commit actually
+# check. This is the strongest configuration the codebase can plausibly
+# pass without disallow_untyped_defs (several functions, mostly ones
+# taking a psycopg connection, intentionally leave a couple of parameters
+# unannotated rather than typed as Any -- see src/tuva_postgres/ops.py) --
+# not full strict mode. No ignore_errors, no blanket
+# ignore_missing_imports, and no directory-wide exclusions: every module
+# under src/tuva_postgres is checked.
+[tool.mypy]
+python_version = "3.12"
+files = ["src/tuva_postgres"]
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true
+pretty = true

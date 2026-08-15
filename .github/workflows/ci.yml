@@ -52,7 +52,7 @@ jobs:
       - name: Set up Python (from .python-version)
         run: uv python install
 
-      - name: Install locked Python tooling (sqlfluff, pre-commit)
+      - name: Install locked Python tooling (ruff, mypy, pytest, sqlfluff, pre-commit)
         run: uv sync --locked
 
       - name: Verify locked Python toolchain
@@ -73,6 +73,15 @@ jobs:
           export DATA_DIR="data"
           EOF
           cat .env
+
+      - name: Lint Python (ruff check)
+        run: make lint-python
+
+      - name: Check Python formatting (ruff format --check)
+        run: make format-python-check
+
+      - name: Type check Python (mypy)
+        run: make typecheck
 
       - name: Run Python unit tests (tuva_postgres package)
         run: make test-unit
@@ -155,6 +164,5 @@ jobs:
         run: make test-deploy
 
       - name: Lint SQL
-        run: |
-          uv run bash scripts/sqlfluff_psql_wrapper.sh lint $(git ls-files '*.sql')
+        run: make lint-sql
 

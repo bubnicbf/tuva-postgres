@@ -2,13 +2,15 @@
 """Structural regression test for the repository's Python dependency setup.
 
 The application scripts under scripts/ use only the Python standard
-library; SQLFluff and pre-commit are dev/tooling dependencies. This test
-guards the reproducible-toolchain contract described in the repository
-README: exact direct pins in pyproject.toml, a current committed uv.lock
-that actually contains those exact versions, a single selected Python
-version (.python-version) compatible with pyproject.toml's
-requires-python, and no ad hoc/unpinned `pip install sqlfluff` or
-`pip install pre-commit` left behind in the Makefile or CI.
+library; Ruff, mypy, pytest, SQLFluff, pre-commit, PyYAML, and
+types-requests are dev/tooling dependencies. This test guards the
+reproducible-toolchain contract described in the repository README: exact
+direct pins in pyproject.toml for the full toolchain (not only SQLFluff
+and pre-commit), a current committed uv.lock that actually contains those
+exact versions, a single selected Python version (.python-version)
+compatible with pyproject.toml's requires-python, and no ad hoc/unpinned
+`pip install ruff`/`mypy`/`pytest`/`sqlfluff`/`pre-commit` left behind in
+the Makefile or CI.
 
 Standard library only, including `tomllib` (Python 3.11+) -- no PyYAML,
 uv, pre-commit, sqlfluff, or network access required. Because this test
@@ -37,16 +39,93 @@ import sys
 import tomllib
 from pathlib import Path
 
-REQUIRED_DEV_PACKAGES = ["sqlfluff", "pre-commit"]
+REQUIRED_DEV_PACKAGES = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "types-requests",
+    "sqlfluff",
+    "pre-commit",
+    "pyyaml",
+]
+
+# Packages checked for both an exact pin in pyproject.toml AND a matching
+# entry in uv.lock (every REQUIRED_DEV_PACKAGES entry qualifies -- kept as
+# its own name so the intent of the lock cross-check is explicit at the
+# call site below).
+LOCK_CHECKED_DEV_PACKAGES = REQUIRED_DEV_PACKAGES
+
+# Tool names that must never appear in an ad hoc, unpinned `pip install`
+# anywhere in the Makefile or CI workflow -- they must come from
+# `uv sync --locked` only.
+GUARDED_TOOL_NAMES = ["ruff", "mypy", "pytest", "sqlfluff", "pre-commit", "pre_commit"]
+
+# Tool names that must be invoked through `uv run` in CI (never a bare
+# `ruff`/`mypy`/`pytest`/`sqlfluff` relying on some other, unlocked
+# installation on the runner's PATH).
+UV_RUN_CHECKED_TOOL_NAMES = ["ruff", "mypy", "pytest", "sqlfluff"]
 
 EXACT_PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^=<>!~,\s\[\]]+)$")
 REQUIRES_PYTHON_CLAUSE_RE = re.compile(r"^(==|!=|<=|>=|<|>)\s*([0-9]+(?:\.[0-9]+)*)\*?$")
 PIP_INSTALL_RE = re.compile(r"pip\s+install", re.IGNORECASE)
 
 
+MAKE_TARGET_HEADER_RE = re.compile(r"^([A-Za-z0-9_.-]+)\s*:(?!=)\s*(.*)$")
+MAKE_INVOCATION_RE = re.compile(r"\bmake\s+((?:[A-Za-z0-9_.-]+\s*)+)")
+
+
 class DependencyError(Exception):
     """Raised for a structural problem in the dependency setup, with a
     message that names the specific file/package/version at fault."""
+
+
+def parse_makefile_targets(text: str):
+    """Return {target_name: {"prereqs": [...], "recipe": [line, ...]}} for a
+    Makefile's explicit targets. Deliberately simple: single-name target
+    lines with tab-indented recipe bodies (this repository's actual style,
+    confirmed by inspection) -- not a general Makefile parser. Skips
+    special targets (e.g. .PHONY) and variable assignments."""
+    targets = {}
+    current = None
+    for raw_line in text.splitlines():
+        if raw_line.startswith("\t"):
+            if current is not None:
+                targets[current]["recipe"].append(raw_line[1:])
+            continue
+        if not raw_line.strip():
+            current = None
+            continue
+        line = raw_line.split("#", 1)[0].rstrip()
+        m = MAKE_TARGET_HEADER_RE.match(line)
+        if m:
+            name, prereqs_text = m.groups()
+            if name.startswith("."):
+                current = None
+                continue
+            entry = targets.setdefault(name, {"prereqs": [], "recipe": []})
+            entry["prereqs"].extend(prereqs_text.split())
+            current = name
+        else:
+            current = None
+    return targets
+
+
+def target_recipe_contains(targets, target_name, predicate, _visited=None):
+    """True iff any recipe line of target_name, or of any prerequisite
+    target (recursively, e.g. `quality`'s dependency chain), satisfies
+    predicate(line). Guards against prerequisite cycles."""
+    if _visited is None:
+        _visited = set()
+    if target_name in _visited or target_name not in targets:
+        return False
+    _visited.add(target_name)
+    info = targets[target_name]
+    if any(predicate(line) for line in info["recipe"]):
+        return True
+    return any(
+        target_recipe_contains(targets, prereq, predicate, _visited)
+        for prereq in info["prereqs"]
+    )
 
 
 def _version_tuple(text: str) -> tuple:
@@ -207,6 +286,11 @@ def validate(repo_root: Path):
 
     sqlfluff_version = pins["sqlfluff"]
     pre_commit_version = pins["pre-commit"]
+    ruff_version = pins["ruff"]
+    mypy_version = pins["mypy"]
+    pytest_version = pins["pytest"]
+    types_requests_version = pins["types-requests"]
+    pyyaml_version = pins["pyyaml"]
 
     # --- uv.lock exists and contains the selected versions ------------------
     if not lock_path.is_file():
@@ -214,42 +298,42 @@ def validate(repo_root: Path):
     with lock_path.open("rb") as f:
         lock_data = tomllib.load(f)
 
-    for pkg, pinned_version, dist_name in (
-        ("sqlfluff", sqlfluff_version, "sqlfluff"),
-        ("pre-commit", pre_commit_version, "pre-commit"),
-    ):
-        lock_versions = find_lockfile_versions(lock_data, dist_name)
+    for pkg in LOCK_CHECKED_DEV_PACKAGES:
+        pinned_version = pins[pkg]
+        lock_versions = find_lockfile_versions(lock_data, pkg)
         if not lock_versions:
-            raise DependencyError(f"uv.lock has no [[package]] entry named {dist_name!r}")
+            raise DependencyError(f"uv.lock has no [[package]] entry named {pkg!r}")
         if pinned_version not in lock_versions:
             raise DependencyError(
-                f"uv.lock has {dist_name}=={'/'.join(lock_versions)}, but pyproject.toml "
+                f"uv.lock has {pkg}=={'/'.join(lock_versions)}, but pyproject.toml "
                 f"pins {pkg}=={pinned_version} (run 'uv lock' to bring them back in sync)"
             )
 
-    # --- Makefile: no ad hoc unpinned sqlfluff/pre-commit installation -----
+    # --- Makefile: no ad hoc unpinned tool installation ---------------------
     if not makefile_path.is_file():
         raise DependencyError(f"Makefile not found: {makefile_path}")
     makefile_text = makefile_path.read_text(encoding="utf-8")
     for line_no, line in enumerate(makefile_text.splitlines(), start=1):
-        if PIP_INSTALL_RE.search(line) and (
-            "sqlfluff" in line.lower() or "pre-commit" in line.lower() or "pre_commit" in line.lower()
+        if PIP_INSTALL_RE.search(line) and any(
+            name in line.lower() for name in GUARDED_TOOL_NAMES
         ):
             raise DependencyError(
                 f"Makefile:{line_no} contains an ad hoc unpinned installation: {line.strip()!r} "
-                "(sqlfluff/pre-commit must come from 'uv sync --locked' only)"
+                "(Ruff/mypy/pytest/SQLFluff/pre-commit must come from 'uv sync --locked' only)"
             )
 
-    # --- CI: no unpinned pip install sqlfluff, uses locked uv sync, and ----
-    #     runs sqlfluff through uv run
+    # --- CI: no unpinned pip install of a guarded tool, uses locked uv sync,
+    #     and runs each guarded tool through uv run -----------------------
     if not ci_path.is_file():
         raise DependencyError(f"CI workflow not found: {ci_path}")
     ci_text = ci_path.read_text(encoding="utf-8")
     for line_no, line in enumerate(ci_text.splitlines(), start=1):
-        if PIP_INSTALL_RE.search(line) and "sqlfluff" in line.lower():
+        if PIP_INSTALL_RE.search(line) and any(
+            name in line.lower() for name in GUARDED_TOOL_NAMES
+        ):
             raise DependencyError(
                 f".github/workflows/ci.yml:{line_no} still contains an unpinned "
-                f"'pip install sqlfluff': {line.strip()!r}"
+                f"pip install of a locked tool: {line.strip()!r}"
             )
 
     if "uv sync --locked" not in ci_text:
@@ -257,26 +341,48 @@ def validate(repo_root: Path):
             ".github/workflows/ci.yml does not run a locked 'uv sync --locked'"
         )
 
-    sqlfluff_via_uv_run = any(
-        "uv run" in line and "sqlfluff" in line.lower()
-        for line in ci_text.splitlines()
-    )
-    if not sqlfluff_via_uv_run:
-        raise DependencyError(
-            ".github/workflows/ci.yml does not run SQLFluff through 'uv run' "
-            "(expected a line containing both 'uv run' and 'sqlfluff')"
+    # A CI step may invoke a tool directly (`uv run ruff ...`) or indirectly
+    # through a `make` target whose recipe (or one of its prerequisite
+    # targets' recipes, e.g. `quality`'s dependency chain) itself runs the
+    # tool via `uv run`. Both count -- what matters is that the tool is
+    # never invoked any other way (an unpinned PATH lookup, a bare pip
+    # install, etc.), which the checks above already rule out.
+    make_targets = parse_makefile_targets(makefile_text)
+    ci_lines = ci_text.splitlines()
+    invoked_make_targets = set()
+    for line in ci_lines:
+        for m in MAKE_INVOCATION_RE.finditer(line):
+            invoked_make_targets.update(m.group(1).split())
+
+    for tool_name in UV_RUN_CHECKED_TOOL_NAMES:
+
+        def _line_runs_tool_via_uv_run(line, tool_name=tool_name):
+            return "uv run" in line and tool_name in line.lower()
+
+        direct = any(_line_runs_tool_via_uv_run(line) for line in ci_lines)
+        via_make = any(
+            target_recipe_contains(make_targets, target, _line_runs_tool_via_uv_run)
+            for target in invoked_make_targets
         )
+        if not (direct or via_make):
+            raise DependencyError(
+                f".github/workflows/ci.yml does not run {tool_name} through 'uv run' "
+                "(directly, or indirectly via a 'make' target -- including its "
+                "prerequisite targets -- whose recipe uses 'uv run')"
+            )
 
     return [
         f"pyproject.toml: [project] present, requires-python = {requires_python!r}, "
         "dependencies explicitly declared.",
         f".python-version: {selected_python!r} satisfies requires-python.",
-        f"[dependency-groups].dev: sqlfluff=={sqlfluff_version}, pre-commit=={pre_commit_version} "
-        "(exact pins, each declared once).",
-        f"uv.lock: contains sqlfluff=={sqlfluff_version} and pre-commit=={pre_commit_version}.",
-        "Makefile: no ad hoc unpinned sqlfluff/pre-commit installation.",
-        "CI: no unpinned 'pip install sqlfluff'; runs a locked 'uv sync --locked'; "
-        "runs SQLFluff through 'uv run'.",
+        "[dependency-groups].dev: exact pins, each declared once, for "
+        f"ruff=={ruff_version}, mypy=={mypy_version}, pytest=={pytest_version}, "
+        f"types-requests=={types_requests_version}, sqlfluff=={sqlfluff_version}, "
+        f"pre-commit=={pre_commit_version}, pyyaml=={pyyaml_version}.",
+        "uv.lock: contains a matching [[package]] entry for every one of the above.",
+        "Makefile: no ad hoc unpinned installation of ruff/mypy/pytest/sqlfluff/pre-commit.",
+        "CI: no unpinned pip install of a locked tool; runs a locked 'uv sync --locked'; "
+        "runs ruff/mypy/pytest/sqlfluff through 'uv run' (directly or via a 'make' target).",
     ]
 
 
@@ -296,9 +402,10 @@ def main(argv):
         return 1
 
     print(
-        f"PASS: {repo_root} declares and locks its Python dev toolchain correctly "
-        "(single [project] table, exact sqlfluff/pre-commit pins, a current uv.lock, "
-        "and no unpinned sqlfluff/pre-commit installation in Makefile or CI)."
+        f"PASS: {repo_root} declares and locks its full Python quality toolchain correctly "
+        "(single [project] table; exact pins for ruff, mypy, pytest, types-requests, "
+        "sqlfluff, pre-commit, and pyyaml; a current uv.lock; and no unpinned installation "
+        "of any of these tools in Makefile or CI)."
     )
     for d in diagnostics:
         print(f"  - {d}")

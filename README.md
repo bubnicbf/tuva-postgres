@@ -64,7 +64,17 @@ section for the full walkthrough.
 SQL data-quality/validation queries (the smoke tests and add-on checks
 `scripts/run_tests.sh` runs after a load) are a separate concern and live
 under `db/tests/`, not `db/migrations/` -- they are never treated as
-deployable DDL.
+deployable DDL, and new SQL validation tests should be added there (new
+deployable DDL, by contrast, always goes into a new migration -- see
+above). `db/tests/zz_results.sql` initializes the `test_results` table
+and summary views and is applied once as setup, not as a validation case;
+every other `db/tests/*.sql` file is a validation case, executed in
+deterministic filename order by `scripts/run_tests.sh` -- the
+authoritative SQL-test runner, invoked via `make test` (requires the
+configured database) or directly as `uv run tuva-postgres test`.
+`make test-shell` is the database-free counterpart: it validates
+migration and SQL-test-runner *structure and behavior* (via stubbed
+`psql`/`python3`) without needing a real Postgres connection.
 
 `make create-db` / `make migrate` apply pending migrations transactionally
 (see `scripts/apply_schema.sh` -> `tuva_postgres.migrations`);

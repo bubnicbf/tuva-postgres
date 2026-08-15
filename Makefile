@@ -17,6 +17,7 @@ test-shell:
 	bash scripts/tests/test_run_tests_path.sh
 	bash scripts/tests/test_run_tests_no_embedded_workflow.sh
 	bash scripts/tests/test_load_to_postgres_no_legacy_seed.sh
+	bash scripts/tests/test_patient_gender_index.sh
 
 test: test-shell
 	. .env && bash scripts/run_tests.sh

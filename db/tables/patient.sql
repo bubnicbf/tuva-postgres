@@ -48,6 +48,6 @@ CREATE INDEX IF NOT EXISTS patient_zip_idx         ON :"schema".patient (zip_cod
 CREATE INDEX IF NOT EXISTS patient_state_city_idx  ON :"schema".patient (state, city);
 CREATE INDEX IF NOT EXISTS patient_last_first_idx  ON :"schema".patient (last_name, first_name);
 CREATE INDEX IF NOT EXISTS patient_birth_date_idx  ON :"schema".patient (birth_date);
-CREATE INDEX IF NOT EXISTS patient_sex_idx         ON :"schema".patient (sex);
+CREATE INDEX IF NOT EXISTS patient_gender_idx      ON :"schema".patient (gender);
 CREATE INDEX IF NOT EXISTS patient_race_idx        ON :"schema".patient (race);
 CREATE INDEX IF NOT EXISTS patient_ethnicity_idx   ON :"schema".patient (ethnicity);

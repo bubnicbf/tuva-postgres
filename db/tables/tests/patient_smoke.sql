@@ -71,3 +71,29 @@ WHERE age IS NOT NULL
     OR
     (age BETWEEN 0 AND 99 AND age_group <> ((age/10)*10)::text || '-' || (((age/10)*10)+9)::text)
   );
+
+-- 12) catalog: patient_gender_idx exists, in the configured schema, on the
+--     patient table, indexing the gender column (defense against the
+--     column being renamed/dropped out from under the index).
+SELECT 'patient_gender_idx_exists' AS test,
+       EXISTS (
+         SELECT 1
+         FROM pg_indexes
+         WHERE schemaname = :'schema'
+           AND tablename  = 'patient'
+           AND indexname  = 'patient_gender_idx'
+           AND indexdef  ILIKE '%(gender)%'
+       ) AS pass,
+       0 AS info;
+
+-- 13) catalog: the obsolete patient_sex_idx (indexing a nonexistent "sex"
+--     column) must not exist on the patient table.
+SELECT 'patient_sex_idx_absent' AS test,
+       NOT EXISTS (
+         SELECT 1
+         FROM pg_indexes
+         WHERE schemaname = :'schema'
+           AND tablename  = 'patient'
+           AND indexname  = 'patient_sex_idx'
+       ) AS pass,
+       0 AS info;

@@ -4,7 +4,11 @@ hand.
 
 Checks, in order (each can independently fail the check):
   1. PostgreSQL connectivity (can we open a connection at all).
-  2. Migration state: nothing pending, and no checksum mismatches.
+  2. Migration state: unhealthy if any one-time migration's checksum has
+     drifted, any migration's execution mode no longer matches its
+     applied history, or anything is pending (including a repeatable
+     migration awaiting its initial application or a reapplication
+     because its checksum changed).
   3. Freshness: the most recent *successful* pipeline run finished within
      PIPELINE_MAX_SUCCESS_AGE_HOURS.
 
@@ -58,14 +62,19 @@ def run_healthcheck(config, *, connect_fn=connect, migrations_mod=migrations, op
         migrations_ok = True
         try:
             mstatus = migrations_mod.status(conn, config)
-            if mstatus.checksum_mismatches:
+            if mstatus.one_time_mismatches:
                 migrations_ok = False
-                migrations_detail = f"checksum mismatch(es): {', '.join(mstatus.checksum_mismatches)}"
+                migrations_detail = f"one-time checksum mismatch(es): {', '.join(mstatus.one_time_mismatches)}"
+            elif mstatus.mode_mismatches:
+                migrations_ok = False
+                migrations_detail = f"execution mode mismatch(es): {', '.join(mstatus.mode_mismatches)}"
             elif mstatus.pending:
                 migrations_ok = False
-                migrations_detail = f"{len(mstatus.pending)} pending migration(s)"
+                pending_versions = ", ".join(m.version for m in mstatus.pending)
+                migrations_detail = f"{len(mstatus.pending)} pending migration(s): {pending_versions}"
             else:
-                migrations_detail = f"{len(mstatus.applied)} applied, none pending"
+                applied_count = len(mstatus.applied_one_time) + len(mstatus.applied_repeatable_current)
+                migrations_detail = f"{applied_count} applied, none pending"
         except Exception as exc:  # noqa: BLE001
             migrations_ok = False
             migrations_detail = f"status check failed ({exc.__class__.__name__})"

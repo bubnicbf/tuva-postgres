@@ -18,23 +18,64 @@ Each migration's checksum is a SHA-256 over its ordered constituent
 files' contents (framed with path+length so reordering or truncation
 changes the hash); a later edit to any file a migration manifest
 references is therefore detected as a checksum mismatch on the next run,
-exactly like editing an already-applied migration file directly. Applied
-migrations and their file layout are immutable: moving a file without
-changing its basename or bytes preserves its checksum (and is how
-migrations 0001/0002 were reorganized into version-owned directories
+exactly like editing an already-applied migration file directly. The
+checksum is computed purely from a migration's constituent SQL files --
+it never hashes the manifest JSON itself, so adding or changing manifest
+metadata (such as `execution`, below) never changes a migration's
+checksum.
+
+Execution modes -- every manifest must declare exactly one:
+  * "one_time" (see `ExecutionMode.ONE_TIME`): applied at most once. Once
+    applied, its SQL, file order, checksum, and execution mode are all
+    immutable -- any drift (changed checksum, or a manifest that now
+    claims a different execution mode) is a hard error that blocks all
+    further migration activity. Migrations 0001 and 0002 are one_time.
+  * "repeatable" (see `ExecutionMode.REPEATABLE`): applied on first
+    discovery, then transactionally reapplied whenever its checksum
+    changes, and skipped otherwise -- standard checksum-driven repeatable-
+    migration semantics (think a `CREATE OR REPLACE VIEW`/function you
+    want to keep current, not a one-off schema change). A changed
+    repeatable migration is *pending work*, not an integrity failure.
+    Repeatable SQL must be written idempotently (`CREATE OR REPLACE`,
+    `... IF NOT EXISTS`, etc.) -- the runner does not attempt to parse or
+    verify SQL idempotency itself.
+
+Ordering: within `apply_pending()`, ALL pending one_time migrations run
+first, in ascending version order; only after they all succeed do pending
+repeatable migrations (initial application or reapplication) run, also in
+ascending version order. This lets a repeatable view or function safely
+depend on a schema object a pending one_time migration is about to
+create, regardless of how manifests happen to interleave by version
+number.
+
+Applied migrations and their file layout are immutable: moving a file
+without changing its basename or bytes preserves its checksum (and is
+how migrations 0001/0002 were reorganized into version-owned directories
 without invalidating databases that already applied them), but editing
 content, reordering a manifest's `files` list, or changing which files a
 migration includes always changes the checksum.
 
-`schema_migrations` itself is bootstrapped directly by this module (not
-sourced from a migration file) -- it must exist before any migration can
-be tracked. Everything else migrations create (pipeline_runs,
-pipeline_artifacts, ...) is a normal tracked migration.
+`schema_migrations` itself is bootstrapped (and additively, idempotently
+upgraded for execution-mode tracking) directly by this module -- not
+sourced from a migration file -- because it must exist, in the shape the
+runner expects, before any migration can be tracked. Everything else
+migrations create (pipeline_runs, pipeline_artifacts, ...) is a normal
+tracked migration. See `ensure_history_table()` for exactly what the
+upgrade does and why it's always safe to (re)run, including against a
+pre-execution-mode database.
+
+Planning (classifying discovered migrations against applied history --
+pending one_time, pending repeatable [initial or changed], one_time
+checksum mismatch, execution-mode mismatch) is a single pure function,
+`_plan_status()`, with no database access of its own. `status()` (read-
+only) and `apply_pending()` both call it against whatever `applied`
+mapping they've already read, so the two paths can never subtly disagree
+about what state a migration is in.
 
 Adding a new migration (see docs/RUNBOOK.md "Adding a new migration" for
 the full walkthrough): pick the next unused numeric version, add
-`db/migrations/{version}_{slug}.json` and its SQL under
-`db/migrations/sql/{version}_{slug}/`, and never edit an existing,
+`db/migrations/{version}_{slug}.json` (declaring `"execution"`) and its
+SQL under `db/migrations/{version}_{slug}/`, and never edit an existing,
 applied migration's manifest or files -- add a new one instead.
 
 No `ON_ERROR_STOP` here (that's a psql-specific flag) -- the equivalent
@@ -52,6 +93,7 @@ import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
 from . import __version__
@@ -63,10 +105,21 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _VERSION_RE = re.compile(r"^[0-9]{4,}$")
 
 
+class ExecutionMode(str, Enum):
+    """The exactly-two allowed values of a manifest's required
+    `"execution"` field. Subclasses `str` so a mode compares equal to,
+    and can be inserted/selected as, its plain string value -- there is
+    exactly one representation, never scattered string literals."""
+
+    ONE_TIME = "one_time"
+    REPEATABLE = "repeatable"
+
+
 @dataclass(frozen=True)
 class MigrationDef:
     version: str
     description: str
+    execution: ExecutionMode
     files: tuple[Path, ...]
     var_map: dict[str, str]  # sql placeholder name -> PipelineConfig attribute name
     manifest_path: Path
@@ -80,13 +133,41 @@ class AppliedMigration:
     applied_at: datetime
     duration_ms: float
     app_version: str
+    execution: ExecutionMode
+    execution_count: int
 
 
 @dataclass(frozen=True)
 class MigrationStatus:
-    applied: tuple[AppliedMigration, ...]
-    pending: tuple[MigrationDef, ...]
-    checksum_mismatches: tuple[str, ...]
+    """A pure classification of every discovered migration against
+    applied history -- see `_plan_status()`, the single function that
+    produces this (used identically by `status()` and `apply_pending()`).
+    """
+
+    applied_one_time: tuple[AppliedMigration, ...]
+    applied_repeatable_current: tuple[AppliedMigration, ...]
+    pending_one_time: tuple[MigrationDef, ...]
+    pending_repeatable_initial: tuple[MigrationDef, ...]
+    pending_repeatable_changed: tuple[MigrationDef, ...]
+    one_time_mismatches: tuple[str, ...]
+    mode_mismatches: tuple[str, ...]
+
+    @property
+    def pending(self) -> tuple[MigrationDef, ...]:
+        """Every migration `apply_pending()` would act on: pending
+        one_time migrations, then repeatable migrations awaiting initial
+        application or reapplication (in that priority order -- see
+        module docstring "Ordering")."""
+        return self.pending_one_time + self.pending_repeatable_initial + self.pending_repeatable_changed
+
+    @property
+    def has_integrity_failures(self) -> bool:
+        """True if the database is in a state `apply_pending()` will
+        refuse to proceed past: a one_time migration whose checksum
+        drifted, or any migration whose execution mode no longer matches
+        its applied history. A changed *repeatable* migration is deliber-
+        ately excluded -- that's pending work, not an integrity failure."""
+        return bool(self.one_time_mismatches or self.mode_mismatches)
 
 
 def _validate_identifier(name: str, value: str) -> None:
@@ -117,6 +198,7 @@ def discover(migrations_dir: Path, repo_root: Path) -> list[MigrationDef]:
         description = raw.get("description")
         files = raw.get("files")
         var_map = raw.get("vars", {})
+        execution_raw = raw.get("execution")
 
         if not isinstance(version, str) or not _VERSION_RE.match(version):
             raise MigrationError(f"{manifest_path}: 'version' must be a numeric string like '0001'")
@@ -124,6 +206,25 @@ def discover(migrations_dir: Path, repo_root: Path) -> list[MigrationDef]:
             raise MigrationError(f"{manifest_path}: 'description' must be a nonempty string")
         if not isinstance(files, list) or not files:
             raise MigrationError(f"{manifest_path}: 'files' must be a nonempty list")
+
+        # Execution mode is required and must be exactly one of the
+        # allowed ExecutionMode values -- never inferred from SQL
+        # contents, filename, version, or description, and never
+        # silently defaulted. Missing, wrong-typed, and unknown values
+        # are all manifest validation errors.
+        allowed = ", ".join(repr(m.value) for m in ExecutionMode)
+        if not isinstance(execution_raw, str):
+            raise MigrationError(
+                f"{manifest_path}: 'execution' is required and must be a string, one of {allowed} "
+                f"(got {execution_raw!r})"
+            )
+        try:
+            execution = ExecutionMode(execution_raw)
+        except ValueError:
+            raise MigrationError(
+                f"{manifest_path}: 'execution'={execution_raw!r} is not a valid execution mode "
+                f"(expected one of {allowed})"
+            ) from None
 
         if version in seen_versions:
             raise MigrationError(
@@ -183,6 +284,7 @@ def discover(migrations_dir: Path, repo_root: Path) -> list[MigrationDef]:
             MigrationDef(
                 version=version,
                 description=description,
+                execution=execution,
                 files=tuple(resolved_files),
                 var_map=dict(var_map),
                 manifest_path=manifest_path,
@@ -194,6 +296,11 @@ def discover(migrations_dir: Path, repo_root: Path) -> list[MigrationDef]:
 
 
 def compute_checksum(migration: MigrationDef) -> str:
+    """SHA-256 over `migration`'s ordered constituent SQL files only --
+    basename, byte length, and content, framed so reordering or
+    truncation changes the hash. Deliberately independent of the
+    manifest's own fields (version/description/execution/vars): adding or
+    changing manifest metadata never changes a migration's checksum."""
     hasher = hashlib.sha256()
     for path in migration.files:
         content = path.read_bytes()
@@ -220,6 +327,40 @@ def _rendered_sql(migration: MigrationDef, variables: dict[str, str]) -> str:
 
 
 def ensure_history_table(conn, ops_schema: str) -> None:
+    """Bootstrap (and idempotently upgrade) `<ops_schema>.schema_migrations`.
+
+    `schema_migrations` is deliberately bootstrap-managed here rather than
+    by a normal tracked migration -- it must exist, in the shape this
+    runner expects, before any migration can be tracked.
+
+    The upgrade from the original six-column shape (version, description,
+    checksum, applied_at, duration_ms, app_version) to the execution-mode-
+    aware shape (+ execution, execution_count) is purely additive and
+    idempotent:
+      * `ADD COLUMN IF NOT EXISTS` -- a no-op against a table that already
+        has these columns (including a brand-new table, or one this
+        function has already upgraded).
+      * The backfill (`UPDATE ... WHERE execution IS NULL`) only ever
+        touches rows that predate execution-mode tracking entirely, and
+        only ever sets `execution`/`execution_count` -- it never modifies
+        an existing row's version, checksum, applied_at, description, or
+        duration_ms/app_version. Pre-existing rows are backfilled as
+        `ExecutionMode.ONE_TIME` with `execution_count = 1`, matching this
+        repository's compatibility rule that migrations applied before
+        execution-mode tracking existed are one_time.
+      * The `NOT NULL`/`CHECK` enforcement is (re)applied every call, but
+        is harmless against an already-conforming table (schema_migrations
+        has, at most, one row per migration -- there is no realistic scale
+        concern here); the `CHECK` constraint is added inside a guarded
+        `DO $$ ... $$` block because PostgreSQL has no
+        `ADD CONSTRAINT IF NOT EXISTS`, so this function is safe to call
+        every time (every `apply_pending()` invocation does).
+
+    This function is called only from `apply_pending()` -- never from the
+    read-only `status()` path (see its docstring for why: status() must
+    work against an un-upgraded, pre-execution-mode table without ever
+    mutating it).
+    """
     _validate_identifier("OPS_SCHEMA", ops_schema)
     with conn.cursor() as cur:
         cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{ops_schema}"')
@@ -235,6 +376,53 @@ def ensure_history_table(conn, ops_schema: str) -> None:
             )
             """
         )
+
+        # --- Additive, idempotent upgrade for execution-mode tracking ---
+        cur.execute(f'ALTER TABLE "{ops_schema}".schema_migrations ADD COLUMN IF NOT EXISTS execution text')
+        cur.execute(
+            f'ALTER TABLE "{ops_schema}".schema_migrations ADD COLUMN IF NOT EXISTS execution_count integer'
+        )
+        # Backfill only rows that predate execution-mode tracking. Never
+        # touches version/checksum/applied_at/description/duration_ms/
+        # app_version.
+        cur.execute(
+            f"UPDATE \"{ops_schema}\".schema_migrations SET execution = '{ExecutionMode.ONE_TIME.value}' "
+            f"WHERE execution IS NULL"
+        )
+        cur.execute(
+            f'UPDATE "{ops_schema}".schema_migrations SET execution_count = 1 WHERE execution_count IS NULL'
+        )
+        cur.execute(
+            f"ALTER TABLE \"{ops_schema}\".schema_migrations "
+            f"ALTER COLUMN execution SET DEFAULT '{ExecutionMode.ONE_TIME.value}'"
+        )
+        cur.execute(f'ALTER TABLE "{ops_schema}".schema_migrations ALTER COLUMN execution SET NOT NULL')
+        cur.execute(f'ALTER TABLE "{ops_schema}".schema_migrations ALTER COLUMN execution_count SET DEFAULT 1')
+        cur.execute(f'ALTER TABLE "{ops_schema}".schema_migrations ALTER COLUMN execution_count SET NOT NULL')
+        # Validate stored execution values. Guarded so re-running this
+        # bootstrap never errors on an already-present constraint --
+        # PostgreSQL has no "ADD CONSTRAINT IF NOT EXISTS".
+        allowed_values = ", ".join(f"'{m.value}'" for m in ExecutionMode)
+        cur.execute(
+            f"""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class r ON r.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = r.relnamespace
+                WHERE n.nspname = '{ops_schema}'
+                  AND r.relname = 'schema_migrations'
+                  AND c.conname = 'schema_migrations_execution_check'
+              ) THEN
+                ALTER TABLE "{ops_schema}".schema_migrations
+                  ADD CONSTRAINT schema_migrations_execution_check
+                  CHECK (execution IN ({allowed_values}));
+              END IF;
+            END
+            $$;
+            """
+        )
     conn.commit()
 
 
@@ -247,14 +435,53 @@ def _history_table_exists(conn, ops_schema: str) -> bool:
         return cur.fetchone() is not None
 
 
-def _read_applied(conn, ops_schema: str) -> dict[str, AppliedMigration]:
-    applied: dict[str, AppliedMigration] = {}
+def _history_has_execution_columns(conn, ops_schema: str) -> bool:
+    """Read-only (information_schema only) check for whether the
+    execution-mode columns have been added yet. Lets `status()` read
+    both the old (pre-upgrade) and new schema_migrations shapes without
+    ever running the (mutating) upgrade DDL in `ensure_history_table()`
+    itself."""
     with conn.cursor() as cur:
         cur.execute(
-            f'SELECT version, description, checksum, applied_at, duration_ms, app_version '
-            f'FROM "{ops_schema}".schema_migrations ORDER BY version'
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'schema_migrations' AND column_name = 'execution'",
+            (ops_schema,),
         )
-        for version, description, checksum, applied_at, duration_ms, app_version in cur.fetchall():
+        return cur.fetchone() is not None
+
+
+def _read_applied(conn, ops_schema: str) -> dict[str, AppliedMigration]:
+    """Read every recorded migration. Works against both the old
+    (six-column) and new (execution-mode-aware) schema_migrations shapes
+    -- see `_history_has_execution_columns()`. Rows from an old-shaped
+    table (or, defensively, any row with a NULL execution/execution_count
+    that predates the backfill) are interpreted as `ExecutionMode.ONE_TIME`
+    with `execution_count=1`, per this repository's compatibility rule."""
+    applied: dict[str, AppliedMigration] = {}
+    has_execution_columns = _history_has_execution_columns(conn, ops_schema)
+    with conn.cursor() as cur:
+        if has_execution_columns:
+            cur.execute(
+                f'SELECT version, description, checksum, applied_at, duration_ms, app_version, '
+                f'execution, execution_count '
+                f'FROM "{ops_schema}".schema_migrations ORDER BY version'
+            )
+            rows = [
+                (version, description, checksum, applied_at, duration_ms, app_version, execution, execution_count)
+                for version, description, checksum, applied_at, duration_ms, app_version, execution, execution_count
+                in cur.fetchall()
+            ]
+        else:
+            cur.execute(
+                f'SELECT version, description, checksum, applied_at, duration_ms, app_version '
+                f'FROM "{ops_schema}".schema_migrations ORDER BY version'
+            )
+            rows = [
+                (version, description, checksum, applied_at, duration_ms, app_version, None, None)
+                for version, description, checksum, applied_at, duration_ms, app_version in cur.fetchall()
+            ]
+
+        for version, description, checksum, applied_at, duration_ms, app_version, execution, execution_count in rows:
             applied[version] = AppliedMigration(
                 version=version,
                 description=description,
@@ -262,36 +489,109 @@ def _read_applied(conn, ops_schema: str) -> dict[str, AppliedMigration]:
                 applied_at=applied_at,
                 duration_ms=duration_ms,
                 app_version=app_version,
+                execution=ExecutionMode(execution) if execution else ExecutionMode.ONE_TIME,
+                execution_count=execution_count if execution_count is not None else 1,
             )
     return applied
 
 
-def status(conn, config) -> MigrationStatus:
-    """Read-only: never writes, never takes a lock. Safe to run anytime,
-    including concurrently with an in-progress migration."""
-    migrations_dir = Path(__file__).resolve().parents[2] / "db" / "migrations"
-    repo_root = migrations_dir.parents[1]
+def _plan_status(
+    all_migrations: list[MigrationDef], applied: dict[str, AppliedMigration]
+) -> MigrationStatus:
+    """Pure classification of discovered migrations against already-
+    applied history. Touches no database -- `status()` and
+    `apply_pending()` both call this against whatever `applied` mapping
+    they've already read, so the two paths can never subtly disagree
+    about what state a migration is in.
+
+    `all_migrations` is assumed pre-sorted ascending by version (as
+    `discover()` returns it), so every output tuple below is also in
+    ascending version order.
+    """
+    applied_one_time: list[AppliedMigration] = []
+    applied_repeatable_current: list[AppliedMigration] = []
+    pending_one_time: list[MigrationDef] = []
+    pending_repeatable_initial: list[MigrationDef] = []
+    pending_repeatable_changed: list[MigrationDef] = []
+    one_time_mismatches: list[str] = []
+    mode_mismatches: list[str] = []
+
+    for migration in all_migrations:
+        record = applied.get(migration.version)
+
+        if record is None:
+            if migration.execution is ExecutionMode.ONE_TIME:
+                pending_one_time.append(migration)
+            else:
+                pending_repeatable_initial.append(migration)
+            continue
+
+        # Execution mode is immutable once applied -- checked before
+        # checksum, since a mode change is always a configuration/
+        # integrity problem regardless of whether the SQL also changed.
+        if record.execution != migration.execution:
+            mode_mismatches.append(migration.version)
+            continue
+
+        checksum = compute_checksum(migration)
+        if migration.execution is ExecutionMode.ONE_TIME:
+            if record.checksum == checksum:
+                applied_one_time.append(record)
+            else:
+                one_time_mismatches.append(migration.version)
+        else:
+            if record.checksum == checksum:
+                applied_repeatable_current.append(record)
+            else:
+                # A changed repeatable migration is pending work, not a
+                # checksum-integrity failure.
+                pending_repeatable_changed.append(migration)
+
+    return MigrationStatus(
+        applied_one_time=tuple(applied_one_time),
+        applied_repeatable_current=tuple(applied_repeatable_current),
+        pending_one_time=tuple(pending_one_time),
+        pending_repeatable_initial=tuple(pending_repeatable_initial),
+        pending_repeatable_changed=tuple(pending_repeatable_changed),
+        one_time_mismatches=tuple(one_time_mismatches),
+        mode_mismatches=tuple(mode_mismatches),
+    )
+
+
+def _default_migrations_and_repo_root(
+    migrations_dir: Path | None, repo_root: Path | None
+) -> tuple[Path, Path]:
+    if migrations_dir is None:
+        migrations_dir = Path(__file__).resolve().parents[2] / "db" / "migrations"
+    if repo_root is None:
+        repo_root = migrations_dir.parents[1]
+    return migrations_dir, repo_root
+
+
+def status(
+    conn, config, *, migrations_dir: Path | None = None, repo_root: Path | None = None
+) -> MigrationStatus:
+    """Read-only: never writes, never takes a lock, and never runs the
+    schema_migrations metadata upgrade in `ensure_history_table()` --
+    safe to call against a database whose history table predates
+    execution-mode tracking entirely (its rows are interpreted as
+    one_time/execution_count=1, per `_read_applied()`) as well as one
+    that's already been upgraded. Safe to run anytime, including
+    concurrently with an in-progress migration.
+
+    `migrations_dir`/`repo_root` are an injectable seam (defaulting to
+    this repository's real db/migrations/) so callers -- tests, in
+    particular -- can point discovery at an isolated fixture set without
+    touching the real, committed migrations.
+    """
+    migrations_dir, repo_root = _default_migrations_and_repo_root(migrations_dir, repo_root)
     all_migrations = discover(migrations_dir, repo_root)
 
     if not _history_table_exists(conn, config.ops_schema):
-        return MigrationStatus(applied=(), pending=tuple(all_migrations), checksum_mismatches=())
+        return _plan_status(all_migrations, {})
 
     applied = _read_applied(conn, config.ops_schema)
-    mismatches = []
-    pending = []
-    for migration in all_migrations:
-        checksum = compute_checksum(migration)
-        if migration.version in applied:
-            if applied[migration.version].checksum != checksum:
-                mismatches.append(migration.version)
-        else:
-            pending.append(migration)
-
-    return MigrationStatus(
-        applied=tuple(applied[v] for v in sorted(applied)),
-        pending=tuple(pending),
-        checksum_mismatches=tuple(mismatches),
-    )
+    return _plan_status(all_migrations, applied)
 
 
 def _target_schema_nonempty(conn, pg_schema: str) -> bool:
@@ -333,7 +633,11 @@ def _verify_baseline_compatible(conn, pg_schema: str) -> list[str]:
     return problems
 
 
-def _apply_one(conn, migration: MigrationDef, config) -> AppliedMigration:
+def _apply_one_time(conn, migration: MigrationDef, config) -> AppliedMigration:
+    """Execute a one_time migration's SQL and INSERT its history row in
+    one transaction. Only ever called for a migration with no existing
+    history row (see `_plan_status()`'s `pending_one_time`) -- a one_time
+    history row, once inserted, is never updated by this runner."""
     variables = _resolve_vars(migration, config)
     sql_text = _rendered_sql(migration, variables)
     checksum = compute_checksum(migration)
@@ -346,9 +650,19 @@ def _apply_one(conn, migration: MigrationDef, config) -> AppliedMigration:
             duration_ms = (time.monotonic() - started) * 1000.0
             cur.execute(
                 f'INSERT INTO "{config.ops_schema}".schema_migrations '
-                f"(version, description, checksum, applied_at, duration_ms, app_version) "
-                f"VALUES (%s, %s, %s, %s, %s, %s)",
-                (migration.version, migration.description, checksum, applied_at, duration_ms, __version__),
+                f"(version, description, checksum, applied_at, duration_ms, app_version, "
+                f"execution, execution_count) "
+                f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    migration.version,
+                    migration.description,
+                    checksum,
+                    applied_at,
+                    duration_ms,
+                    __version__,
+                    ExecutionMode.ONE_TIME.value,
+                    1,
+                ),
             )
         conn.commit()
     except Exception:
@@ -362,12 +676,94 @@ def _apply_one(conn, migration: MigrationDef, config) -> AppliedMigration:
         applied_at=applied_at,
         duration_ms=duration_ms,
         app_version=__version__,
+        execution=ExecutionMode.ONE_TIME,
+        execution_count=1,
     )
 
 
-def apply_pending(conn, config, *, baseline_existing: bool = False, logger=None) -> list[AppliedMigration]:
-    migrations_dir = Path(__file__).resolve().parents[2] / "db" / "migrations"
-    repo_root = migrations_dir.parents[1]
+def _apply_repeatable(conn, migration: MigrationDef, config, *, prior_execution_count: int) -> AppliedMigration:
+    """Execute a repeatable migration's SQL and INSERT-or-update its
+    history row in one transaction (`ON CONFLICT (version) DO UPDATE`
+    handles both initial application and reapplication with a single
+    statement). If the SQL fails, the whole transaction (including any
+    partial history write) rolls back and the previously successful
+    history row -- checksum, description, applied_at, duration, app
+    version, and execution_count -- is left completely untouched, exactly
+    as if this call had never happened.
+    """
+    variables = _resolve_vars(migration, config)
+    sql_text = _rendered_sql(migration, variables)
+    checksum = compute_checksum(migration)
+    started = time.monotonic()
+    applied_at = datetime.now(timezone.utc)
+    new_execution_count = prior_execution_count + 1
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql_text)
+            duration_ms = (time.monotonic() - started) * 1000.0
+            cur.execute(
+                f'INSERT INTO "{config.ops_schema}".schema_migrations '
+                f"(version, description, checksum, applied_at, duration_ms, app_version, "
+                f"execution, execution_count) "
+                f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                f"ON CONFLICT (version) DO UPDATE SET "
+                f"description = EXCLUDED.description, "
+                f"checksum = EXCLUDED.checksum, "
+                f"applied_at = EXCLUDED.applied_at, "
+                f"duration_ms = EXCLUDED.duration_ms, "
+                f"app_version = EXCLUDED.app_version, "
+                f"execution = EXCLUDED.execution, "
+                f"execution_count = EXCLUDED.execution_count",
+                (
+                    migration.version,
+                    migration.description,
+                    checksum,
+                    applied_at,
+                    duration_ms,
+                    __version__,
+                    ExecutionMode.REPEATABLE.value,
+                    new_execution_count,
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return AppliedMigration(
+        version=migration.version,
+        description=migration.description,
+        checksum=checksum,
+        applied_at=applied_at,
+        duration_ms=duration_ms,
+        app_version=__version__,
+        execution=ExecutionMode.REPEATABLE,
+        execution_count=new_execution_count,
+    )
+
+
+def apply_pending(
+    conn,
+    config,
+    *,
+    baseline_existing: bool = False,
+    logger=None,
+    migrations_dir: Path | None = None,
+    repo_root: Path | None = None,
+) -> list[AppliedMigration]:
+    """Apply every pending migration, in order: all pending one_time
+    migrations (ascending version), then all repeatable migrations
+    awaiting initial application or reapplication (ascending version) --
+    see module docstring "Ordering". Refuses to proceed at all (before
+    executing any SQL) if any applied migration shows a one_time checksum
+    mismatch or an execution-mode mismatch -- migrations are immutable
+    once applied; add a new migration instead of editing one.
+
+    `migrations_dir`/`repo_root`: see `status()`'s docstring -- the same
+    injectable seam, for tests.
+    """
+    migrations_dir, repo_root = _default_migrations_and_repo_root(migrations_dir, repo_root)
     all_migrations = discover(migrations_dir, repo_root)
 
     if not try_advisory_lock(conn, MIGRATION_LOCK_KEY):
@@ -378,23 +774,26 @@ def apply_pending(conn, config, *, baseline_existing: bool = False, logger=None)
     try:
         ensure_history_table(conn, config.ops_schema)
         applied = _read_applied(conn, config.ops_schema)
+        plan = _plan_status(all_migrations, applied)
 
-        for migration in all_migrations:
-            if migration.version in applied:
-                checksum = compute_checksum(migration)
-                if applied[migration.version].checksum != checksum:
-                    raise MigrationError(
-                        f"migration {migration.version} ({migration.manifest_path.name}) has changed since it "
-                        "was applied -- checksum mismatch. Migrations are immutable once applied; add a new "
-                        "migration instead of editing this one."
-                    )
+        if plan.mode_mismatches:
+            raise MigrationError(
+                f"migration(s) {', '.join(plan.mode_mismatches)} declare a different execution mode than "
+                "when they were applied. Execution mode is immutable once a migration is applied -- add a "
+                "new migration instead of changing this one's mode."
+            )
+        if plan.one_time_mismatches:
+            raise MigrationError(
+                f"one_time migration(s) {', '.join(plan.one_time_mismatches)} have changed since they were "
+                "applied -- checksum mismatch. One-time migrations are immutable once applied; add a new "
+                "migration instead of editing this one."
+            )
 
         first_version = all_migrations[0].version if all_migrations else None
         applied_results: list[AppliedMigration] = []
-        for migration in all_migrations:
-            if migration.version in applied:
-                continue
 
+        # --- Pass 1: all pending one_time migrations, ascending version -
+        for migration in plan.pending_one_time:
             if migration.version == first_version and _target_schema_nonempty(conn, config.pg_schema):
                 if not baseline_existing:
                     raise MigrationError(
@@ -410,7 +809,22 @@ def apply_pending(conn, config, *, baseline_existing: bool = False, logger=None)
                         + "\n  - ".join(problems)
                     )
 
-            result = _apply_one(conn, migration, config)
+            result = _apply_one_time(conn, migration, config)
+            applied_results.append(result)
+            if logger is not None:
+                logger(migration.version, migration.description, result.duration_ms)
+
+        # --- Pass 2: repeatable migrations (initial + changed), only
+        #     after every pending one_time migration above has succeeded,
+        #     ascending version ------------------------------------------
+        to_apply_repeatable = tuple(
+            sorted(plan.pending_repeatable_initial + plan.pending_repeatable_changed, key=lambda m: m.version)
+        )
+        for migration in to_apply_repeatable:
+            prior = applied.get(migration.version)
+            result = _apply_repeatable(
+                conn, migration, config, prior_execution_count=(prior.execution_count if prior else 0)
+            )
             applied_results.append(result)
             if logger is not None:
                 logger(migration.version, migration.description, result.duration_ms)
@@ -429,16 +843,47 @@ def run_host_identity() -> str:
 
 def _print_status(conn, config) -> int:
     result = status(conn, config)
-    if result.checksum_mismatches:
-        print(f"CHECKSUM MISMATCH: {', '.join(result.checksum_mismatches)}")
-        print("A previously applied migration's referenced file(s) changed. This must be investigated.")
+    if result.has_integrity_failures:
+        if result.one_time_mismatches:
+            print(f"ONE-TIME CHECKSUM MISMATCH: {', '.join(result.one_time_mismatches)}")
+            print(
+                "A previously applied one-time migration's referenced file(s) changed. "
+                "This must be investigated -- one-time migrations are immutable once applied."
+            )
+        if result.mode_mismatches:
+            print(f"EXECUTION MODE MISMATCH: {', '.join(result.mode_mismatches)}")
+            print(
+                "A migration's manifest 'execution' no longer matches its applied history. "
+                "Execution mode is immutable once a migration is applied."
+            )
         return 1
-    print(f"Applied migrations ({len(result.applied)}):")
-    for m in result.applied:
+
+    print(f"Applied one-time migrations ({len(result.applied_one_time)}):")
+    for m in result.applied_one_time:
         print(f"  {m.version}  {m.description}  applied_at={m.applied_at.isoformat()}  ({m.duration_ms:.1f} ms)")
-    print(f"Pending migrations ({len(result.pending)}):")
-    for m in result.pending:
+
+    print(f"Current repeatable migrations ({len(result.applied_repeatable_current)}):")
+    for m in result.applied_repeatable_current:
+        print(
+            f"  {m.version}  {m.description}  applied_at={m.applied_at.isoformat()}  "
+            f"execution_count={m.execution_count}"
+        )
+
+    print(f"Pending one-time migrations ({len(result.pending_one_time)}):")
+    for m in result.pending_one_time:
         print(f"  {m.version}  {m.description}")
+
+    print(f"Repeatable migrations awaiting initial application ({len(result.pending_repeatable_initial)}):")
+    for m in result.pending_repeatable_initial:
+        print(f"  {m.version}  {m.description}")
+
+    print(
+        f"Repeatable migrations awaiting reapplication, checksum changed "
+        f"({len(result.pending_repeatable_changed)}):"
+    )
+    for m in result.pending_repeatable_changed:
+        print(f"  {m.version}  {m.description}")
+
     return 0
 
 

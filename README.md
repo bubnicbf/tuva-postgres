@@ -52,14 +52,32 @@ Each migration is a versioned JSON manifest (`db/migrations/{version}_
 `db/migrations/sql/0002_operational_schema/`). The manifest's `files` list
 is the authoritative execution order -- never filesystem traversal order.
 
-Applied migrations are immutable: never edit an existing migration's
-files or reorder its manifest once it has shipped. `src/tuva_postgres/
-migrations.py` computes each migration's checksum from its ordered
-files' basenames, byte lengths, and contents, and refuses to proceed if
-an already-applied migration's checksum has changed. Database changes
-always go into a **new** migration at the next unused numeric version
-(`0003`, `0004`, ...) -- see `docs/RUNBOOK.md`'s "Adding a new migration"
-section for the full walkthrough.
+Every manifest also declares exactly one **execution mode** via a
+required `"execution"` field:
+
+- `"one_time"` -- applied at most once. Once applied, its SQL, file
+  order, checksum, and execution mode are all immutable; any drift is a
+  hard error that blocks all further migration activity. Migrations
+  `0001` and `0002` are both `one_time`.
+- `"repeatable"` -- applied on first discovery, then transactionally
+  reapplied whenever its checksum changes, and skipped otherwise
+  (standard checksum-driven semantics -- never rerun unconditionally).
+  Use this for idempotent SQL (`CREATE OR REPLACE VIEW`/function, etc.)
+  you want to keep current, not a one-off schema change.
+
+`src/tuva_postgres/migrations.py` computes each migration's checksum
+purely from its ordered files' basenames, byte lengths, and contents
+(manifest metadata like `execution` never affects it), and refuses to
+proceed if an already-applied `one_time` migration's checksum -- or any
+migration's execution mode -- has changed since it was applied. Within a
+single run, all pending `one_time` migrations apply (ascending version)
+before any pending `repeatable` migration, so a repeatable view or
+function can safely depend on a schema object a pending `one_time`
+migration is about to create, regardless of version numbering. Database
+changes always go into a **new** migration at the next unused numeric
+version (`0003`, `0004`, ...) -- see `docs/RUNBOOK.md`'s "Adding a new
+migration" section for the full walkthrough, including execution-mode
+guidance.
 
 SQL data-quality/validation queries (the smoke tests and add-on checks
 `scripts/run_tests.sh` runs after a load) are a separate concern and live

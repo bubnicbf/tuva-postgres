@@ -1,6 +1,7 @@
 {
   "version": "0002",
   "description": "Operational schema: pipeline_runs and pipeline_artifacts tables",
+  "execution": "one_time",
   "vars": {
     "ops_schema": "OPS_SCHEMA"
   },

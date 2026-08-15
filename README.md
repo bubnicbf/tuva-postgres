@@ -94,7 +94,9 @@ package) intentionally:**
 
 ## Notes
 
-- Put CSVs in data/ with headers matching db/schema.sql.
+- Put CSVs in data/ with headers matching the applicable table definitions
+  under db/tables/*.sql (see db/migrations/0001_baseline.json for the full,
+  ordered list).
 - Adjust table/column names to the Tuva release you use.
 - scripts/load_to_postgres.sh uses \copy, so no server-side file access needed.
 

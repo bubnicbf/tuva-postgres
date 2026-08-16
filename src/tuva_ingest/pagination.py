@@ -481,6 +481,10 @@ def extract_paginated_run(
         while True:
             page_number += 1
             if page_number > config.api_max_pages:
+                log_event(
+                    logger, "pagination_limit_exceeded", run_id=run_id, endpoint=endpoint,
+                    limit="max_pages", configured_max=config.api_max_pages, page_number=page_number,
+                )
                 raise PaginationError(
                     f"pagination for endpoint {endpoint!r} exceeded the configured maximum of "
                     f"{config.api_max_pages} pages (TUVA_API_MAX_PAGES) -- aborting as a defense "
@@ -489,6 +493,10 @@ def extract_paginated_run(
 
             if request_token is not None:
                 if request_token in seen_request_tokens:
+                    log_event(
+                        logger, "pagination_limit_exceeded", run_id=run_id, endpoint=endpoint,
+                        limit="cycle_detected", page_number=page_number,
+                    )
                     raise PaginationError(
                         f"pagination cycle detected: page token {request_token!r} was requested more "
                         "than once in this run"
@@ -520,8 +528,46 @@ def extract_paginated_run(
                 record_count=envelope.record_count,
             )
 
+            # Absolute safety ceiling on total source records accepted in
+            # this run -- checked *after* envelope validation (so we know
+            # the page's own record_count is trustworthy) but *before*
+            # this page is written/published, so a run that would exceed
+            # the limit never has this page's records land on disk at
+            # all. Counts every record in the page toward the limit,
+            # including any that will later be quarantined at load time
+            # (quarantine classification happens downstream, in
+            # paginated_loader.py -- this check has no visibility into
+            # which records will eventually be valid vs. quarantined, by
+            # design: the limit is about total *source* volume, not
+            # validity).
+            prospective_total = total_record_count + envelope.record_count
+            if prospective_total > config.api_max_records_per_run:
+                log_event(
+                    logger, "pagination_limit_exceeded", run_id=run_id, endpoint=endpoint,
+                    limit="max_records", configured_max=config.api_max_records_per_run,
+                    page_number=page_number, prospective_total=prospective_total,
+                )
+                raise PaginationError(
+                    f"pagination for endpoint {endpoint!r} would exceed the configured maximum of "
+                    f"{config.api_max_records_per_run} records per run (TUVA_API_MAX_RECORDS_PER_RUN) "
+                    f"after accepting page {page_number} -- aborting before publishing this page"
+                )
+
             if envelope.next_page_token is not None:
-                if envelope.next_page_token in seen_next_tokens or envelope.next_page_token == request_token:
+                if envelope.next_page_token == request_token:
+                    log_event(
+                        logger, "pagination_limit_exceeded", run_id=run_id, endpoint=endpoint,
+                        limit="cycle_detected", page_number=page_number,
+                    )
+                    raise PaginationError(
+                        f"pagination cycle detected: the server returned the current page token "
+                        f"{request_token!r} as next_page_token -- this would loop forever"
+                    )
+                if envelope.next_page_token in seen_next_tokens:
+                    log_event(
+                        logger, "pagination_limit_exceeded", run_id=run_id, endpoint=endpoint,
+                        limit="cycle_detected", page_number=page_number,
+                    )
                     raise PaginationError(
                         f"pagination cycle detected: next_page_token {envelope.next_page_token!r} repeats "
                         "a previously seen token in this run"

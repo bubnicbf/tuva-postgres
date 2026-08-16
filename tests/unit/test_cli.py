@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from tuva_ingest import cli  # noqa: E402
-from tuva_ingest.errors import CliUsageError, ConfigError, RunNotFoundError  # noqa: E402
+from tuva_ingest.errors import CliUsageError, ConfigError, OAuthError, QuarantineError, RunNotFoundError  # noqa: E402
 
 
 class TestBuildParser(unittest.TestCase):
@@ -94,6 +94,43 @@ class TestMainErrorHandling(unittest.TestCase):
             self.assertEqual(cli.main(["healthcheck"]), 0)
         with mock.patch.object(cli, "_cmd_healthcheck", return_value=1):
             self.assertEqual(cli.main(["healthcheck"]), 1)
+
+    def test_oauth_error_from_subcommand_is_sanitized_and_exits_1(self):
+        # OAuthError is a ConnectorError subclass (category "oauth") --
+        # main() must handle it the same generic way as any other
+        # ConnectorError, with no token/secret leaking into stderr.
+        with mock.patch.object(
+            cli, "_cmd_extract", side_effect=OAuthError("token endpoint returned an invalid grant")
+        ):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                code = cli.main(["extract", "--endpoint", "eligibility"])
+        self.assertEqual(code, 1)
+        self.assertIn("[oauth]", stderr.getvalue())
+        self.assertIn("invalid grant", stderr.getvalue())
+
+    def test_quarantine_error_from_subcommand_is_sanitized_and_exits_1(self):
+        with mock.patch.object(
+            cli, "_cmd_load", side_effect=QuarantineError("failed to insert quarantine row, rolling back")
+        ):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                code = cli.main(["load", "--run-id", "019abc"])
+        self.assertEqual(code, 1)
+        self.assertIn("[quarantine]", stderr.getvalue())
+
+    def test_oauth_error_message_never_leaks_a_bearer_token_or_secret(self):
+        # Defense-in-depth: even if a bug somewhere put a token-shaped
+        # value into an OAuthError's message, main()'s sanitize_error
+        # pass must still strip it before it reaches stderr.
+        sentinel_secret = "sk-live-sentinel-9f8e7d6c5b4a"
+        with mock.patch.object(
+            cli, "_cmd_extract", side_effect=OAuthError(f"refresh failed, Authorization: Bearer {sentinel_secret}")
+        ):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                cli.main(["extract", "--endpoint", "eligibility"])
+        self.assertNotIn(sentinel_secret, stderr.getvalue())
 
 
 
@@ -260,6 +297,72 @@ class TestRunPaginatedLoadResolution(unittest.TestCase):
 
         with self.assertRaises(ReconciliationError):
             cli._run_paginated_load("run-1", config=self.config, logger=self.logger)
+
+
+class TestBuildPaginatedApiClientAuthModeSelection(unittest.TestCase):
+    """_build_paginated_api_client must select OAuth mode if and only if
+    TUVA_OAUTH_TOKEN_URL is configured -- the static-secret path
+    (secrets.retrieve_api_credential) is otherwise used unchanged. Both
+    branches are exercised with every collaborator mocked so no real
+    network/OAuth-server/cloud-secret-manager call is made."""
+
+    def _config(self, *, oauth_token_url=None):
+        @dataclass
+        class _Config:
+            oauth_token_url: str | None = oauth_token_url
+            oauth_client_id: str | None = "client-1" if oauth_token_url else None
+            oauth_client_secret_value: str | None = "secret-1" if oauth_token_url else None
+            oauth_scopes: str | None = None
+            oauth_refresh_skew_seconds: float = 60.0
+            api_max_retries: int = 3
+            api_max_retry_delay_seconds: float = 5.0
+            api_max_retry_duration_seconds: float = 120.0
+
+            def httpx_timeout(self):
+                return None
+
+        return _Config()
+
+    def test_oauth_mode_selected_when_token_url_is_configured(self):
+        import logging
+
+        logger = logging.getLogger("tuva_ingest.tests.test_cli.oauth_mode")
+        with (
+            mock.patch("tuva_ingest.oauth.OAuthTokenManager") as fake_manager_cls,
+            mock.patch("tuva_ingest.api_client.ApiClient") as fake_client_cls,
+        ):
+            config = self._config(oauth_token_url="https://example.invalid/oauth/token")
+            cli._build_paginated_api_client(config, logger)
+            fake_manager_cls.assert_called_once()
+            fake_client_cls.assert_called_once()
+            _, kwargs = fake_client_cls.call_args
+            self.assertIn("oauth_manager", kwargs)
+            self.assertNotIn("token", kwargs)
+
+    def test_static_secret_mode_selected_when_token_url_is_unset(self):
+        import logging
+
+        from pydantic import SecretStr
+
+        from tuva_ingest.secrets import ApiCredential
+
+        logger = logging.getLogger("tuva_ingest.tests.test_cli.static_mode")
+        with (
+            mock.patch(
+                "tuva_ingest.secrets.retrieve_api_credential",
+                return_value=ApiCredential(api_token=SecretStr("fake-static-token")),
+            ) as fake_retrieve,
+            mock.patch("tuva_ingest.oauth.OAuthTokenManager") as fake_manager_cls,
+            mock.patch("tuva_ingest.api_client.ApiClient") as fake_client_cls,
+        ):
+            config = self._config(oauth_token_url=None)
+            cli._build_paginated_api_client(config, logger)
+            fake_retrieve.assert_called_once()
+            fake_manager_cls.assert_not_called()
+            fake_client_cls.assert_called_once()
+            _, kwargs = fake_client_cls.call_args
+            self.assertIn("token", kwargs)
+            self.assertNotIn("oauth_manager", kwargs)
 
 
 class TestSyncStopsBeforeLoadOnExtractionFailure(unittest.TestCase):

@@ -114,3 +114,23 @@ class WatermarkError(ConnectorError):
 
     category = "watermark"
 
+
+class OAuthError(ConnectorError):
+    """Raised by `oauth.py` for any OAuth token-lifecycle failure: a
+    malformed or incomplete token-endpoint response, an unsupported
+    token_type, a permanent grant failure (invalid_client/invalid_grant/
+    ...), or a transient failure that exhausted the shared bounded retry
+    budget. Never includes a token, client secret, or the raw
+    token-endpoint response body in its message."""
+
+    category = "oauth"
+
+
+class QuarantineError(ConnectorError):
+    """Raised when a structurally invalid record cannot be safely written
+    to the quarantine table (e.g. a database error while inserting a
+    quarantine row) -- always treated as a failed run, rolling back the
+    whole load transaction so a partially-quarantined run is never left
+    committed."""
+
+    category = "quarantine"

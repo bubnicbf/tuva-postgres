@@ -232,6 +232,38 @@ migration and SQL-test-runner *structure and behavior* (via stubbed
 `make migration-status` reports applied, pending, and checksum-mismatch
 states without applying anything.
 
+### Migration idempotency
+
+CI runs the real migration runner (`scripts/apply_schema.sh`) **twice**
+against the same unique, disposable schemas, as a dedicated step ("Run
+migration suite twice and verify idempotency") that runs before schema
+creation/fixture loading/SQL validation on every push, pull request, and
+scheduled run. The first invocation applies every pending migration; the
+second, identical invocation must be a true no-op -- it never bypasses
+`schema_migrations` to hand-rerun `one_time` SQL, and it must report zero
+migrations applied. The check compares, byte-for-byte, before and after
+the second run: the complete migration-history table (every column,
+including `execution_count`), a deterministic catalog fingerprint
+(schemas, tables, views, columns, constraints, indexes, functions, and
+non-internal triggers), and the existing focused foreign-key catalog. It
+also confirms the final `--status` output has zero pending migrations and
+no checksum/execution-mode mismatches, and that `--status` itself never
+mutates history. This protects `one_time` immutability and unchanged-
+`repeatable` reapplication-skipping -- it is a separate concern from
+testing a *changed* repeatable migration's re-execution (see
+`scripts/tests/test_migration_execution_modes.sh`).
+
+Run it locally with `make test-schema-idempotency` (requires a real,
+**disposable** PostgreSQL database via `PG_DSN` in `.env` -- never point
+it at production; it creates and drops its own uniquely-named temporary
+schemas and never touches `tuva`/`tuva_term`/`tuva_ops`). It's
+intentionally excluded from `test-shell`/`test` since it needs Postgres.
+The harness's control flow (does it correctly accept a true no-op rerun
+and correctly reject every way a rerun can go wrong?) has separate,
+database-free regression coverage in
+`scripts/tests/test_schema_idempotency_harness_controls.sh`, run as part
+of `make test-shell`.
+
 ## Python development and quality tooling
 
 `src/tuva_postgres/` has two runtime dependencies -- `requests` (the API

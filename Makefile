@@ -73,14 +73,21 @@ test-shell:
 	bash scripts/tests/test_no_legacy_root_sql_files.sh
 	bash scripts/tests/test_versioned_migration_layout.sh
 	bash scripts/tests/test_migration_execution_modes.sh
+	bash scripts/tests/test_schema_idempotency_harness_controls.sh
 	bash scripts/tests/test_sql_test_layout.sh
 	python3 scripts/tests/test_constraint_idempotency_guards.py
 	python3 scripts/tests/test_pre_commit_config.py
 	python3 scripts/tests/test_python_dependencies.py
 
-# Requires a real, DISPOSABLE PostgreSQL test database via PG_DSN (see .env).
-# Applies the core table DDL twice into a uniquely-named temporary schema
-# that it creates and drops itself. Never run against production.
+# Proves the real migration runner (scripts/apply_schema.sh) is idempotent:
+# applies every discovered migration once into uniquely-named temporary
+# schemas, then invokes the same entry point a second time and asserts a
+# true no-op -- zero migrations applied, the complete migration-history
+# table unchanged, and a deterministic catalog fingerprint unchanged.
+# Never hand-reruns migration SQL; never touches "tuva"/"tuva_term"/
+# "tuva_ops". Run by CI on every push/pull_request/schedule; kept outside
+# test-shell/test because it requires a real, DISPOSABLE PostgreSQL test
+# database via PG_DSN (see .env).
 test-schema-idempotency:
 	. .env && bash scripts/tests/test_schema_constraint_idempotency.sh
 

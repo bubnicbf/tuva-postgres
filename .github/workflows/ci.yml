@@ -94,6 +94,9 @@ jobs:
           done
           psql "$PG_DSN" -c "SELECT version();"
 
+      - name: Run migration suite twice and verify idempotency
+        run: make test-schema-idempotency
+
       - name: Apply schemas
         run: make create-db
 

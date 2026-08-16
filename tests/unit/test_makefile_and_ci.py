@@ -124,6 +124,25 @@ class TestMakefileTargets(unittest.TestCase):
         self.assertIn("local-db-up", recipe_line.group(1))
         self.assertIn("local-db-migrate", recipe_line.group(1))
 
+    def test_schema_idempotency_target_invokes_the_real_harness_script(self):
+        recipe = self._recipe("test-schema-idempotency")
+        self.assertIn("scripts/tests/test_schema_constraint_idempotency.sh", recipe)
+
+    def test_schema_idempotency_target_documents_disposable_database_requirement(self):
+        target_idx = self.text.index("test-schema-idempotency:")
+        preceding_comment_block = self.text[:target_idx].splitlines()[-10:]
+        self.assertTrue(
+            any("DISPOSABLE" in line for line in preceding_comment_block),
+            "test-schema-idempotency's preceding comment block does not state the disposable-database requirement",
+        )
+
+    def test_schema_idempotency_kept_out_of_test_shell_and_test(self):
+        # test-shell/test must stay database-free / non-Postgres-required;
+        # the idempotency harness needs a real disposable Postgres and is
+        # invoked as its own dedicated CI step instead.
+        self.assertNotIn("test-schema-idempotency", self._recipe("test-shell"))
+        self.assertNotIn("test-schema-idempotency", self._recipe("test"))
+
 
 @unittest.skipUnless(HAVE_YAML, "PyYAML is not installed in this environment")
 class TestCiWorkflow(unittest.TestCase):
@@ -156,6 +175,65 @@ class TestCiWorkflow(unittest.TestCase):
         triggers = self.doc.get("on", self.doc.get(True))
         schedule = triggers["schedule"]
         self.assertEqual(schedule[0]["cron"], "0 6 * * *")
+
+    def _step_indices_running(self, make_target: str) -> list[int]:
+        # Word-boundary match on the target name -- "make test" is a
+        # substring of "make test-unit", "make test-schema-idempotency",
+        # etc., so a plain substring check would misidentify which step
+        # actually invokes which target.
+        pattern = re.compile(rf"make {re.escape(make_target)}(?:\s|$)", re.MULTILINE)
+        return [i for i, step in enumerate(self.steps) if pattern.search(step.get("run", ""))]
+
+    def test_schema_idempotency_step_present_exactly_once(self):
+        indices = self._step_indices_running("test-schema-idempotency")
+        self.assertEqual(
+            len(indices), 1,
+            "expected exactly one CI step invoking 'make test-schema-idempotency'",
+        )
+
+    def test_schema_idempotency_step_positioned_after_readiness_before_load_and_sql_tests(self):
+        readiness_indices = [
+            i for i, step in enumerate(self.steps)
+            if "pg_isready" in step.get("run", "") or "Wait for Postgres" in step.get("name", "")
+        ]
+        self.assertTrue(readiness_indices, "could not locate the Postgres readiness step")
+        readiness_idx = readiness_indices[0]
+
+        idempotency_idx = self._step_indices_running("test-schema-idempotency")[0]
+        self.assertGreater(
+            idempotency_idx, readiness_idx,
+            "the migration-idempotency step must run after Postgres readiness is confirmed",
+        )
+
+        for target in ("create-db", "load", "test"):
+            later_indices = self._step_indices_running(target)
+            self.assertTrue(later_indices, f"expected a step invoking 'make {target}'")
+            self.assertLess(
+                idempotency_idx, later_indices[0],
+                f"the migration-idempotency step must run before 'make {target}' "
+                "(fixture loading / SQL validation)",
+            )
+
+    def test_schema_idempotency_step_has_no_continue_on_error_or_swallowed_failures(self):
+        idempotency_idx = self._step_indices_running("test-schema-idempotency")[0]
+        step = self.steps[idempotency_idx]
+        self.assertNotIn("continue-on-error", step)
+        run = step.get("run", "")
+        self.assertNotIn("|| true", run)
+        self.assertNotIn("|| :", run)
+        self.assertNotRegex(run, r">\s*/dev/null\s+2>&1\s*\|\|")
+
+    def test_schema_idempotency_step_not_restricted_to_a_single_event_type(self):
+        idempotency_idx = self._step_indices_running("test-schema-idempotency")[0]
+        step = self.steps[idempotency_idx]
+        self.assertNotIn("if", step, "the idempotency step must not be gated behind an event-type 'if:' condition")
+
+    def test_all_preexisting_pipeline_steps_still_present(self):
+        for target in (
+            "check-python-deps", "create-db", "migration-status", "load", "test",
+            "test-integration", "test-container", "test-deploy", "lint-sql",
+        ):
+            self.assertIn(f"make {target}", self.run_commands, f"missing pre-existing step invoking 'make {target}'")
 
 
 if __name__ == "__main__":

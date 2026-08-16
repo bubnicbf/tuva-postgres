@@ -162,6 +162,49 @@ repository.
   Add new SQL validation tests under `db/tests/`; new deployable DDL
   instead always goes into a new migration, per the walkthrough below.
 
+### CI migration idempotency check
+
+CI runs `scripts/apply_schema.sh` (the real migration entry point) twice
+against the same unique, disposable schemas, as its own dedicated step
+("Run migration suite twice and verify idempotency") that runs right
+after the Postgres readiness check and before `make create-db`/`make
+load`/`make test`, on every push, pull request, and scheduled run -- with
+no `continue-on-error` and no swallowed failures. The first run applies
+every pending migration; the second run must be a true no-op:
+
+- zero migrations applied, and the exact same
+  `"No pending migrations. Database is up to date."` message the runner
+  always prints for a clean state (never a manually-rerun `one_time`
+  migration -- the check goes through `scripts/apply_schema.sh` both
+  times, exactly like a real deploy would);
+- the complete `schema_migrations` history table unchanged, column for
+  column, including `execution_count` (a `one_time` migration's count
+  must stay `1`, never re-increment);
+- a deterministic catalog fingerprint unchanged -- schemas, tables,
+  views, columns, primary/foreign/unique/check constraints, indexes,
+  functions, and non-internal triggers (Postgres's own auto-generated
+  FK-enforcement triggers are deliberately excluded, since their names
+  embed a non-deterministic OID and would otherwise look like drift
+  between two identically-created schemas); and
+- the existing focused foreign-key catalog (every expected FK present
+  exactly once, deferrable, initially deferred) unchanged.
+
+It also confirms the final `--status` output has zero pending migrations,
+no checksum/execution-mode mismatches, and that calling `--status` itself
+never mutates history. Run it locally with `make test-schema-idempotency`
+against a real, **disposable** `PG_DSN` (never production -- it creates
+and drops its own uniquely-named temporary schemas and never touches
+`tuva`/`tuva_term`/`tuva_ops`); it's excluded from `test-shell`/`test`
+because it needs Postgres. The harness's control flow -- does it actually
+catch a second run that applies something, drifts history, or drifts the
+catalog? -- has separate, database-free regression coverage in
+`scripts/tests/test_schema_idempotency_harness_controls.sh` (part of
+`make test-shell`), which drives the real harness script against a tiny
+stubbed migration set instead of simulating Postgres catalog behavior.
+This check is about rerun safety of the *unchanged* migration set; a
+changed `repeatable` migration's re-execution is a separate concern
+covered by `scripts/tests/test_migration_execution_modes.sh`.
+
 ### Adding a new migration
 
 1. Pick the next unused numeric version (check `make migration-status`

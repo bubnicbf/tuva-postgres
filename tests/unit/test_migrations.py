@@ -23,9 +23,9 @@ class TestDiscoverRealMigrations(unittest.TestCase):
     directory -- proves the three shipped files are well-formed, unique,
     and discoverable, not just that discover() works in the abstract."""
 
-    def test_discovers_five_migrations_in_order(self):
+    def test_discovers_six_migrations_in_order(self):
         found = migrations.discover(REPO_ROOT / "migrations")
-        self.assertEqual([m.version for m in found], ["001", "002", "003", "004", "005"])
+        self.assertEqual([m.version for m in found], ["001", "002", "003", "004", "005", "006"])
         self.assertEqual(
             [m.filename for m in found],
             [
@@ -34,6 +34,7 @@ class TestDiscoverRealMigrations(unittest.TestCase):
                 "003_roles_and_grants.sql",
                 "004_endpoint_scoped_ingestion.sql",
                 "005_paginated_extraction_state.sql",
+                "006_record_quarantine.sql",
             ],
         )
 
@@ -224,6 +225,103 @@ class TestMigration005PaginatedExtractionState(unittest.TestCase):
             "002_ingestion_control.sql",
             "003_roles_and_grants.sql",
             "004_endpoint_scoped_ingestion.sql",
+        ):
+            path = REPO_ROOT / "migrations" / filename
+            self.assertTrue(path.is_file(), f"migration {filename} must still exist unmodified")
+
+
+class TestMigration006RecordQuarantine(unittest.TestCase):
+    """migrations/006_record_quarantine.sql adds the restricted
+    quarantined_records table (validators.py/quarantine.py/
+    paginated_loader.py) -- a lightweight structural check against the
+    real shipped file, without requiring a live PostgreSQL connection.
+    Access-control behavior itself (grants actually taking effect) is
+    covered by tests/integration/test_pipeline_integration.py against a
+    disposable database."""
+
+    def test_file_is_discovered_with_a_stable_checksum(self):
+        found = migrations.discover(REPO_ROOT / "migrations")
+        migration_006 = next(m for m in found if m.version == "006")
+        self.assertEqual(migration_006.filename, "006_record_quarantine.sql")
+        self.assertEqual(migration_006.checksum, migrations.compute_checksum(migration_006.path))
+
+    def test_creates_quarantined_records_table_with_required_columns(self):
+        path = REPO_ROOT / "migrations" / "006_record_quarantine.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("quarantined_records", sql)
+        for column in (
+            "quarantine_id",
+            "run_id",
+            "source",
+            "endpoint",
+            "page_number",
+            "record_index",
+            "reason_code",
+            "reason_detail",
+            "raw_record",
+            "source_record_sha256",
+            "quarantined_at",
+        ):
+            self.assertIn(column, sql)
+
+    def test_reason_code_is_constrained_to_a_fixed_allowlist(self):
+        path = REPO_ROOT / "migrations" / "006_record_quarantine.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("quarantined_records_reason_code_check", sql)
+        for reason_code in (
+            "record_not_object",
+            "missing_required_field",
+            "invalid_required_type",
+            "invalid_identifier",
+            "invalid_date_format",
+            "schema_validation_failed",
+        ):
+            self.assertIn(reason_code, sql)
+
+    def test_reason_detail_length_is_bounded(self):
+        path = REPO_ROOT / "migrations" / "006_record_quarantine.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("quarantined_records_reason_detail_length_check", sql)
+        self.assertIn("char_length(reason_detail) <= 200", sql)
+
+    def test_adds_idempotency_unique_index(self):
+        path = REPO_ROOT / "migrations" / "006_record_quarantine.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("quarantined_records_run_page_record_key", sql)
+        self.assertIn("(run_id, page_number, record_index)", sql)
+
+    def test_revokes_public_access(self):
+        path = REPO_ROOT / "migrations" / "006_record_quarantine.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn('REVOKE ALL ON :"ops_schema".quarantined_records FROM PUBLIC;', sql)
+
+    def test_revokes_default_privileges_before_granting_insert_only_to_ingest_role(self):
+        # migration 003's ALTER DEFAULT PRIVILEGES would otherwise leak
+        # SELECT/UPDATE onto this brand-new table -- the explicit REVOKE
+        # before the narrow GRANT INSERT is load-bearing, not defensive
+        # boilerplate. Assert ordering, not just presence.
+        path = REPO_ROOT / "migrations" / "006_record_quarantine.sql"
+        sql = path.read_text(encoding="utf-8")
+        revoke_idx = sql.index('REVOKE ALL ON :"ops_schema".quarantined_records FROM :"ingest_role";')
+        grant_idx = sql.index('GRANT INSERT ON :"ops_schema".quarantined_records TO :"ingest_role";')
+        self.assertLess(revoke_idx, grant_idx)
+        self.assertNotIn('GRANT SELECT ON :"ops_schema".quarantined_records', sql)
+        self.assertNotIn('GRANT UPDATE ON :"ops_schema".quarantined_records', sql)
+        self.assertNotIn('GRANT DELETE ON :"ops_schema".quarantined_records', sql)
+
+    def test_transform_role_is_never_granted_access(self):
+        path = REPO_ROOT / "migrations" / "006_record_quarantine.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertNotIn('GRANT SELECT ON :"ops_schema".quarantined_records TO :"transform_role"', sql)
+        self.assertNotIn('TO :"transform_role"', sql)
+
+    def test_is_forward_only_never_rewrites_prior_migrations(self):
+        for filename in (
+            "001_operational_schemas.sql",
+            "002_ingestion_control.sql",
+            "003_roles_and_grants.sql",
+            "004_endpoint_scoped_ingestion.sql",
+            "005_paginated_extraction_state.sql",
         ):
             path = REPO_ROOT / "migrations" / filename
             self.assertTrue(path.is_file(), f"migration {filename} must still exist unmodified")

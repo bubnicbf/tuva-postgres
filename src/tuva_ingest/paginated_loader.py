@@ -16,16 +16,38 @@ against on-disk corruption/tampering between extract and load) -- see
 Idempotency key: `(_snapshot_id, _source_row_number)` on each raw table
 (added by migrations/005_paginated_extraction_state.sql), with
 `_snapshot_id` reused to store the paginated run's `run_id` and
-`_source_row_number` assigned as a global, run-wide running counter
-(continuing across page boundaries) -- see `load_paginated_run`. This
-reuses the exact same two columns the legacy CSV contract already
-populates (`raw_loader.py`'s `_RAW_COLUMNS`), so both contracts' rows
-coexist in the same physical tables without any schema fork.
+`_source_row_number` assigned as a running counter over only the
+*structurally valid* records (continuing across page boundaries) -- see
+`load_paginated_run`. This reuses the exact same two columns the legacy
+CSV contract already populates (`raw_loader.py`'s `_RAW_COLUMNS`), so
+both contracts' rows coexist in the same physical tables without any
+schema fork.
+
+Quarantine
+-----------
+Every record is classified by `validators.validate_record` before it is
+staged: a structurally valid record is loaded into the raw table exactly
+as before; a structurally invalid one is instead written to the
+restricted `quarantined_records` table (see `quarantine.py`,
+`migrations/006_record_quarantine.sql`) and is *never* also loaded into
+the raw table. `load_paginated_run` returns a `LoadCounts` (valid vs.
+quarantined per page and in total) that the caller (`cli.py`) uses for
+the three-way reconciliation this connector requires:
+`source_record_count == raw_loaded_count + quarantined_count`.
+
+`quarantined_count` is computed by re-classifying every record on every
+call to `load_paginated_run` (the same deterministic pass over the
+immutable page files this function already performs), never by
+`SELECT`-ing the quarantine table back -- `ingest_role` is deliberately
+granted only `INSERT` on `quarantined_records` (see migrations/006's
+access-model comment), so this function must never need `SELECT` on it
+to compute a correct count, including on an idempotent repeat load.
 """
 from __future__ import annotations
 
 import gzip
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,8 +55,18 @@ from .db import qualified_relation
 from .endpoints import table_for_endpoint
 from .errors import RawLoadError, ReconciliationError
 from .pagination import PaginatedRunStore, file_sha256
+from .logging_utils import log_event
+from .quarantine import insert_quarantine_record
+from .validators import validate_record
 
 _STAGING_TABLE = "_tuva_ingest_page_staging"
+
+
+@dataclass(frozen=True)
+class LoadCounts:
+    valid_count: int
+    quarantined_count: int
+    quarantined_by_reason: dict
 
 
 def _relation(raw_schema: str, table: str) -> str:
@@ -100,15 +132,29 @@ def verify_run_manifest(store: PaginatedRunStore, run_id: str) -> dict:
     return manifest
 
 
-def load_paginated_run(conn, config, store: PaginatedRunStore, run_id: str, manifest: dict) -> None:
+def load_paginated_run(conn, config, store: PaginatedRunStore, run_id: str, manifest: dict, *, logger: object = None) -> LoadCounts:
     """Load every page of `manifest` into `config.raw_schema`'s table for
     `manifest['endpoint']`, inside the caller's existing transaction --
     never commits or rolls back itself, and never touches any raw table
-    other than the one endpoint's. Idempotent: repeating this for the
-    same `run_id` inserts nothing new (`ON CONFLICT (_snapshot_id,
-    _source_row_number) DO NOTHING`) rather than duplicating rows.
-    Raises `RawLoadError` if a page's records cannot be staged/copied.
+    other than the one endpoint's. Every record is classified by
+    `validators.validate_record` first: a structurally valid record is
+    staged into the raw table exactly as before; a structurally invalid
+    one is instead inserted into the restricted `quarantined_records`
+    table (see `quarantine.py`) and is never also loaded into the raw
+    table. Idempotent: repeating this for the same `run_id` inserts
+    nothing new into either table (`ON CONFLICT DO NOTHING` on both,
+    backed by migrations/005's and migrations/006's unique indexes)
+    rather than duplicating rows.
+
+    Returns a `LoadCounts` computed from this call's own classification
+    pass (valid vs. quarantined, and quarantined-by-reason-code) -- see
+    module docstring for why this is never a `SELECT` against the
+    quarantine table. Raises `RawLoadError` if a page's valid records
+    cannot be staged/copied, or `QuarantineError` if a quarantine insert
+    fails.
     """
+    from .errors import QuarantineError
+
     endpoint = manifest["endpoint"]
     table = table_for_endpoint(endpoint)
     relation = _relation(config.raw_schema, table)
@@ -124,12 +170,25 @@ def load_paginated_run(conn, config, store: PaginatedRunStore, run_id: str, mani
         )
 
     offset = 0
+    valid_count = 0
+    quarantined_count = 0
+    quarantined_by_reason: dict[str, int] = {}
+
     for page in manifest["pages"]:
         page_path = run_dir / page["file_name"]
         page_number = page["page_number"]
         source_page_token = page.get("response_page_token") or page.get("request_page_token")
         retrieved_at = page["retrieved_at"]
         file_sha256 = page["sha256"]
+
+        # Classify every record first, buffering quarantine candidates in
+        # memory for this one page (a page is bounded by TUVA_API_MAX_PAGE_BYTES,
+        # so this is never unbounded) -- quarantine rows are inserted via a
+        # separate statement *after* the COPY below completes, since
+        # PostgreSQL's wire protocol does not allow another statement to
+        # be issued on the same connection while a COPY FROM STDIN is
+        # still open.
+        quarantine_candidates: list[tuple[int, object, object]] = []  # (record_index, decision, record)
 
         with conn.cursor() as cur:
             cur.execute(f"TRUNCATE TABLE {_STAGING_TABLE}")
@@ -138,12 +197,21 @@ def load_paginated_run(conn, config, store: PaginatedRunStore, run_id: str, mani
                     f"COPY {_STAGING_TABLE} (_snapshot_id, _source_row_number, _loaded_at, raw_row, "
                     "endpoint, page_number, source_page_token, retrieved_at, file_sha256) FROM STDIN"
                 ) as copy:
-                    for record in _iter_jsonl_records(page_path):
-                        offset += 1
-                        copy.write_row((
-                            run_id, offset, loaded_at, json.dumps(record, default=str),
-                            endpoint, page_number, source_page_token, retrieved_at, file_sha256,
-                        ))
+                    for record_index, record in enumerate(_iter_jsonl_records(page_path), start=1):
+                        decision = validate_record(endpoint, record)
+                        if decision is None:
+                            offset += 1
+                            valid_count += 1
+                            copy.write_row((
+                                run_id, offset, loaded_at, json.dumps(record, default=str),
+                                endpoint, page_number, source_page_token, retrieved_at, file_sha256,
+                            ))
+                        else:
+                            quarantined_count += 1
+                            quarantined_by_reason[decision.reason_code] = (
+                                quarantined_by_reason.get(decision.reason_code, 0) + 1
+                            )
+                            quarantine_candidates.append((record_index, decision, record))
             except Exception as exc:
                 raise RawLoadError(f"{table!r}: failed while staging page {page['file_name']!r}: {exc}") from exc
 
@@ -155,6 +223,35 @@ def load_paginated_run(conn, config, store: PaginatedRunStore, run_id: str, mani
                 f"source_page_token, retrieved_at, file_sha256 FROM {_STAGING_TABLE} "
                 "ON CONFLICT (_snapshot_id, _source_row_number) DO NOTHING"
             )
+
+        for record_index, decision, record in quarantine_candidates:
+            try:
+                fingerprint = insert_quarantine_record(
+                    conn, config.ops_schema, run_id=run_id, source=config.source_name,
+                    endpoint=endpoint, page_number=page_number, record_index=record_index,
+                    decision=decision, record=record,
+                )
+            except Exception as exc:
+                raise QuarantineError(
+                    f"{endpoint!r}: failed to quarantine record {record_index} of page "
+                    f"{page['file_name']!r} (reason {decision.reason_code!r}): {exc}"
+                ) from exc
+            if logger is not None:
+                log_event(
+                    logger, "record_quarantined", run_id=run_id, endpoint=endpoint,
+                    page_number=page_number, record_index=record_index,
+                    reason_code=decision.reason_code, source_record_sha256=fingerprint,
+                )
+
+    if logger is not None:
+        log_event(
+            logger, "page_reconciled", run_id=run_id, endpoint=endpoint,
+            valid_count=valid_count, quarantined_count=quarantined_count,
+        )
+
+    return LoadCounts(
+        valid_count=valid_count, quarantined_count=quarantined_count, quarantined_by_reason=quarantined_by_reason
+    )
 
 
 def loaded_row_count(conn, raw_schema: str, table: str, run_id: str) -> int:

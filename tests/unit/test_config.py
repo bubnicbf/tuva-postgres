@@ -44,6 +44,13 @@ _ENV_KEYS = [
     "TUVA_API_PAGE_SIZE",
     "TUVA_API_MAX_PAGES",
     "TUVA_API_MAX_PAGE_BYTES",
+    "TUVA_API_MAX_RECORDS_PER_RUN",
+    "TUVA_API_MAX_RETRY_DURATION_SECONDS",
+    "TUVA_OAUTH_TOKEN_URL",
+    "TUVA_OAUTH_CLIENT_ID",
+    "TUVA_OAUTH_CLIENT_SECRET",
+    "TUVA_OAUTH_SCOPES",
+    "TUVA_OAUTH_REFRESH_SKEW_SECONDS",
 ]
 
 
@@ -367,6 +374,121 @@ class TestIngestConfigSecretProviderAndPagination(_EnvIsolatedTestCase):
         config = IngestConfig.load()
         safe = config.safe_dict()
         self.assertEqual(safe["api_secret_id"], "prod/tuva/api-token")
+
+    def test_max_records_per_run_has_a_sensible_default(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertEqual(config.api_max_records_per_run, 2_000_000)
+
+    def test_max_records_per_run_must_be_positive(self):
+        env = _valid_env()
+        env["TUVA_API_MAX_RECORDS_PER_RUN"] = "0"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_max_retry_duration_seconds_has_a_sensible_default(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertEqual(config.api_max_retry_duration_seconds, 120.0)
+
+    def test_max_retry_duration_seconds_must_be_positive(self):
+        env = _valid_env()
+        env["TUVA_API_MAX_RETRY_DURATION_SECONDS"] = "-5"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_max_retry_duration_seconds_rejects_malformed_value(self):
+        env = _valid_env()
+        env["TUVA_API_MAX_RETRY_DURATION_SECONDS"] = "not-a-number"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+
+class TestIngestConfigOAuth(_EnvIsolatedTestCase):
+    """TUVA_OAUTH_TOKEN_URL/_CLIENT_ID/_CLIENT_SECRET/_SCOPES/_REFRESH_SKEW_SECONDS
+    (oauth.py). OAuth is entirely optional -- unset by default, in which
+    case this connector's pre-existing static-bearer-token mode applies
+    unchanged."""
+
+    def test_oauth_fields_default_to_unset(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertIsNone(config.oauth_token_url)
+        self.assertIsNone(config.oauth_client_id)
+        self.assertIsNone(config.oauth_client_secret)
+        self.assertEqual(config.oauth_refresh_skew_seconds, 60.0)
+
+    def test_oauth_token_url_alone_without_client_id_is_rejected(self):
+        env = _valid_env()
+        env["TUVA_OAUTH_TOKEN_URL"] = "https://example.invalid/oauth/token"
+        self._set(**env)
+        with self.assertRaises(ConfigError) as ctx:
+            IngestConfig.load()
+        self.assertIn("TUVA_OAUTH_CLIENT_ID", str(ctx.exception))
+
+    def test_oauth_token_url_alone_without_client_secret_is_rejected(self):
+        env = _valid_env()
+        env["TUVA_OAUTH_TOKEN_URL"] = "https://example.invalid/oauth/token"
+        env["TUVA_OAUTH_CLIENT_ID"] = "client-1"
+        self._set(**env)
+        with self.assertRaises(ConfigError) as ctx:
+            IngestConfig.load()
+        self.assertIn("TUVA_OAUTH_CLIENT_SECRET", str(ctx.exception))
+
+    def test_fully_configured_oauth_is_accepted(self):
+        env = _valid_env()
+        env["TUVA_OAUTH_TOKEN_URL"] = "https://example.invalid/oauth/token"
+        env["TUVA_OAUTH_CLIENT_ID"] = "client-1"
+        env["TUVA_OAUTH_CLIENT_SECRET"] = "super-secret-value"
+        env["TUVA_OAUTH_SCOPES"] = "read write"
+        self._set(**env)
+        config = IngestConfig.load()
+        self.assertEqual(config.oauth_token_url, "https://example.invalid/oauth/token")
+        self.assertEqual(config.oauth_client_id, "client-1")
+        self.assertEqual(config.oauth_client_secret_value, "super-secret-value")
+        self.assertEqual(config.oauth_scopes, "read write")
+
+    def test_oauth_client_secret_redacted_in_safe_dict(self):
+        env = _valid_env()
+        env["TUVA_OAUTH_TOKEN_URL"] = "https://example.invalid/oauth/token"
+        env["TUVA_OAUTH_CLIENT_ID"] = "client-1"
+        env["TUVA_OAUTH_CLIENT_SECRET"] = "super-secret-value"
+        self._set(**env)
+        config = IngestConfig.load()
+        safe = config.safe_dict()
+        self.assertEqual(safe["oauth_client_secret"], "***REDACTED***")
+        self.assertNotIn("super-secret-value", repr(config))
+        self.assertNotIn("super-secret-value", str(config))
+
+    def test_oauth_client_secret_is_a_secret_str_type(self):
+        from pydantic import SecretStr as _SecretStr
+
+        env = _valid_env()
+        env["TUVA_OAUTH_TOKEN_URL"] = "https://example.invalid/oauth/token"
+        env["TUVA_OAUTH_CLIENT_ID"] = "client-1"
+        env["TUVA_OAUTH_CLIENT_SECRET"] = "super-secret-value"
+        self._set(**env)
+        config = IngestConfig.load()
+        self.assertIsInstance(config.oauth_client_secret, _SecretStr)
+
+    def test_plain_http_oauth_token_url_rejected_by_default(self):
+        env = _valid_env()
+        env["TUVA_OAUTH_TOKEN_URL"] = "http://example.invalid/oauth/token"
+        env["TUVA_OAUTH_CLIENT_ID"] = "client-1"
+        env["TUVA_OAUTH_CLIENT_SECRET"] = "secret"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_refresh_skew_seconds_must_be_positive(self):
+        env = _valid_env()
+        env["TUVA_OAUTH_REFRESH_SKEW_SECONDS"] = "0"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
 
 
 _HOSTILE_IDENTIFIERS = [

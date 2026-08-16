@@ -186,7 +186,13 @@ field's own default (standard `pydantic-settings` precedence).
 | `TUVA_API_CONNECT_TIMEOUT_SECONDS` / `TUVA_API_READ_TIMEOUT_SECONDS` / `TUVA_API_WRITE_TIMEOUT_SECONDS` / `TUVA_API_POOL_TIMEOUT_SECONDS` | Per-phase httpx timeout overrides (optional; each falls back to `TUVA_API_TIMEOUT_SECONDS`) | unset |
 | `TUVA_API_MAX_RETRIES` | Max additional attempts after the first (bounded; never unbounded) | `5` |
 | `TUVA_API_MAX_RETRY_DELAY_SECONDS` | Hard ceiling on any single retry sleep, including a `Retry-After` value | `30` |
+| `TUVA_API_MAX_RETRY_DURATION_SECONDS` | Hard ceiling on total elapsed time (monotonic clock) spent retrying one logical request, on top of `TUVA_API_MAX_RETRIES` -- whichever limit is hit first stops retrying | `120` |
 | `TUVA_API_ALLOW_INSECURE_HTTP` | Allow `http://` manifest/artifact URLs (local mock servers only) | `0` |
+| `TUVA_API_MAX_RECORDS_PER_RUN` | Absolute safety ceiling on total source records accepted in one `extract` run (across all pages, including ones later quarantined) | `2000000` |
+| `TUVA_OAUTH_TOKEN_URL` | OAuth token endpoint; setting this switches `extract`/`sync` to OAuth client-credentials mode instead of the static-token path above | unset (OAuth disabled) |
+| `TUVA_OAUTH_CLIENT_ID` / `TUVA_OAUTH_CLIENT_SECRET` | OAuth client credentials; required together whenever `TUVA_OAUTH_TOKEN_URL` is set (`TUVA_OAUTH_CLIENT_SECRET` is a `SecretStr`) | *(required with `TUVA_OAUTH_TOKEN_URL`)* |
+| `TUVA_OAUTH_SCOPES` | Space-separated OAuth scopes requested from the token endpoint | unset |
+| `TUVA_OAUTH_REFRESH_SKEW_SECONDS` | Seconds of remaining token lifetime that trigger a proactive refresh before actual expiry | `60` |
 | `RAW_DATA_DIR` | Local extraction/snapshot directory | `data/raw` |
 | `SOURCE_NAME` | Top-level directory name under `RAW_DATA_DIR` | `tuva` |
 | `DBT_TARGET` / `DBT_PROFILES_DIR` / `DBT_PROJECT_DIR` | Passed through to every `dbt` invocation | `dev` / `.` / `.` |
@@ -278,10 +284,18 @@ is:
 `extract` requests exactly one page per HTTP call (no prefetching) and
 keeps requesting pages only until a validated response's
 `next_page_token` is null/absent -- the API's explicit completion
-signal. A page token that repeats (either as a request token or a
-`next_page_token`) is treated as a pagination cycle and fails loudly;
-`TUVA_API_MAX_PAGES` is a final, configurable safety net if the API never
-signals completion at all.
+signal. Every request and response page token is tracked in a bounded
+observed-token set; a page token that repeats (as a request token, as a
+`next_page_token`, or the server echoing the current token back as the
+next one) is treated as a pagination cycle and fails immediately, never
+loading partial data as success and never advancing the watermark.
+`TUVA_API_MAX_PAGES` and `TUVA_API_MAX_RECORDS_PER_RUN` are absolute,
+independent safety ceilings (not retry controls): the page limit is
+enforced before requesting a page that would exceed it, and the record
+limit is checked, after envelope validation but before publishing, on
+the *prospective* cumulative count (including records that will later be
+quarantined) -- exactly at either limit succeeds; one page or one record
+past it fails the run.
 
 Every validated page is written, byte-for-byte unmodified (no renaming,
 type coercion, flattening, null-stripping, or reordering), as one JSON
@@ -355,26 +369,124 @@ idempotent no-op (see "Failure recovery and idempotency" below).
 
 ### Retry and timeout behavior
 
-`src/tuva_ingest/api_client.py`'s `ApiClient` (a reusable `httpx.Client`)
-retries only genuinely transient failures, via `tenacity`, for both page
-requests (`get_json_page`) and the legacy manifest fetch:
+`src/tuva_ingest/retry.py`'s `BoundedRetryExecutor` implements one
+shared, deterministic-under-test retry policy used identically by
+`src/tuva_ingest/api_client.py` (source API page requests, the legacy
+manifest fetch, and OAuth-mode artifact requests) and
+`src/tuva_ingest/oauth.py` (the OAuth token endpoint). Retried:
 
 * httpx connection/timeout errors (`httpx.NetworkError`, `httpx.TimeoutException`)
 * HTTP `429`
-* HTTP `500`, `502`, `503`, `504`
+* HTTP `502`, `503`, `504`
 
-Ordinary client errors (`400`, `401`, `403`, `404`), envelope validation
-failures, cycle-detection failures, and checksum failures are **never**
-retried. Retries are bounded by `TUVA_API_MAX_RETRIES` (never unbounded)
-with exponential backoff and jitter, honoring a valid `Retry-After`
-header -- but every sleep, whichever source produced it, is capped at
-`TUVA_API_MAX_RETRY_DELAY_SECONDS`. Connect/read/write/pool timeouts are
-each independently configurable (`TUVA_API_CONNECT_TIMEOUT_SECONDS` etc.,
-falling back to `TUVA_API_TIMEOUT_SECONDS`). Redirects are never followed
-(`follow_redirects=False`) -- a page-request URL redirecting to an
-unexpected host must never silently receive this client's bearer token.
-Every page response body is size-checked against `TUVA_API_MAX_PAGE_BYTES`
+**Never** retried: `400`, `403`, `404`, `409`, `422`, and every other
+ordinary `4xx`; `401` (see the single-shot OAuth recovery below, which is
+authentication recovery, not a retry); HTTP `500` (not in the documented
+retryable-server-status set); envelope validation failures; cycle-
+detection failures; checksum failures; pagination-limit failures.
+
+Bounded by **two independent limits**, either of which stops retrying:
+`TUVA_API_MAX_RETRIES` (attempt count) and `TUVA_API_MAX_RETRY_DURATION_SECONDS`
+(total elapsed time, tracked via a monotonic clock so a system clock
+adjustment can never extend or shorten the budget). Delay between
+attempts is full-jitter exponential backoff
+(`random() * min(TUVA_API_MAX_RETRY_DELAY_SECONDS, base * 2**attempt)`),
+or a valid `Retry-After` header if present -- supporting both the
+numeric-seconds and HTTP-date forms, computed relative to current
+wall-clock time (a past date means zero delay), and rejecting negative,
+malformed, non-finite, or unreasonably large values (an invalid value
+falls back to backoff rather than being honored as-is). If honoring
+`Retry-After` (or the next backoff delay) would exceed the remaining
+`TUVA_API_MAX_RETRY_DURATION_SECONDS` budget, the request fails
+immediately instead of oversleeping past the deadline. The failed
+response is always closed/released before any sleep. A structured
+`http_retry_scheduled` log event is emitted per retry with only safe
+metadata (status code, attempt number, delay, elapsed duration, an
+endpoint *name* -- never the full URL, which may carry query-string
+values).
+
+Connect/read/write/pool timeouts are each independently configurable
+(`TUVA_API_CONNECT_TIMEOUT_SECONDS` etc., falling back to
+`TUVA_API_TIMEOUT_SECONDS`) and are always positive/finite -- never
+silently disabled. Redirects are never followed (`follow_redirects=False`)
+-- a page-request URL redirecting to an unexpected host must never
+silently receive this client's bearer token or OAuth access token. Every
+page response body is size-checked against `TUVA_API_MAX_PAGE_BYTES`
 before it is parsed.
+
+**OAuth 401 recovery** (OAuth mode only, see below): on an HTTP `401`
+from the source API, the client forces exactly one token refresh and
+replays the request exactly once -- never a loop, and never counted
+against the retry budget above. If the replay also returns `401`, the
+request fails immediately.
+
+### OAuth token lifecycle
+
+Optional and additive: leaving `TUVA_OAUTH_TOKEN_URL` unset keeps every
+command on the static-bearer-token path (`TUVA_API_TOKEN`/
+`TUVA_API_SECRET_PROVIDER`) unchanged -- this remains the default.
+Setting `TUVA_OAUTH_TOKEN_URL` switches the paginated `extract`/`sync`
+commands (only; the legacy `run`/`load-raw` path is untouched) to
+`src/tuva_ingest/oauth.py`'s `OAuthTokenManager`, which implements the
+OAuth 2.0 client-credentials grant (this repository's own assumption --
+no vendor-specific grant type was documented anywhere in the source
+contract) with `refresh_token` rotation support when the token endpoint
+returns one, falling back to client-credentials whenever no refresh
+token is available or a refresh attempt hits a permanent OAuth error
+(`invalid_client`/`invalid_grant`/similar -- never retried).
+
+The manager: acquires a token only when one is actually needed; holds it
+in memory only, never on disk; tracks expiration via a monotonic
+deadline computed from the token response's `expires_in`; refreshes
+proactively once remaining lifetime drops to `TUVA_OAUTH_REFRESH_SKEW_SECONDS`;
+validates the token endpoint's content-type/shape and rejects a missing
+`access_token`, an unsupported `token_type`, a missing/malformed
+`expires_in`, or unparsable JSON; never returns an expired token; and
+uses a lock to prevent duplicate concurrent refreshes. Only a method
+that returns a ready-to-use `Authorization` value is ever exposed --
+never the full token response -- and the token/client secret are
+redacted from every `repr()`, exception message, log line, and CLI
+output. Transient token-endpoint failures (connection errors, `429`,
+`502`/`503`/`504`) use the same shared bounded retry policy described
+above; permanent OAuth errors are never retried.
+
+### Quarantine
+
+Every record of a paginated run is classified by
+`src/tuva_ingest/validators.py`'s `validate_record` at **load** time
+(extraction itself remains an unmodified byte-for-byte mirror of what the
+source sent -- see "Page request contract" above). The check is
+deliberately narrow and structural only, grounded directly in
+`docs/SOURCE_CONTRACT.md`'s documented record grain -- never an invented
+clinical/business rule, and never triggered by a null *optional* field:
+`eligibility` requires a non-blank string `person_id`; `medical_claim`/
+`pharmacy_claim` require a non-blank string `claim_id` and a scalar
+`claim_line_number`; any populated known date field must be
+recognizably date-shaped.
+
+A record that fails this check is written to the restricted
+`quarantined_records` table (`migrations/006_record_quarantine.sql`)
+under a fixed reason-code allowlist (`record_not_object`,
+`missing_required_field`, `invalid_required_type`, `invalid_identifier`,
+`invalid_date_format`, `schema_validation_failed`) and a bounded,
+sanitized `reason_detail` (field names/rule descriptions only -- never a
+raw field value) -- and is **never** also loaded into the raw table.
+`quarantined_records` contains PHI (a structurally invalid record can
+still carry a name, date of birth, diagnosis code, or any other
+PHI-bearing value); its access model is deliberately more restrictive
+than the raw schema: `PUBLIC` has no access at all, `TRANSFORM_ROLE`
+(dbt) is never granted any access and there is no `sources.yml` entry
+for it, and `INGEST_ROLE` (this connector) is granted **`INSERT` only**
+-- never `SELECT`/`UPDATE`/`DELETE`. (Migration 003's
+`ALTER DEFAULT PRIVILEGES` would otherwise leak `SELECT`/`UPDATE` onto
+this brand-new table; migration 006 explicitly revokes those before
+granting the narrow `INSERT`.) No operational "quarantine review" role
+exists yet in this repository's role model -- an operator must
+explicitly create and grant one before anyone can read this table.
+`quarantined_count` (used in reconciliation below) is computed entirely
+from the connector's own deterministic, idempotent classification pass
+over the immutable page files -- never a `SELECT` against the quarantine
+table, matching its INSERT-only grant.
 
 ### Reconciliation rules
 
@@ -383,12 +495,17 @@ the database, `paginated_loader.verify_run_manifest` independently
 re-verifies, for every page: its on-disk SHA-256 matches the manifest,
 and its decompressed JSONL line count matches the manifest's recorded
 `record_count`; then it confirms the sum of every page's `record_count`
-equals the manifest's own `total_record_count`. After loading, a third
-count -- `SELECT count(*) FROM <raw table> WHERE _snapshot_id = <run_id>`
-(always a fresh query, so it reads correctly whether this is the first
-load or an idempotent repeat) -- must also equal `total_record_count`.
-**Any of the three mismatches fails the entire run**, inside the same
-transaction as the load, so nothing partial is ever left visible.
+equals the manifest's own `total_record_count`. Every record is then
+classified (see "Quarantine" above): a structurally valid record is
+staged into the raw table; an invalid one is quarantined instead. After
+loading, `source_record_count` (the manifest's `total_record_count`)
+must equal `raw_loaded_count` (a fresh
+`SELECT count(*) FROM <raw table> WHERE _snapshot_id = <run_id>`, so it
+reads correctly whether this is the first load or an idempotent repeat)
+**plus** `quarantined_count`. **Any mismatch -- checksum, record count,
+or the three-way reconciliation identity -- fails the entire run**,
+inside the same transaction as the load, so nothing partial (and no
+record present in both raw and quarantine) is ever left visible.
 
 ### High-water mark semantics
 
@@ -426,7 +543,7 @@ $ uv run tuva-ingest extract --endpoint medical-claims --since 2025-01-01
 {"event": "extract", "run_id": "medical-claims-20260816T140302-a1b2c3d4e5f6", "endpoint": "medical-claims", "table": "medical_claim", "since": "2025-01-01", "status": "succeeded", "path": "data/raw/tuva/pages/medical-claims-20260816T140302-a1b2c3d4e5f6", "page_count": 3, "record_count": 1214, "candidate_high_water_mark": "2026-08-16T14:03:00Z"}
 
 $ uv run tuva-ingest load --run-id medical-claims-20260816T140302-a1b2c3d4e5f6
-{"event": "load", "run_id": "medical-claims-20260816T140302-a1b2c3d4e5f6", "endpoint": "medical-claims", "table": "medical_claim", "since": "2025-01-01", "status": "succeeded", "row_count": 1214, "path": "data/raw/tuva/pages/medical-claims-20260816T140302-a1b2c3d4e5f6", "high_water_mark": "2026-08-16T14:03:00Z"}
+{"event": "load", "run_id": "medical-claims-20260816T140302-a1b2c3d4e5f6", "endpoint": "medical-claims", "table": "medical_claim", "since": "2025-01-01", "status": "succeeded", "row_count": 1214, "quarantined_count": 3, "quarantined_by_reason": {"missing_required_field": 3}, "path": "data/raw/tuva/pages/medical-claims-20260816T140302-a1b2c3d4e5f6", "high_water_mark": "2026-08-16T14:03:00Z"}
 ```
 
 `sync` prints the same shape as `load`, plus `"event": "sync"`. Human-
@@ -447,11 +564,15 @@ UTC ISO-8601 timestamped, with `event`/`level`/`app_version` always
 present and `run_id`/`endpoint`/`stage`/`duration_ms`/`table`/
 `error_category`/`error_message` where applicable. The paginated flow
 emits its own named lifecycle events -- `secret_retrieved`,
+`oauth_token_requested`/`oauth_token_refreshed`/`oauth_token_refresh_failed`,
 `page_request_started`/`page_request_completed`, `page_validated`,
-`page_file_published`, `pagination_completed`, `raw_load_started`/
-`raw_load_completed`, `reconciliation_completed`, `watermark_committed`,
-`run_succeeded`/`run_failed` -- never logging page bodies, record
-contents, or credentials:
+`page_file_published`, `pagination_completed`, `pagination_limit_exceeded`,
+`http_retry_scheduled`, `record_quarantined`, `page_reconciled`,
+`raw_load_started`/`raw_load_completed`, `reconciliation_completed`,
+`watermark_committed`, `run_succeeded`/`run_failed` -- never logging page
+bodies, record contents, tokens, or credentials (`record_quarantined`
+logs only the run id, endpoint, page/record position, reason code, and a
+non-reversible SHA-256 fingerprint -- never the raw record itself):
 
 ```json
 {"app_version": "0.1.0", "endpoint": "medical-claims", "event": "page_file_published", "level": "INFO", "record_count": 500, "run_id": "medical-claims-20260816T140302-a1b2c3d4e5f6", "sha256": "3a7bd3e2...", "timestamp": "2026-08-16T14:03:02.114000Z"}
@@ -611,7 +732,27 @@ no real HTTP or filesystem access outside a temp dir.
 `tests/unit/test_paginated_loader.py` covers `verify_run_manifest`'s
 database-free reconciliation checks. `tests/unit/test_state.py`'s
 `TestGetWatermark`/`TestCommitWatermark` cover watermark read/write SQL
-composition with a fake connection.
+composition with a fake connection. `tests/unit/test_retry.py` covers
+`BoundedRetryExecutor` (retryable-status matrix, attempt- and
+duration-based exhaustion using an injectable fake clock/sleep so no
+real sleeping occurs, backoff/jitter, every `Retry-After` variant
+including HTTP-dates and deadline-exceeding values, close-before-sleep
+ordering). `tests/unit/test_oauth.py` covers the full `OAuthTokenManager`
+lifecycle (client-credentials, refresh-token rotation and fallback,
+proactive refresh at the skew threshold, malformed/incomplete
+token-response rejection, concurrent-refresh de-duplication, secret
+redaction with sentinel values) against a mocked transport -- no real
+OAuth server. `tests/unit/test_api_client.py` adds coverage for
+per-status retry/no-retry behavior (including that `500`/`409`/`422` are
+never retried), separate connect/read timeout wiring, the retry-duration
+budget, and the single-shot OAuth `401`-refresh-and-replay path.
+`tests/unit/test_validators.py` covers every quarantine reason code
+against the endpoint-specific structural rules (and confirms optional/
+null fields never trigger quarantine). `tests/unit/test_quarantine.py`
+covers quarantine-row SQL composition and fingerprinting with a fake
+connection. `tests/unit/test_migrations.py` includes structural checks
+for migration 006 (the quarantine table's columns, reason-code
+constraint, and the revoke-before-grant access-control ordering).
 `tests/unit/test_input_layer_contract.py` is also database-free and
 network-free, but specifically enforces the Input Layer contract at the
 file level by parsing `packages.yml`/`dbt_project.yml`/the model SQL/
@@ -647,7 +788,19 @@ reconciliation mismatch or a simulated mid-load failure rolls back the
 committed watermark unchanged; a successful load commits the watermark
 and the data together in the same transaction; and a candidate watermark
 that would move the endpoint's committed watermark backward is rejected
-before anything is written.
+before anything is written. `TestQuarantineAgainstRealDatabase` further
+proves, against real grants: `PUBLIC` has no access to
+`quarantined_records`, `INGEST_ROLE` has `INSERT` only (never
+`SELECT`/`UPDATE`/`DELETE`, confirming migration 006's revoke-before-
+grant), and `TRANSFORM_ROLE` has no access; a quarantined record never
+also appears in the raw table; the reconciliation identity
+(`source_record_count == raw_loaded_count + quarantined_count`) holds
+for a mix of valid/invalid records; a repeated load never duplicates
+quarantine rows; a simulated failed quarantine insert rolls back both
+the raw rows and the quarantine rows for that load; a reconciliation-
+style failure leaves the prior watermark completely unchanged; and a
+fully successful run commits raw rows, quarantine rows, and the
+watermark together in one transaction.
 
 ## Validation order
 
@@ -753,8 +906,9 @@ where table_name in ('eligibility', 'medical_claim', 'pharmacy_claim');
   is written -- all staged first, then published via a single atomic
   directory rename. A failure partway through (a validation error, an
   HTTP failure, a detected pagination cycle, exceeding
-  `TUVA_API_MAX_PAGES`) cleans up its `.staging/` directory and never
-  leaves a partial run at the published path. Every `extract` mints a
+  `TUVA_API_MAX_PAGES`/`TUVA_API_MAX_RECORDS_PER_RUN`) cleans up its
+  `.staging/` directory and never leaves a partial run at the published
+  path. Every `extract` mints a
   fresh `run_id`, so retrying after a failure simply produces a new,
   independent run rather than resuming/overwriting the failed one; if a
   `run_id` were ever to collide with an existing published run,
@@ -775,10 +929,15 @@ where table_name in ('eligibility', 'medical_claim', 'pharmacy_claim');
   reads correctly on a repeat, not the INSERT's own affected-row count),
   and `state.commit_watermark`'s `ON CONFLICT (source, endpoint) DO
   UPDATE` means re-committing the same already-committed watermark value
-  is also a safe no-op. A reconciliation mismatch or a backward-moving
-  candidate watermark rolls back the entire transaction -- the raw table
-  load, the run bookkeeping, and the watermark are never partially
-  committed.
+  is also a safe no-op. Quarantine inserts share the same idempotency
+  shape (`ON CONFLICT (run_id, page_number, record_index) DO NOTHING`,
+  backed by migrations/006's unique index), and `quarantined_count` is
+  recomputed from the same deterministic classification pass on every
+  call, so a repeat load never double-counts or duplicates a quarantine
+  row either. A reconciliation mismatch, a quarantine-insert failure, or
+  a backward-moving candidate watermark rolls back the entire
+  transaction -- the raw table load, the quarantine rows, the run
+  bookkeeping, and the watermark are never partially committed.
 - **Legacy full-manifest extraction/loading** (`tuva-ingest run` /
   `load-raw`): unchanged from before -- a snapshot is only "published"
   once its artifact(s) are downloaded, verified, and a `_SUCCESS` marker
@@ -832,6 +991,24 @@ where table_name in ('eligibility', 'medical_claim', 'pharmacy_claim');
   psycopg's `COPY` protocol, never interpolated.
 - This connector never handles PHI in its own test fixtures
   (`tests/fixtures/*.csv` are synthetic).
+- `TUVA_OAUTH_CLIENT_SECRET` is a `pydantic.SecretStr`, exactly like
+  `PG_DSN`/`TUVA_API_TOKEN`. OAuth access/refresh tokens are held in
+  memory only (never written to disk) by `oauth.OAuthTokenManager`, and
+  are redacted from every `repr()`, exception message, log line, and CLI
+  output -- `sanitize_error`/`sanitize_text` redact `Bearer ...` values,
+  OAuth token-request form secrets, DSN passwords, and other
+  token-shaped fields as defense in depth on top of the `SecretStr`
+  type itself. Tests exercise this with unique sentinel secret values
+  and assert they never appear in captured logs/CLI output.
+- `quarantined_records` (`migrations/006_record_quarantine.sql`)
+  contains PHI. Its access model is more restrictive than the raw
+  schema: `PUBLIC` has no access, `TRANSFORM_ROLE` is never granted any
+  access, and `INGEST_ROLE` is granted `INSERT` only -- never
+  `SELECT`/`UPDATE`/`DELETE`. A deployment must apply the same
+  retention, access-logging, and encryption-at-rest controls to this
+  table that it applies to the raw schema; this repository only
+  configures database-level grants, not infrastructure-level controls.
+  No raw/staging/final/dbt model ever reads from it.
 
 ## Upgrading beyond Tuva 0.18.0
 
@@ -894,14 +1071,18 @@ where table_name in ('eligibility', 'medical_claim', 'pharmacy_claim');
 ## Repository layout
 
 ```
-src/tuva_ingest/     the connector: config (pydantic-settings), api_client (httpx+tenacity),
+src/tuva_ingest/     the connector: config (pydantic-settings), api_client (httpx, shared bounded
+                     retries), retry (shared BoundedRetryExecutor/backoff/Retry-After policy),
+                     oauth (OAuthTokenManager, client-credentials + refresh-token lifecycle),
                      endpoints (--endpoint <-> raw table mapping), secrets (credential providers),
-                     pagination (paginated extract + immutable page files), paginated_loader
-                     (reconciled, idempotent raw load), extract, raw_loader (legacy CSV contract),
+                     pagination (paginated extract + immutable page files + safety limits),
+                     paginated_loader (reconciled, idempotent raw load + quarantine routing),
+                     validators (structural quarantine classification), quarantine (restricted
+                     quarantine-table access), extract, raw_loader (legacy CSV contract),
                      state, migrations, cli
-migrations/           001-005: raw + operational schemas, run/table-load control, role grants,
+migrations/           001-006: raw + operational schemas, run/table-load control, role grants,
                      endpoint-scoped ingestion metadata, paginated-extraction watermark state
-                     + raw-table idempotency indexes
+                     + raw-table idempotency indexes, restricted PHI-bearing quarantine table
 dbt_project.yml, packages.yml, profiles.example.yml, macros/, models/   the dbt project
 tests/unit/            database-free tests (including test_input_layer_contract.py's
                         file-level Input Layer contract checks, test_secrets.py,

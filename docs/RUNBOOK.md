@@ -112,15 +112,41 @@ designed to be retry-safe:
   -- it mints a fresh `run_id`, so a retry is a wholly new run, not a
   resume.
 - **`load`/`sync` failed partway through (checksum/reconciliation
-  mismatch, a backward-moving candidate watermark, a connection
-  drop)**: the whole transaction (the raw table load, run/table-load
-  bookkeeping, and the watermark write) rolled back together; the
-  endpoint's previously committed high-water mark is completely
-  untouched, and no partial rows are visible in the raw table. Rerun
+  mismatch, a quarantine-insert failure, a backward-moving candidate
+  watermark, a connection drop)**: the whole transaction (the raw table
+  load, any quarantine rows, run/table-load bookkeeping, and the
+  watermark write) rolled back together; the endpoint's previously
+  committed high-water mark is completely untouched, and no partial rows
+  are visible in either the raw table or the quarantine table. Rerun
   `uv run tuva-ingest load --run-id <same value>` -- re-loading an
-  already-loaded run is a safe no-op (`ON CONFLICT DO NOTHING`); if the
-  underlying cause was a corrupted page file or a source data problem,
-  re-run `extract` for a fresh run instead.
+  already-loaded run is a safe no-op (`ON CONFLICT DO NOTHING`, for both
+  the raw and quarantine tables); if the underlying cause was a
+  corrupted page file or a source data problem, re-run `extract` for a
+  fresh run instead.
+- **`extract` failed with a pagination-limit or cycle error
+  (`TUVA_API_MAX_PAGES`/`TUVA_API_MAX_RECORDS_PER_RUN` exceeded, or a
+  repeated/self-referencing page token detected)**: the run is stopped
+  immediately and never published -- nothing partial is left on disk,
+  and (since `load` never runs) the watermark is untouched. This
+  usually means either the source's pagination is misbehaving (a stuck
+  or looping `next_page_token`) or the configured limits are genuinely
+  too low for the endpoint's current data volume; investigate the
+  source's page-token behavior first, and only raise the limit(s) in
+  `.env` deliberately once you've confirmed the endpoint really does
+  need to return that many pages/records in one run.
+- **`extract`/`sync` failed with an OAuth error (`TUVA_OAUTH_TOKEN_URL`
+  configured)**: a permanent grant failure (`invalid_client`/
+  `invalid_grant`) means the configured `TUVA_OAUTH_CLIENT_ID`/
+  `TUVA_OAUTH_CLIENT_SECRET` (or a rotated refresh token this connector
+  no longer has) is wrong -- verify/rotate the credential with the
+  source and update `.env`/your secret store; this is never retried
+  automatically. A transient token-endpoint failure (connection error,
+  `429`/`502`/`503`/`504`) is retried automatically under the same
+  bounded retry policy as source API requests, then surfaces as a
+  normal OAuth error if it never recovers. A single unexpected `401`
+  from the source API itself triggers one automatic forced refresh and
+  replay; a `401` on that replay too means the token (or the
+  credentials behind it) is invalid and fails immediately.
 - **`load-raw` failed partway through (bad checksum, connection
   drop)**: the whole transaction (all three raw tables + run
   bookkeeping) rolled back together; no partial snapshot is visible.
@@ -252,6 +278,48 @@ upgrade is a deliberate, single-commit, reviewed change.
 - This repository's own test fixtures (`tests/fixtures/*.csv`) are
   synthetic and contain no PHI; do not commit real extracted snapshots
   or database dumps to this repository.
+- `TUVA_OAUTH_CLIENT_SECRET` (when OAuth mode is in use) is redacted the
+  same way as `PG_DSN`/`TUVA_API_TOKEN`; rotate it in `.env`/your secret
+  store the same way -- no code change required. OAuth access/refresh
+  tokens themselves are never persisted anywhere by this connector
+  (memory-only, per process), so there is nothing to rotate or revoke
+  on this side beyond the client secret itself.
+- `ingest_ops.quarantined_records` contains PHI (see "Quarantined
+  records" below) and is access-restricted at the database level --
+  `PUBLIC` and `TRANSFORM_ROLE` have no access, and `INGEST_ROLE` can
+  only `INSERT`, never read it back. No dbt model or downstream
+  consumer ever reads from it.
+
+## Quarantined records
+
+A structurally invalid record (missing/blank required identifier,
+wrong type, unrecognizable date shape) is written to
+`ingest_ops.quarantined_records` instead of its endpoint's raw table --
+see README.md's "Quarantine" section for the exact structural rules and
+the fixed reason-code allowlist. `load`/`sync`'s JSON result reports
+`quarantined_count`/`quarantined_by_reason` for the run, and each
+quarantined record also emits a `record_quarantined` structured log
+event (run id, endpoint, page/record position, reason code, and a
+non-reversible fingerprint -- never the record itself).
+
+No operational "quarantine review" role exists in this repository's
+role model yet -- `INGEST_ROLE` itself cannot read this table back (by
+design), so an operator must explicitly `GRANT SELECT ON
+ingest_ops.quarantined_records TO <a role you create and control>`
+before anyone can review quarantined records, and should scope that
+role as narrowly as any other PHI-bearing access in your environment
+(audited, time-limited, least-privilege). This repository deliberately
+does not create that role for you.
+
+A `reason_code` on a quarantined row tells you *why* (e.g.
+`missing_required_field`); `reason_detail` names the specific field/rule
+(bounded, never a raw value); `raw_record` (jsonb) and
+`source_record_sha256` let a reviewer with granted access correlate the
+row back to the exact source payload. A quarantined record is never
+retried automatically -- if the source later sends a corrected version
+of the same logical record, it arrives as a new record in a later
+`extract` run and is reclassified independently; there is no
+"un-quarantine" operation in this connector today.
 
 ## What this repository does not own
 

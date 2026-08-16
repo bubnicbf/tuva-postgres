@@ -153,3 +153,33 @@ def load_snapshot(conn, config, snapshot_dir: Path, snapshot_id: str, checksums:
         row_counts[table] = load_table(conn, config.raw_schema, table, csv_path, snapshot_id)
 
     return row_counts
+
+
+def load_single_endpoint_snapshot(
+    conn, config, snapshot_dir: Path, snapshot_id: str, table: str, checksums: dict
+) -> int:
+    """Load exactly one managed raw table (`table`) from `snapshot_dir`
+    into `config.raw_schema`, inside the caller's existing transaction --
+    this function never commits, and it never touches any raw table
+    other than `table` (no other table is TRUNCATEd, queried, or
+    written). This is what `tuva-ingest load --run-id ...` uses (see
+    cli.py's `_cmd_load`) so loading one endpoint's snapshot can never
+    truncate or replace another endpoint's already-loaded raw table.
+
+    Returns the number of rows loaded. Raises RawLoadError if the
+    expected CSV file is missing, has no recorded checksum in this
+    snapshot's checksums.json, or fails checksum verification -- the
+    caller is responsible for rolling back the transaction in every case
+    (see `load_snapshot`'s docstring for the equivalent all-tables
+    contract this mirrors for a single table).
+    """
+    csv_path = snapshot_dir / f"{table}.csv"
+    if not csv_path.is_file():
+        raise RawLoadError(f"expected raw file not found for managed table {table!r}: {csv_path}")
+
+    table_checksum = checksums.get(table)
+    if not table_checksum or "sha256" not in table_checksum:
+        raise RawLoadError(f"no recorded checksum for managed table {table!r} in this snapshot's checksums.json")
+    verify_file_checksum(csv_path, table_checksum["sha256"], table=table)
+
+    return load_table(conn, config.raw_schema, table, csv_path, snapshot_id)

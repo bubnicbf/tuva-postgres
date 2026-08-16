@@ -158,5 +158,61 @@ class TestManifestValidation(unittest.TestCase):
         self.assertEqual(artifact.filename, "eligibility.csv")
 
 
+
+
+def _valid_endpoint_manifest(table: str) -> dict:
+    return {
+        "version": 1,
+        "source": "tuva",
+        "snapshot_id": "2026-08-14T060000Z",
+        "created_at": "2026-08-14T06:00:00Z",
+        "artifacts": [
+            {
+                "table": table,
+                "url": f"https://example.invalid/snapshots/2026-08-14T060000Z/{table}.csv",
+                "sha256": "a" * 64,
+                "size_bytes": 1234,
+            }
+        ],
+    }
+
+
+class TestManifestEndpointScoping(unittest.TestCase):
+    """extract --endpoint <name> requests and validates a manifest scoped
+    to exactly one table via the new expected_tables parameter, while the
+    legacy full-manifest flow (expected_tables=None) keeps validating
+    against all of RAW_TABLES unchanged."""
+
+    def test_expected_tables_none_still_requires_all_raw_tables(self):
+        raw = _valid_endpoint_manifest("eligibility")
+        with self.assertRaises(ManifestError):
+            parse_and_validate(raw, allow_insecure_http=False)
+
+    def test_scoped_manifest_with_matching_single_artifact_is_valid(self):
+        raw = _valid_endpoint_manifest("eligibility")
+        manifest = parse_and_validate(raw, allow_insecure_http=False, expected_tables=("eligibility",))
+        self.assertEqual(len(manifest.artifacts), 1)
+        self.assertEqual(manifest.artifacts[0].table, "eligibility")
+
+    def test_scoped_manifest_rejects_artifact_outside_requested_table(self):
+        raw = _valid_endpoint_manifest("medical_claim")
+        with self.assertRaises(ManifestError) as ctx:
+            parse_and_validate(raw, allow_insecure_http=False, expected_tables=("eligibility",))
+        self.assertIn("was not requested for this extraction", str(ctx.exception))
+
+    def test_scoped_manifest_rejects_missing_requested_artifact(self):
+        raw = _valid_endpoint_manifest("eligibility")
+        raw["artifacts"] = []
+        with self.assertRaises(ManifestError):
+            parse_and_validate(raw, allow_insecure_http=False, expected_tables=("eligibility",))
+
+    def test_scoped_manifest_accepts_each_supported_table_independently(self):
+        for table in RAW_TABLES:
+            with self.subTest(table=table):
+                raw = _valid_endpoint_manifest(table)
+                manifest = parse_and_validate(raw, allow_insecure_http=False, expected_tables=(table,))
+                self.assertEqual([a.table for a in manifest.artifacts], [table])
+
+
 if __name__ == "__main__":
     unittest.main()

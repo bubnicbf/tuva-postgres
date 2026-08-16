@@ -10,7 +10,7 @@
 # walkthrough):
 #
 #   make local-db-ready     # start postgres, wait for health
-#   make local-migrate      # apply operational migrations (001-003)
+#   make local-migrate      # apply operational migrations (001-004)
 #   make local-dbt-deps     # fetch the pinned Tuva 0.18.0 package
 #   make local-extract      # pull a snapshot via the ingestion API client
 #   make local-load-raw     # load the snapshot into the raw schema
@@ -93,7 +93,8 @@ services:
     restart: on-failure
 
   # One-shot migration runner: applies migrations/001_operational_schemas.sql,
-  # 002_ingestion_control.sql, and 003_roles_and_grants.sql (see
+  # 002_ingestion_control.sql, 003_roles_and_grants.sql, and
+  # 004_endpoint_scoped_ingestion.sql (see
   # src/tuva_ingest/migrations.py) against the local database, then
   # exits. Never creates or touches Tuva-managed core/terminology/output
   # schemas -- only the raw and operational-control namespaces (see
@@ -168,7 +169,8 @@ services:
       - dbt-packages:/app/dbt_packages
     # Safe default for `docker compose up`: only needs the database,
     # never the (unset-by-default) API credentials. Override with `run`
-    # or `extract` once TUVA_API_MANIFEST_URL/TUVA_API_TOKEN are supplied.
+    # or `extract --endpoint <name>` (see README.md) once
+    # TUVA_API_MANIFEST_URL/TUVA_API_TOKEN are supplied.
     command: ["healthcheck"]
     restart: "no"
 

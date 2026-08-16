@@ -231,3 +231,70 @@ def table_load_row_counts(conn, ops_schema, run_id) -> dict:
             (run_id,),
         )
         return {table_name: row_count for table_name, row_count in cur.fetchall()}
+
+
+def upsert_running_run(
+    conn, ops_schema, *, run_id, source, snapshot_id, endpoint=None, requested_since=None,
+    environment, app_version, host,
+) -> None:
+    """Idempotently (re)start a run keyed by `run_id`: insert a fresh
+    'running' row, or -- if this exact `run_id` already exists from a
+    prior `extract`/`load`/`sync` attempt -- reset it back to 'running'
+    in place (`ON CONFLICT (run_id) DO UPDATE`).
+
+    This is what makes `tuva-ingest load --run-id X` (and `sync`, which
+    calls it with the same `run_id` `extract` just produced) safe to
+    repeat: `run_id` is stable (this connector reuses the extraction's
+    own immutable `snapshot_id` as its run id -- see
+    `extract.EndpointExtractResult`), so a second `load --run-id X` must
+    never fail with a duplicate-primary-key error against
+    `ingestion_runs`; it must instead idempotently redo the load and
+    leave `ingestion_runs` describing the most recent attempt. Contrast
+    with `create_running_run` above, which every *fresh*-run-id caller
+    (`run`, legacy `load-raw`, both of which mint a new uuid4-based
+    run_id every invocation) still uses -- those never need upsert
+    semantics because their run_id is never reused.
+
+    Requires migrations/004_endpoint_scoped_ingestion.sql (the `endpoint`/
+    `requested_since` columns on `ingestion_runs`).
+    """
+    relation = _relation(ops_schema, _INGESTION_RUNS)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {relation} "
+            f"(run_id, source, snapshot_id, endpoint, requested_since, environment, app_version, host, "
+            f"started_at, status, current_stage) "
+            f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'running', 'starting') "
+            f"ON CONFLICT (run_id) DO UPDATE SET "
+            f"source = EXCLUDED.source, snapshot_id = EXCLUDED.snapshot_id, "
+            f"endpoint = EXCLUDED.endpoint, requested_since = EXCLUDED.requested_since, "
+            f"environment = EXCLUDED.environment, app_version = EXCLUDED.app_version, host = EXCLUDED.host, "
+            f"started_at = EXCLUDED.started_at, finished_at = NULL, status = 'running', "
+            f"current_stage = 'starting', error_category = NULL, error_message = NULL",
+            (
+                run_id, source, snapshot_id, endpoint, requested_since, environment, app_version, host,
+                datetime.now(timezone.utc),
+            ),
+        )
+    conn.commit()
+
+
+def upsert_table_load_pending(conn, ops_schema, run_id, *, table, expected_sha256, expected_size_bytes) -> None:
+    """The idempotent-reload counterpart to `record_table_load_pending`:
+    inserts a fresh `table_loads` row, or resets an existing one (same
+    `run_id` + `table_name`) back to `pending` in place. Requires
+    migrations/004_endpoint_scoped_ingestion.sql's unique constraint on
+    `(run_id, table_name)`."""
+    relation = _relation(ops_schema, _TABLE_LOADS)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {relation} "
+            f"(run_id, table_name, expected_sha256, expected_size_bytes, started_at, load_status) "
+            f"VALUES (%s, %s, %s, %s, %s, 'pending') "
+            f"ON CONFLICT (run_id, table_name) DO UPDATE SET "
+            f"expected_sha256 = EXCLUDED.expected_sha256, expected_size_bytes = EXCLUDED.expected_size_bytes, "
+            f"started_at = EXCLUDED.started_at, load_status = 'pending', row_count = NULL, "
+            f"actual_sha256 = NULL, actual_size_bytes = NULL, error_message = NULL, finished_at = NULL",
+            (run_id, table, expected_sha256, expected_size_bytes, datetime.now(timezone.utc)),
+        )
+    conn.commit()

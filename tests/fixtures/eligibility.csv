@@ -1,0 +1,4 @@
+person_id,member_id,subscriber_id,birth_date,death_date,enrollment_start_date,enrollment_end_date,payer,payer_type,plan,original_reason_entitlement_code,dual_status_code,medicare_status_code,group_id,group_name,fips_state_code,data_source
+patient-001,member-001,subscriber-001,1958-03-12,,2025-01-01,2025-12-31,Acme Health Plan,commercial,Gold PPO,0,NA,10,grp-100,Acme Corp,47,tuva
+patient-002,member-002,subscriber-001,1990-07-04,,2025-01-01,2025-12-31,Acme Health Plan,commercial,Silver HMO,0,NA,,grp-100,Acme Corp,47,tuva
+patient-003,member-003,subscriber-003,1945-11-23,2025-06-15,2025-01-01,2025-06-15,Beta Medicare Advantage,medicare,MA Plan B,1,02,20,,,,tuva

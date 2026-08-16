@@ -1,4 +1,4 @@
-"""Unit tests for tuva_postgres.api_client, against a real in-process mock
+"""Unit tests for tuva_ingest.api_client, against a real in-process mock
 HTTP server (http.server), not a proprietary/external API.
 
 Requires the `requests` runtime dependency (see pyproject.toml /
@@ -28,9 +28,9 @@ except ImportError:
     HAVE_REQUESTS = False
 
 if HAVE_REQUESTS:
-    from tuva_postgres.api_client import ApiClient
-    from tuva_postgres.errors import ChecksumError, DownloadError
-    from tuva_postgres.manifest import Artifact
+    from tuva_ingest.api_client import ApiClient
+    from tuva_ingest.errors import ChecksumError, DownloadError
+    from tuva_ingest.manifest import Artifact
 
 TOKEN = "s3cr3t-test-token-do-not-leak"
 CONTENT = b"id,name\n1,alice\n2,bob\n"
@@ -125,7 +125,7 @@ class TestApiClient(unittest.TestCase):
 
         server = self._start(handle)
         self._client().download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
-        self.assertIn("tuva-postgres/", seen["ua"])
+        self.assertIn("tuva-ingest/", seen["ua"])
 
     # --- integrity checks -------------------------------------------------
     def test_checksum_mismatch_raises_and_cleans_up(self):

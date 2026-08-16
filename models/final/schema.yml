@@ -1,0 +1,87 @@
+version: 2
+
+models:
+  - name: eligibility
+    description: >
+      Tuva Input Layer contract model. Consumed directly by the Tuva
+      package (packages.yml, pinned to tuva-health/the_tuva_project
+      0.18.0) via ref('eligibility'). See the model's header comment for
+      the documented assumption behind this column mapping.
+    columns:
+      - name: patient_id
+        description: Person identifier, unique per patient within a data_source.
+        data_tests: [not_null]
+      - name: member_id
+        description: Member/subscriber-line identifier.
+      - name: enrollment_start_date
+        description: Coverage start date.
+      - name: enrollment_end_date
+        description: Coverage end date.
+      - name: payer
+        description: Payer name.
+      - name: data_source
+        description: Source system tag distinguishing this connector's data within a shared Tuva warehouse.
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["tuva"]
+
+  - name: medical_claim
+    description: >
+      Tuva Input Layer contract model. Consumed directly by the Tuva
+      package via ref('medical_claim'). See the model's header comment
+      for the documented assumption behind this column mapping.
+    columns:
+      - name: claim_id
+        description: Claim identifier.
+        data_tests: [not_null]
+      - name: claim_line_number
+        description: 1-based claim line number within claim_id.
+      - name: patient_id
+        description: Person identifier; expected to match eligibility.patient_id for the same data_source.
+        data_tests: [not_null]
+      - name: claim_type
+        description: Source-supplied claim type (e.g. institutional/professional).
+      - name: paid_amount
+        description: Amount paid on this claim line.
+      - name: data_source
+        description: Source system tag distinguishing this connector's data within a shared Tuva warehouse.
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["tuva"]
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - claim_id
+            - claim_line_number
+
+  - name: pharmacy_claim
+    description: >
+      Tuva Input Layer contract model. Consumed directly by the Tuva
+      package via ref('pharmacy_claim'). See the model's header comment
+      for the documented assumption behind this column mapping.
+    columns:
+      - name: claim_id
+        description: Claim identifier.
+        data_tests: [not_null]
+      - name: claim_line_number
+        description: 1-based claim line number within claim_id.
+      - name: patient_id
+        description: Person identifier; expected to match eligibility.patient_id for the same data_source.
+        data_tests: [not_null]
+      - name: ndc_code
+        description: National Drug Code for the dispensed product.
+      - name: paid_amount
+        description: Amount paid on this claim line.
+      - name: data_source
+        description: Source system tag distinguishing this connector's data within a shared Tuva warehouse.
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["tuva"]
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - claim_id
+            - claim_line_number

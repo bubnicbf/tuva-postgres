@@ -1,490 +1,257 @@
-# tuva-postgres
-Reproducible Postgres load of Tuva seed datasets.
+# tuva-ingest
 
-## Quickstart
-```bash
-make init
-cp scripts/setup_env.example .env  # edit DSN / schema
-make create-db
-python scripts/normalize_csvs.py data
-make load
-make test
+A raw-to-Input-Layer ingestion connector for [the Tuva Project](https://thetuvaproject.com)
+dbt package. `tuva-ingest` extracts source claims data through a
+versioned manifest contract, loads it into a configurable raw
+PostgreSQL warehouse schema, and hands it off to dbt to map into the
+Tuva Input Layer -- the pinned Tuva package (`tuva-health/the_tuva_project`,
+exactly `0.18.0`) then builds its own core data model, terminology sets,
+and marts on top of that.
+
+This repository does not own or reproduce any of Tuva's core,
+terminology, or output DDL. Every table this repository defines lives
+in the raw landing schema or the operational/control schema; Tuva's own
+tables are created and owned entirely by the pinned dbt package.
+
+## Architecture
+
+```
+   API manifest              raw PostgreSQL schema        dbt: staging          dbt: Input Layer         Tuva package (0.18.0)
+  (versioned JSON)     -->    (JSONB schema-on-read)  -->  (typed, trimmed) -->  (eligibility,       -->  (core, terminology,
+                                                                                  medical_claim,           marts -- never
+  src/tuva_ingest/            src/tuva_ingest/             models/staging/       pharmacy_claim)          duplicated locally)
+  extract.py, api_client.py   raw_loader.py                                      models/final/
 ```
 
-## Production ingestion pipeline
+1. **Extract** (`tuva-ingest extract`) -- fetches and validates a
+   versioned JSON manifest (see `docs/API_MANIFEST.md`) describing one
+   snapshot's per-table CSV artifacts, downloads each one
+   (checksum-verified, retried, bearer-authenticated), and publishes
+   the snapshot atomically under `RAW_DATA_DIR`. A partial download can
+   never appear complete to a later step.
+2. **Load raw** (`tuva-ingest load-raw`) -- loads the published
+   snapshot into the configured raw schema (`RAW_SCHEMA`, default
+   `raw`) only. Every row is stored as a single `raw_row jsonb` column
+   plus fixed metadata columns (`_snapshot_id`, `_source_row_number`,
+   `_loaded_at`) -- no type coercion, renaming, or business logic
+   happens here, so the raw layer is a faithful, replayable copy of
+   exactly what the source sent.
+3. **dbt** (`tuva-ingest dbt -- <args>`) -- `models/staging/*.sql`
+   types and normalizes the raw JSONB into typed columns;
+   `models/final/{eligibility,medical_claim,pharmacy_claim}.sql`
+   expose the Tuva Input Layer contract those staging models feed. dbt
+   never writes back into the raw schema.
+4. **Tuva package** -- pinned to exactly `0.18.0`
+   (`packages.yml`), `ref()`s this project's Input Layer models by
+   name and builds its own core/terminology/mart models on top of
+   them, in its own schema(s). This repository never vendors or
+   duplicates any of that package's model files.
 
-Beyond the plain CSV loader above, `src/tuva_postgres/` is a full
-production pipeline: an authenticated API client speaking a versioned
-JSON manifest contract, an immutable raw landing layer, tracked database
-migrations, an observable orchestrator (`fetch -> migrate -> load ->
-test`), a production container, and a scheduled Kubernetes `CronJob`.
+Source data is never loaded directly into any Tuva-managed schema.
 
-```bash
-uv sync --locked                        # installs requests + psycopg (see below)
-cp scripts/setup_env.example .env       # fill in TUVA_API_MANIFEST_URL/TOKEN, PG_DSN, etc.
-make migrate                            # or: uv run tuva-postgres migrate
-make pipeline                           # or: uv run tuva-postgres run
-make health                             # or: uv run tuva-postgres healthcheck
-```
+## Prerequisites
 
-See **`docs/RUNBOOK.md`** for the full operations guide (required
-config, scheduled runs, reading structured logs, querying run/artifact
-history, handling checksum/migration failures, retention, and
-recommended alerts), **`docs/API_MANIFEST.md`** for the manifest contract
-the API client speaks, and **`deploy/kubernetes/README.md`** for the
-(not-applied-by-this-repo) Kubernetes deployment.
+- [uv](https://docs.astral.sh/uv/) (Python 3.12, pinned via
+  `.python-version`)
+- Docker + Docker Compose v2, for a local disposable PostgreSQL (or
+  point `PG_DSN` at any PostgreSQL 16+ instance you already have)
+- Network access to dbt Hub (for `dbt deps`, which fetches the pinned
+  Tuva package) when you actually run dbt
 
-New Makefile targets: `deps`, `fetch`, `migrate`, `migration-status`,
-`pipeline`, `health`, `test-unit`, `test-integration` (requires a
-disposable `PG_DSN`), `test-container`, `test-deploy`, `docker-build`,
-`compose-up`, `compose-down`, and the `local-db-*`/`test-compose-integration`
-targets below.
-
-## Local PostgreSQL with Docker Compose
-
-A disposable, one-command local PostgreSQL database for development --
-this is a separate concern from three other things this repository also
-has, and it's worth being clear about which is which:
-
-- **Local PostgreSQL (this section, `compose.yaml`)** -- a throwaway
-  database on your machine for day-to-day development. Local-only
-  example credentials, no TLS, no backups, no HA.
-- **The application pipeline container (`Dockerfile`, the `pipeline`
-  service in `compose.yaml`)** -- the same production image, runnable
-  locally against that disposable database for `healthcheck`/`migrate`,
-  or a full `run` if you also supply `TUVA_API_MANIFEST_URL`/
-  `TUVA_API_TOKEN`.
-- **Production Kubernetes deployment (`deploy/kubernetes/`)** -- what
-  actually runs in production; see `docs/RUNBOOK.md`. Nothing in
-  `compose.yaml` is applied to, or used by, production -- Compose is a
-  local development convenience only.
-
-### Prerequisites
-
-- Docker Engine or Docker Desktop
-- Docker Compose v2 (the `docker compose` subcommand, not the standalone
-  `docker-compose` v1 binary)
-
-### One-command startup
+## Quick start
 
 ```bash
-make local-db-ready
+git clone <this repo> && cd tuva-postgres
+make init                      # uv sync --locked; installs pre-commit; copies .env template
+# edit .env: at minimum PG_DSN, and TUVA_API_MANIFEST_URL/TUVA_API_TOKEN
+# if you plan to run `extract`/`run` against a real manifest endpoint
+
+make local-db-ready            # starts a local disposable Postgres (docker compose) and migrates it
+make migrate-status            # read-only: confirm 001-003 are applied
+
+make extract                   # fetch + publish a raw snapshot (requires TUVA_API_MANIFEST_URL/TOKEN)
+make load-raw                  # load the published snapshot into RAW_SCHEMA
+make dbt-deps                  # fetch the pinned Tuva 0.18.0 package
+make dbt-build                 # staging -> Input Layer -> Tuva's own models, plus dbt tests
+
+make health                    # DB connectivity + migration state + last-successful-run freshness
 ```
 
-Starts Postgres (detached), waits for it to report healthy, then applies
-every migration through the repository's real migration runner (`tuva-
-postgres migrate` -- the exact same code path as `make migrate` against
-any other database; nothing is duplicated into a Postgres init script).
-Safe to rerun any time; it never requires `TUVA_API_MANIFEST_URL`/
-`TUVA_API_TOKEN`, and never deletes existing data.
-
-### Host connection information
-
-The command above prints the host DSN when it finishes. It matches
-`compose.yaml`'s local-only example credentials exactly:
-
-```
-postgresql://tuva_local:local-only-example-password-change-me@127.0.0.1:5432/tuva
-```
-
-**The password above is intentionally not a secret.** It is a clearly
-labeled, local-development-only placeholder baked into `compose.yaml`
-for convenience -- never reuse it anywhere outside your own machine, and
-never treat it as if it protects anything.
-
-Load host-side environment variables (schemas included) into your shell:
+Or run the whole pipeline in one command once `.env` is populated:
 
 ```bash
-cp scripts/setup_local_postgres.example .env   # or scripts/setup_env.example
-. .env
+make run   # migrate -> extract -> load-raw -> dbt deps -> dbt build
 ```
 
-Both example files already match `compose.yaml`'s credentials, database
-name, and schemas (`tuva` / `tuva_term` / `tuva_ops`) -- see
-`scripts/setup_local_postgres.example` for the full explanation of how
-Compose's own `${VAR:-default}` interpolation and shell-sourcing a `.env`
-file are two different mechanisms that happen to use similar syntax.
+## Configuration
 
-### Everyday commands
+Every setting is an environment variable, loaded and validated by
+`src/tuva_ingest/config.py`'s `IngestConfig.load()` -- see
+`scripts/setup_env.example` for the full list with safe local
+defaults. `make init` copies it to `.env` (git-ignored) for you.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `PG_DSN` | PostgreSQL connection string | *(required)* |
+| `RAW_SCHEMA` | Raw landing schema (never Tuva-managed) | `raw` |
+| `OPS_SCHEMA` | Operational/control schema (run/table-load history) | `ingest_ops` |
+| `INPUT_LAYER_SCHEMA` | Schema dbt materializes `models/final/*.sql` into | `input_layer` |
+| `INGEST_ROLE` / `TRANSFORM_ROLE` | Least-privilege role names (see `migrations/003_roles_and_grants.sql`) | `tuva_ingest_role` / `tuva_transform_role` |
+| `TUVA_API_MANIFEST_URL` / `TUVA_API_TOKEN` | Manifest endpoint + bearer token (see `docs/API_MANIFEST.md`) | *(required for `extract`/`run`)* |
+| `TUVA_API_TIMEOUT_SECONDS` / `TUVA_API_MAX_RETRIES` | HTTP client bounds | `30` / `5` |
+| `TUVA_API_ALLOW_INSECURE_HTTP` | Allow `http://` manifest/artifact URLs (local mock servers only) | `0` |
+| `RAW_DATA_DIR` | Local extraction/snapshot directory | `data/raw` |
+| `SOURCE_NAME` | Top-level directory name under `RAW_DATA_DIR` | `tuva` |
+| `DBT_TARGET` / `DBT_PROFILES_DIR` / `DBT_PROJECT_DIR` | Passed through to every `dbt` invocation | `dev` / `.` / `.` |
+| `PIPELINE_ENVIRONMENT` / `PIPELINE_MAX_SUCCESS_AGE_HOURS` | Healthcheck freshness window | `local` / `30` |
+| `LOG_LEVEL` | Structured JSON log level | `INFO` |
+
+`IngestConfig.load()` fails fast with every problem listed at once
+(never just the first), validates every dynamic schema/role name
+against a single shared identifier policy (`src/tuva_ingest/identifiers.py`)
+before any SQL is composed, and never includes `PG_DSN`/`TUVA_API_TOKEN`
+in `repr()`, logs, or `safe_dict()` output.
+
+## Local PostgreSQL (Docker Compose)
+
+`compose.yml` provides a disposable local Postgres plus one-shot
+`migrate`/`dbt-deps`/`dbt-build` services and an `ingest` service for
+the connector CLI. See the file's own header comment for the full
+command reference. Routine lifecycle:
 
 ```bash
-make local-db-status   # container state + migration status (read-only)
-make local-db-migrate  # (re)apply migrations -- safe to rerun, exits nonzero on failure
-make local-db-shell    # psql against the local database (no host psql required)
-make local-db-logs     # follow Postgres logs (Ctrl-C to stop following)
+make local-db-ready     # start postgres, wait healthy, apply migrations
+make local-db-status    # container state + migration status (read-only)
+make local-db-shell     # psql against the local database
+make local-db-down      # stop containers, KEEP the data volume
+make local-db-reset     # DESTRUCTIVE: also drops the data volume
 ```
 
-### Stopping and restarting (data preserved)
+## Migrations
+
+`migrations/001_operational_schemas.sql`, `002_ingestion_control.sql`,
+and `003_roles_and_grants.sql` are the only DDL this repository owns:
+the raw and operational-control schemas, run/table-load bookkeeping
+tables, and least-privilege role grants. They are checksum-tracked
+(`src/tuva_ingest/migrations.py`), applied at most once each, and
+rerunning `tuva-ingest migrate` against an already-migrated database is
+always a true no-op. Dynamic identifiers (schema/role names) use
+psql-style `:"name"` substitution, validated against the same shared
+identifier policy every other dynamic-SQL call site uses -- see
+`migrations.py`'s module docstring for why static SQL alone can't
+express this.
+
+## dbt project
+
+- `dbt_project.yml` -- claims-only Tuva var configuration
+  (`claims_enabled: true`, `clinical_enabled`/`provider_attribution_enabled: false`)
+  and the `require_ref_searches_node_package_before_root` flag Tuva
+  0.18.0 requires.
+- `packages.yml` -- `tuva-health/the_tuva_project` pinned to exactly
+  `0.18.0`, plus `dbt_utils` (used by `models/final/schema.yml`'s
+  uniqueness tests).
+- `profiles.example.yml` -- entirely environment-variable-driven, with
+  safe local placeholder defaults only; never a real credential. Copy
+  to `profiles.yml` (git-ignored) or rely on the Docker image, which
+  bakes this same file in as `profiles.yml` since it contains nothing
+  secret.
+- `models/sources.yml` -- declares the three raw tables
+  (`eligibility`, `medical_claim`, `pharmacy_claim`) with freshness
+  checks.
+- `models/staging/*.sql` -- normalizes `raw_row` JSONB into typed,
+  trimmed columns (empty string -> `NULL`; malformed dates/numerics ->
+  typed `NULL` via the `safe_date`/`safe_numeric`/`safe_integer`
+  macros in `macros/safe_cast.sql`, since PostgreSQL has no
+  `TRY_CAST`). No Tuva-specific business logic here.
+- `models/final/*.sql` -- the Input Layer contract models Tuva's
+  package `ref()`s by name. Fields this connector's source data cannot
+  confidently supply are typed `NULL`, documented in each model's own
+  header comment and in `models/final/schema.yml` -- never an invented
+  mapping.
+
+## Testing
 
 ```bash
-make local-db-down     # stops containers; the Postgres data volume is preserved
-make local-db-ready     # starts again -- your data is exactly as you left it
+make test-unit          # database-free: fakes/mocks only, safe to run anywhere
+make test-integration   # requires PG_DSN pointed at a DISPOSABLE PostgreSQL database
+make quality            # dependency lock check, ruff, mypy, unit tests, sqlfluff -- database-free
+make ci-full            # quality + dbt parse/deps + the full integration suite
 ```
 
-Routine shutdown (`make local-db-down`, and `make compose-down`) never
-passes `-v` to `docker compose down` -- local database data survives an
-ordinary stop/start cycle.
+`tests/unit/` fakes or mocks every I/O boundary (an in-process
+`http.server` for the API client, fake psycopg connections for
+SQL-composition tests) so it never touches a real database or network.
+`tests/integration/test_pipeline_integration.py` requires a real,
+disposable PostgreSQL database (never point it at production) and
+proves: migrations are truly idempotent on a second run; reloading the
+same snapshot never duplicates rows; a corrupted checksum rolls back
+the *entire* snapshot's transaction, not just one table; ingestion
+never creates or touches any Tuva-managed schema name; and (when `dbt`
+is on `PATH`, which `uv sync --locked` guarantees) a real `dbt build`
+against the fixtures in `tests/fixtures/` produces the three Input
+Layer tables with the expected row counts.
 
-### Resetting all local data (destructive)
+## Failure recovery and idempotency
 
-```bash
-make local-db-reset
+- **Extraction**: a snapshot is only "published" once every artifact
+  is downloaded and verified and a `_SUCCESS` marker is written.
+  Re-extracting the exact same manifest is a safe no-op; re-extracting
+  a `snapshot_id` with *different* content is a loud failure, never a
+  silent overwrite.
+- **Raw loading**: each raw table is `TRUNCATE`d and reloaded from a
+  specific `snapshot_id` inside one transaction spanning all three
+  tables plus run bookkeeping -- retrying never duplicates rows, and a
+  failure partway through never leaves a partially-loaded snapshot
+  visible.
+- **Migrations**: checksum-tracked and applied at most once;
+  `apply_pending` takes a PostgreSQL advisory lock so concurrent runs
+  never race.
+- **Run state**: `ingest_ops.ingestion_runs`/`table_loads` (see
+  `migrations/002_ingestion_control.sql`) record every run's stage,
+  status, row counts, and errors. A run can only leave `running`
+  exactly once (see `src/tuva_ingest/state.py`).
+
+## Security
+
+- Never commit `.env` or `profiles.yml` (both git-ignored).
+- `PG_DSN` and `TUVA_API_TOKEN` are never logged, printed, or included
+  in any error message (`src/tuva_ingest/logging_utils.py`'s
+  `sanitize_error`/`sanitize_text`).
+- Every dynamic schema/table/role identifier is validated against
+  `src/tuva_ingest/identifiers.py`'s shared policy before it is ever
+  composed into SQL text; data values are always bound through
+  parameterized queries or psycopg's `COPY` protocol, never
+  interpolated.
+- This connector never handles PHI in its own test fixtures
+  (`tests/fixtures/*.csv` are synthetic).
+
+## Upgrading beyond Tuva 0.18.0
+
+Bump the pin in `packages.yml`, re-run `dbt deps`, and review Tuva's
+own changelog for Input Layer contract changes before touching
+`models/final/*.sql`. Treat any upgrade as a deliberate, reviewed
+change -- never a floating range or `main`/`latest`.
+
+## Known limitations
+
+The exact Tuva 0.18.0 Input Layer column contract for
+`eligibility`/`medical_claim`/`pharmacy_claim` should be verified
+against the pinned package's own source (`dbt_packages/the_tuva_project/`
+after `dbt deps`) before relying on this connector's `models/final/*.sql`
+in production -- the mapping here follows Tuva's documented conventions
+and this repository's own claims data model, but every field this
+connector's source cannot confidently supply is a typed `NULL` (see
+each model's header comment), not a guess.
+
+## Repository layout
+
 ```
-
-This **permanently deletes** the local Postgres data volume (and this
-stack's other local-only volumes). It requires either an interactive
-`yes` confirmation, or `CONFIRM_LOCAL_DB_RESET=yes` for scripted/
-noninteractive use:
-
-```bash
-CONFIRM_LOCAL_DB_RESET=yes make local-db-reset
+src/tuva_ingest/     the connector: config, api_client, extract, raw_loader, state, migrations, cli
+migrations/           001-003: raw + operational schemas, run/table-load control, role grants
+dbt_project.yml, packages.yml, profiles.example.yml, macros/, models/   the dbt project
+tests/unit/            database-free tests
+tests/integration/     tests requiring a disposable PostgreSQL database
+tests/fixtures/         small synthetic CSV fixtures used by tests/integration
+docs/RUNBOOK.md         day-to-day operational runbook
+docs/API_MANIFEST.md    the versioned manifest contract extract.py consumes
 ```
-
-It only ever touches this Compose project's own resources -- never
-`docker system prune`, never another project's containers or volumes.
-
-### Changing the host port
-
-If port 5432 is already in use on your machine, set `POSTGRES_PORT`
-before starting the stack:
-
-```bash
-POSTGRES_PORT=5433 make local-db-ready
-```
-
-The container-side port always stays Postgres's normal 5432; only the
-host-side publish port changes. Update `PG_DSN`/`.env` accordingly if you
-load one (`scripts/setup_local_postgres.example` already references
-`${POSTGRES_PORT:-5432}`).
-
-### Running the Compose integration smoke test
-
-```bash
-make test-compose-integration
-```
-
-Spins up an **isolated**, uniquely-named Compose project (never your own
-`local-db-*` stack) on a dynamically chosen port, proves the whole
-workflow end to end against a real Postgres (config rendering, health,
-migrations, expected schemas, idempotent reapply, stop/start data
-persistence), and cleans up fully on exit. Requires Docker; prints a
-clear `SKIPPED` message and exits successfully if Docker isn't available.
-The database-free structural counterpart (`tests/unit/
-test_local_postgres_compose.py`, run via `make test-unit`) always runs,
-with or without Docker.
-
-## Database migrations
-
-`db/migrations/` is the **sole authoritative home for deployable DDL** --
-there is no other place a table, view, or constraint definition lives.
-Each migration is a versioned JSON manifest (`db/migrations/{version}_
-{slug}.json`) plus one or more SQL files it owns exclusively, under
-`db/migrations/sql/{version}_{slug}/` (see `db/migrations/0001_baseline.json`
-/ `db/migrations/sql/0001_baseline/{core,views,terminology}/` and
-`db/migrations/0002_operational_schema.json` /
-`db/migrations/sql/0002_operational_schema/`). The manifest's `files` list
-is the authoritative execution order -- never filesystem traversal order.
-
-Every manifest also declares exactly one **execution mode** via a
-required `"execution"` field:
-
-- `"one_time"` -- applied at most once. Once applied, its SQL, file
-  order, checksum, and execution mode are all immutable; any drift is a
-  hard error that blocks all further migration activity. Migrations
-  `0001` and `0002` are both `one_time`.
-- `"repeatable"` -- applied on first discovery, then transactionally
-  reapplied whenever its checksum changes, and skipped otherwise
-  (standard checksum-driven semantics -- never rerun unconditionally).
-  Use this for idempotent SQL (`CREATE OR REPLACE VIEW`/function, etc.)
-  you want to keep current, not a one-off schema change.
-
-`src/tuva_postgres/migrations.py` computes each migration's checksum
-purely from its ordered files' basenames, byte lengths, and contents
-(manifest metadata like `execution` never affects it), and refuses to
-proceed if an already-applied `one_time` migration's checksum -- or any
-migration's execution mode -- has changed since it was applied. Within a
-single run, all pending `one_time` migrations apply (ascending version)
-before any pending `repeatable` migration, so a repeatable view or
-function can safely depend on a schema object a pending `one_time`
-migration is about to create, regardless of version numbering. Database
-changes always go into a **new** migration at the next unused numeric
-version (`0003`, `0004`, ...) -- see `docs/RUNBOOK.md`'s "Adding a new
-migration" section for the full walkthrough, including execution-mode
-guidance.
-
-SQL data-quality/validation queries (the smoke tests and add-on checks
-`scripts/run_tests.sh` runs after a load) are a separate concern and live
-under `db/tests/`, not `db/migrations/` -- they are never treated as
-deployable DDL, and new SQL validation tests should be added there (new
-deployable DDL, by contrast, always goes into a new migration -- see
-above). `db/tests/zz_results.sql` initializes the `test_results` table
-and summary views and is applied once as setup, not as a validation case;
-every other `db/tests/*.sql` file is a validation case, executed in
-deterministic filename order by `scripts/run_tests.sh` -- the
-authoritative SQL-test runner, invoked via `make test` (requires the
-configured database) or directly as `uv run tuva-postgres test`.
-`make test-shell` is the database-free counterpart: it validates
-migration and SQL-test-runner *structure and behavior* (via stubbed
-`psql`/`python3`) without needing a real Postgres connection.
-
-`make create-db` / `make migrate` apply pending migrations transactionally
-(see `scripts/apply_schema.sh` -> `tuva_postgres.migrations`);
-`make migration-status` reports applied, pending, and checksum-mismatch
-states without applying anything.
-
-### SQL identifier safety
-
-`PG_SCHEMA`/`TERMINOLOGY_SCHEMA`/`OPS_SCHEMA` are dynamic PostgreSQL
-*identifiers* (schema names), not data -- they can never be bound as an
-ordinary `%s` query parameter the way a value can, because PostgreSQL
-identifier syntax and string-literal syntax are different things. This
-repository enforces one strict, ASCII-only policy for every dynamic
-identifier, everywhere: `src/tuva_postgres/identifiers.py` (Python) and
-`scripts/lib/postgres_identifiers.sh` (shell) both implement the same
-rule -- first character an ASCII letter or underscore, remaining
-characters ASCII letters/digits/underscores, full match only (no dots,
-quotes, whitespace, semicolons, comments, or non-ASCII characters).
-Valid: `tuva`, `tuva_ops`, `_temporary`, `TestSchema_1`. Rejected:
-empty string, `1schema`, `schema-name`, `schema.name`, `schema name`,
-`schema; DROP TABLE patient`, anything containing a quote, newline, tab,
-or null byte.
-
-Every identifier is validated **and** safely quoted before it is ever
-combined with SQL text, using `tuva_postgres.db.qualified_relation()`/
-`quote_ident()` (or `scripts/lib/postgres_identifiers.sh`'s
-`validate_postgres_identifier`/`quote_validated_postgres_identifier` in
-shell scripts) -- never accepted as an already-quoted string, and never
-accepted as a single `"schema.table"` value (schema and relation are
-always supplied and validated as two separate arguments). Ordinary data
-values (run IDs, URLs, timestamps, error messages, checksums, table names
-used *as data*, ...) are never touched by this policy -- they continue to
-travel as normal bound `%s` query parameters. Validation happens at two
-independent layers (config load time in `PipelineConfig.load()`, and
-again at the point SQL is actually composed in `db.py`/`ops.py`/
-`migrations.py`), and an invalid identifier is always rejected before any
-`cursor.execute()`/`psql` invocation, never after. `scripts/tests/
-test_no_raw_schema_interpolation.py` (part of `make test-shell`) is a
-static AST-based regression guard against this pattern being
-reintroduced.
-
-## CI fixture and the complete-run smoke test
-
-`tests/fixtures/ci/complete_snapshot/` is a small, deterministic,
-**synthetic** CSV snapshot -- one row per managed table (all 15 tables in
-`tuva_postgres.manifest.MANAGED_TABLES`), with fixed synthetic IDs
-(`person-1`, `practitioner-1`, `location-1`, `encounter-1`, ...), fixed
-past dates, and fixed amounts. It contains **no PHI, no real patient
-data, and no credentials** -- every coded/terminology field is left
-`NULL` (see `scripts/tests/test_ci_fixture.py`'s secret/SSN-shaped-value
-scan). It exists only to prove, deterministically and reproducibly, that
-migrations, the real loader, and the full SQL validation suite actually
-work end to end -- it is not representative of real data volume or
-terminology coverage. Never point `DATA_DIR` at this directory for a real
-load; it's for CI and local smoke testing only (see
-`tests/fixtures/ci/complete_snapshot/README.md`).
-
-Validating the fixture's structure without a database:
-
-```bash
-python3 scripts/tests/test_ci_fixture.py
-```
-
-This checks that all 15 managed CSVs are present (no more, no fewer),
-every header is complete and matches migration 0001's column order,
-every file has at least one data row, cross-file foreign keys resolve,
-no value looks like a secret or SSN, and no value was generated from the
-current date/time. It also runs negative-control checks (a missing CSV,
-an extra CSV, a truncated row, a duplicate header, a broken relationship)
-against scratch copies to prove the validator actually rejects a broken
-fixture, not just that it accepts the real one. `make test-shell` runs
-this test as part of the standard database-free suite.
-
-Running the full fixture-backed smoke test against a **disposable**
-PostgreSQL database (never production):
-
-```bash
-PG_DSN=postgresql://user:pass@host:port/db bash scripts/tests/test_ci_complete_run.sh
-```
-
-or, against the database already configured in `.env` (what CI itself
-runs, via `.github/workflows/ci.yml`):
-
-```bash
-make test-ci-complete-run
-```
-
-Either proves the real sequence: migrations apply, every fixture CSV
-header matches the migrated schema in ordinal order, `scripts/
-load_to_postgres.sh` loads the fixture through its normal preflight and
-atomic-transaction path (never its zero-file no-op path), every managed
-table ends up with its exact expected row count, key foreign-key
-relationships join, the real `scripts/run_tests.sh` executes the full
-`db/tests/*.sql` suite, and `scripts/verify_complete_run.py` confirms
-every expected suite is represented with zero failures and migration
-status is current. CI ties every result to its own deterministic
-`RUN_ID` (`ci-${{ github.run_id }}-${{ github.run_attempt }}`), so a
-stale result from an earlier run can never be mistaken for evidence
-about the current one.
-
-**Updating the fixture safely when migration 0001's baseline schema
-changes** (a column added, renamed, reordered, or removed):
-
-1. Apply the updated migration to a disposable database (`make
-   local-db-ready` or any other disposable Postgres).
-2. Check for drift: `PG_DSN=... uv run python3
-   scripts/generate_ci_fixture.py check --pg-schema <disposable schema>`
-   -- exits nonzero with a per-table diff if the committed fixture no
-   longer matches the migrated schema.
-3. If a new column needs a deterministic value, add it to `OVERRIDES` in
-   `scripts/generate_ci_fixture.py` (columns left unlisted are written
-   blank/NULL, matching every nullable column's default).
-4. Regenerate the committed fixture explicitly: `PG_DSN=... uv run
-   python3 scripts/generate_ci_fixture.py generate --pg-schema
-   <disposable schema> --out tests/fixtures/ci/complete_snapshot`.
-5. Review the diff, re-run `python3 scripts/tests/test_ci_fixture.py` and
-   `bash scripts/tests/test_ci_complete_run.sh`, and commit the fixture
-   together with the schema/migration change that caused the drift.
-
-`scripts/generate_ci_fixture.py` never connects to a database unless you
-pass `--pg-dsn`/`--pg-schema` explicitly, never defaults to a production
-or shared schema name, and never overwrites the committed fixture unless
-you pass `--out tests/fixtures/ci/complete_snapshot` explicitly. CI never
-regenerates the fixture before loading it -- it always loads exactly what
-is committed, so a stale fixture fails loudly (via `test_ci_fixture.py`
-and/or a header mismatch in `test_ci_complete_run.sh`) instead of being
-silently papered over.
-
-## Python development and quality tooling
-
-`src/tuva_postgres/` has two runtime dependencies -- `requests` (the API
-client) and `psycopg[binary]` (migrations, the orchestrator's database
-access) -- both exact-pinned in `pyproject.toml`. The plain shell scripts
-under `scripts/` still use only the Python standard library.
-
-Everything else is a single, locked dev/tooling toolchain, also
-exact-pinned in `pyproject.toml` (`[dependency-groups] dev`) and locked
-(with every transitive dependency) in the committed `uv.lock`, so local
-and CI runs always resolve the identical versions -- never an unpinned
-`pip install`:
-- **Ruff** -- lint (`ruff check`) and format (`ruff format`) for
-  `src/`, `tests/`, and `scripts/`. See `[tool.ruff]` /
-  `[tool.ruff.lint]` in `pyproject.toml` for the configured rule set
-  (`E4`, `E7`, `E9`, `F`, `I`, `UP`, `B`) and the narrow, justified
-  per-file ignores.
-- **mypy** -- static typing, scoped to the production package only
-  (`files = ["src/tuva_postgres"]` in `[tool.mypy]`). A strong-but-honest
-  configuration, not full strict mode: `check_untyped_defs`,
-  `no_implicit_optional`, `warn_redundant_casts`, `warn_unused_ignores`,
-  `warn_unreachable`, and `strict_equality` are all on, but there's no
-  blanket `ignore_errors`/`ignore_missing_imports` and no
-  `disallow_untyped_defs`.
-- **pytest** -- the test runner for both `tests/unit/` (database-free)
-  and `tests/integration/` (requires a disposable PostgreSQL database).
-  Both suites are `unittest.TestCase`-based; pytest collects and runs
-  them natively, no rewrite needed. See `[tool.pytest.ini_options]` in
-  `pyproject.toml` -- the `integration` marker is what keeps a plain
-  `pytest` run database-free by default.
-- **SQLFluff** -- SQL lint/format via the psql-aware wrapper
-  (`scripts/sqlfluff_psql_wrapper.sh`), which normalizes psql identifier
-  variables (`:"schema"`, `:"terminology_schema"`, `:"ops_schema"`) before
-  linting so checksum-protected migration SQL under `db/migrations/` can
-  be linted without ever modifying its committed content. **Migration
-  SQL is never rewritten by any tool** -- the SQLFluff fix hook only
-  previews suggested changes to stdout; see "Database migrations" above
-  for the checksum contract this protects.
-- **pre-commit** -- orchestrates all of the above (plus a few general
-  hygiene hooks) as local, `uv`-managed git hooks.
-
-Prerequisites:
-- Python 3.12 (selected in `.python-version`; `requires-python = ">=3.12"`
-  in `pyproject.toml`)
-- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
-
-Setup:
-```bash
-make init          # uv sync --locked && uv run pre-commit install
-```
-or, equivalently, without also installing the git hook:
-```bash
-uv sync --locked
-```
-
-Day-to-day commands:
-```bash
-make test-unit             # uv run pytest tests/unit (database-free)
-make test-integration       # uv run pytest tests/integration (requires PG_DSN)
-make lint-python             # uv run ruff check src tests scripts
-make format-python           # uv run ruff format src tests scripts (rewrites in place)
-make format-python-check     # uv run ruff format --check src tests scripts (CI-safe, no rewrite)
-make typecheck                # uv run mypy src/tuva_postgres
-make lint-sql                 # SQLFluff lint via the psql-aware wrapper, every tracked *.sql file
-make quality                  # check-python-deps + lint-python + format-python-check + typecheck + test-unit + lint-sql
-make lint                     # uv run pre-commit run --all-files (every hook, local uv-managed environment)
-make fmt                      # ruff format (rewrites) + the manual-only SQLFluff fixer (preview only, see above)
-make check-python-deps        # verify the locked toolchain is current and installable (no database required)
-```
-
-`make quality` is the single database-free gate to run before every push
-(and is what CI runs, via the same `make` targets -- see
-`.github/workflows/ci.yml`). Every local pre-commit hook's `entry:` is
-prefixed `uv run` directly, so hooks resolve the locked `.venv` correctly
-whether triggered via `make lint`, the installed git hook, or CI.
-
-**Updating a pinned dependency (Ruff, mypy, pytest, SQLFluff, pre-commit,
-or a transitive package) intentionally:**
-1. Edit the direct pin(s) in `pyproject.toml` (`[dependency-groups] dev`).
-2. Regenerate the lockfile: `uv lock`.
-3. Validate the result installs cleanly: `uv sync --locked`.
-4. Commit `pyproject.toml` and `uv.lock` together in the same commit.
-
-## Notes
-
-- Put CSVs in data/ with headers matching the applicable table definitions
-  in the baseline migration DDL under db/migrations/sql/0001_baseline/core/
-  and db/migrations/sql/0001_baseline/terminology/ (see
-  db/migrations/0001_baseline.json for the full, ordered list -- see
-  "Database migrations" below for why db/migrations/ is the only place to
-  look).
-- Adjust table/column names to the Tuva release you use.
-- scripts/load_to_postgres.sh uses \copy, so no server-side file access needed.
-
-### Loading is an atomic snapshot replacement
-
-`make load` (`scripts/load_to_postgres.sh`) treats the CSVs in `DATA_DIR` as a
-complete, replaceable snapshot, not an append-only stream:
-
-- All managed tables are truncated together and every CSV is copied in
-  within a single PostgreSQL transaction, committed only if every copy
-  succeeds. A failure partway through rolls back the whole transaction, so
-  the previous snapshot is left untouched.
-- Re-running the same (or a corrected) snapshot is safe: existing rows are
-  replaced, not appended, so retries never raise duplicate-key errors.
-- A complete set of CSVs is required. If some but not all managed tables'
-  CSVs are present, the loader refuses to run rather than load a partial
-  dataset. If none are present, it's a no-op.
-
-Run `make test-load-integration` (requires a real, disposable `PG_DSN`) to
-verify this against a live database: it loads a snapshot twice to confirm
-retries don't duplicate rows, then loads an intentionally invalid snapshot
-to confirm the prior snapshot survives a failed load intact.
-
----
-
-# Git initialization & message style
-
-**Use Conventional Commits** so your history remains parseable and clean.
-
-- `feat`: new capability (tables, loader features)
-- `fix`: bug fixes (schema mismatch, data type correction)
-- `docs`: README, notes
-- `chore`: non-prod changes (gitignore, boilerplate)
-- `refactor`: non-bug, non-feature structural changes
-- `test`: tests only
-- `ci`/`build`: pipeline & deps
-
-**One-time setup**
-```bash
-git init
-git config commit.template .commit-template.txt
-git add .
-git commit -m "chore(repo): bootstrap Postgres Tuva loader scaffold"

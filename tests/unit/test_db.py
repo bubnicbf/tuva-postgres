@@ -1,5 +1,5 @@
 """Unit tests for the SQL identifier-composition helpers in
-tuva_postgres.db: qualified_relation, quote_ident, validated_identifier,
+tuva_ingest.db: qualified_relation, quote_ident, validated_identifier,
 identifier_sql, qualified_identifier_sql, and substitute_psql_vars.
 
 These prove composition behavior directly (structural assertions on the
@@ -24,8 +24,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from tuva_postgres import db  # noqa: E402
-from tuva_postgres.identifiers import InvalidIdentifierError  # noqa: E402
+from tuva_ingest import db  # noqa: E402
+from tuva_ingest.identifiers import InvalidIdentifierError  # noqa: E402
 
 try:
     import psycopg  # noqa: F401

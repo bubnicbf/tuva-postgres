@@ -50,31 +50,50 @@ vars:
   # resolve against.
   input_layer_schema: input_layer
 
-  # Tuva 0.18.0 sub-part enablement (see README.md "dbt Variables" /
-  # https://thetuvaproject.com/getting-started). This connector is
-  # claims-first: eligibility, medical_claim, and pharmacy_claim are the
-  # three Input Layer tables it maps (see models/final/). Clinical and
-  # provider-attribution Input Layer tables are not mapped by this
-  # project, so those sub-parts stay disabled until they are.
+  # Tuva 0.18.0 domain enablement (see README.md "dbt Variables" /
+  # https://thetuvaproject.com/getting-started and
+  # https://github.com/tuva-health/tuva#dbt-variables for the package's
+  # own defaults). This connector is claims-first: eligibility,
+  # medical_claim, and pharmacy_claim are the three Input Layer tables
+  # it maps (see models/final/), each exposing the domain's FULL
+  # Tuva 0.18.0 column contract -- never a partial one.
+  #
+  # clinical_enabled/provider_attribution_enabled/semantic_layer_enabled
+  # stay false because this connector does not implement those domains'
+  # Input Layer model sets. Per the Input Layer contract, a domain must
+  # never be enabled while only part of its interface is implemented --
+  # see tests/unit/test_dbt_project_contract.py for the test that
+  # enforces this rule, and README.md "How to add another Tuva domain
+  # safely" for the procedure to follow when one of these is turned on
+  # for real.
   claims_enabled: true
   clinical_enabled: false
   provider_attribution_enabled: false
+  semantic_layer_enabled: false
 
 models:
   tuva_ingest_connector:
     staging:
       +schema: staging
       +materialized: view
+      +tags: ["input_layer"]
       +docs:
         node_color: "#8BC34A"
     final:
       +schema: "{{ var('input_layer_schema') }}"
       +materialized: table
+      +tags: ["input_layer"]
       +docs:
         node_color: "#2196F3"
   # The pinned Tuva package's own models are enabled/disabled entirely
   # through its own `claims_enabled`/`clinical_enabled`/
-  # `provider_attribution_enabled` vars above -- this project never
-  # overrides materializations or schemas for the_tuva_project's models,
-  # and never duplicates any of its model files locally (see README.md
-  # "This repository does not own Tuva's DDL").
+  # `provider_attribution_enabled`/`semantic_layer_enabled` vars above --
+  # this project never overrides materializations or schemas for
+  # the_tuva_project's models, and never duplicates any of its model
+  # files locally (see README.md "This repository does not own Tuva's
+  # DDL"). Both `staging` and `final` (not just `final`) carry the
+  # `input_layer` tag: `dbt build --select tag:input_layer` must be able
+  # to build the connector's models from an empty database in one pass,
+  # and the final Input Layer models ref() the staging models -- see
+  # tuva-health/connector_template, which tags all three of its
+  # transformation layers this same way for exactly this reason.

@@ -7,6 +7,8 @@ Subcommands:
   migrate      apply pending operational migrations, or print status with --status
   dbt          run `dbt` against this project with the connector's vars/target wired in
   run          full pipeline: extract -> load-raw -> dbt deps -> dbt build
+               --select tag:input_layer -> dbt build --select tag:dq_structural
+               (each stage gates the next; see README.md "Validation order")
   healthcheck  verify DB connectivity, migration state, and run freshness
 
 Every subcommand loads only the IngestConfig fields it actually needs
@@ -216,17 +218,36 @@ def _cmd_run(_args: argparse.Namespace) -> int:
         env["RAW_SCHEMA"] = config.raw_schema
         env["INPUT_LAYER_SCHEMA"] = config.input_layer_schema
         dbt_common = ["--project-dir", str(config.dbt_project_dir), "--profiles-dir", str(config.dbt_profiles_dir), "--target", config.dbt_target]
+        dbt_vars = ["--vars", f"{{raw_schema: {config.raw_schema}, input_layer_schema: {config.input_layer_schema}}}"]
         deps_result = subprocess.run(["dbt", "deps", *dbt_common], env=env, check=False)
         if deps_result.returncode != 0:
             state.mark_failed(conn, config.ops_schema, run_id, stage="dbt_deps", error_category="dbt", error_message="dbt deps failed")
             return deps_result.returncode
-        build_result = subprocess.run(
-            ["dbt", "build", *dbt_common, "--vars", f"{{raw_schema: {config.raw_schema}, input_layer_schema: {config.input_layer_schema}}}"],
+
+        # Structural DQ gate (see README.md "Validation order"): build
+        # ONLY this connector's own Input Layer models first, then ONLY
+        # the pinned Tuva package's structural DQ checks -- each stage
+        # must succeed before the next one runs, and a failure at either
+        # stage stops the pipeline immediately without attempting
+        # logical/analytical DQ or any downstream Tuva mart. This
+        # mirrors `make pipeline` (see Makefile's dbt-input-layer/
+        # dbt-dq-structural targets) so `tuva-ingest run` and `make
+        # pipeline` can never silently diverge in ordering.
+        input_layer_result = subprocess.run(
+            ["dbt", "build", *dbt_common, *dbt_vars, "--select", "tag:input_layer"],
             env=env, check=False,
         )
-        if build_result.returncode != 0:
-            state.mark_failed(conn, config.ops_schema, run_id, stage="dbt_build", error_category="dbt", error_message="dbt build failed")
-            return build_result.returncode
+        if input_layer_result.returncode != 0:
+            state.mark_failed(conn, config.ops_schema, run_id, stage="dbt_input_layer", error_category="dbt", error_message="dbt build --select tag:input_layer failed")
+            return input_layer_result.returncode
+
+        dq_structural_result = subprocess.run(
+            ["dbt", "build", *dbt_common, *dbt_vars, "--select", "tag:dq_structural"],
+            env=env, check=False,
+        )
+        if dq_structural_result.returncode != 0:
+            state.mark_failed(conn, config.ops_schema, run_id, stage="dbt_dq_structural", error_category="dbt", error_message="dbt build --select tag:dq_structural failed")
+            return dq_structural_result.returncode
 
         state.mark_succeeded(conn, config.ops_schema, run_id, rows_loaded=row_counts, tables_loaded=list(row_counts))
         log_event(logger, "pipeline_run_succeeded", run_id=run_id, snapshot_id=extracted.snapshot_id, **row_counts)

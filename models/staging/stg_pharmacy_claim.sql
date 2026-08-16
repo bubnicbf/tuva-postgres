@@ -8,6 +8,15 @@
 -- trimmed columns. See models/staging/stg_eligibility.sql's header for
 -- the normalization approach (raw_field()/safe_date()/safe_numeric()/
 -- safe_integer() -- macros/raw_field.sql, macros/safe_cast.sql).
+--
+-- Column names here match the Tuva Input Layer `pharmacy_claim`
+-- contract directly (person_id not patient_id -- see models/final/
+-- pharmacy_claim.sql's header for how that contract was confirmed) so
+-- models/final/pharmacy_claim.sql's mapping is a plain select/cast, not
+-- a rename. `quantity` is cast as an integer (safe_integer), matching
+-- the contract's documented "positive integer" type for pharmacy claim
+-- quantity -- distinct from medical_claim's numeric
+-- service_unit_quantity.
 
 with source as (
 
@@ -26,7 +35,7 @@ renamed as (
         {{ raw_field('raw_row', 'claim_id') }}                            as claim_id,
         {{ safe_integer(raw_field('raw_row', 'claim_line_number')) }}     as claim_line_number,
 
-        {{ raw_field('raw_row', 'person_id') }}                           as patient_id,
+        {{ raw_field('raw_row', 'person_id') }}                           as person_id,
         {{ raw_field('raw_row', 'member_id') }}                           as member_id,
         {{ raw_field('raw_row', 'payer') }}                               as payer,
         {{ raw_field('raw_row', 'plan') }}                                as plan,
@@ -37,7 +46,7 @@ renamed as (
         {{ safe_date(raw_field('raw_row', 'dispensing_date')) }}          as dispensing_date,
 
         {{ raw_field('raw_row', 'ndc_code') }}                            as ndc_code,
-        {{ safe_numeric(raw_field('raw_row', 'quantity')) }}              as quantity,
+        {{ safe_integer(raw_field('raw_row', 'quantity')) }}              as quantity,
         {{ safe_integer(raw_field('raw_row', 'days_supply')) }}           as days_supply,
         {{ safe_integer(raw_field('raw_row', 'refills')) }}               as refills,
 

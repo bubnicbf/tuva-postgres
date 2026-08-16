@@ -24,8 +24,11 @@ tables are created and owned entirely by the pinned dbt package.
 ```
 
 1. **Extract** (`tuva-ingest extract`) -- fetches and validates a
-   versioned JSON manifest (see `docs/API_MANIFEST.md`) describing one
-   snapshot's per-table CSV artifacts, downloads each one
+   versioned JSON manifest (see `docs/API_MANIFEST.md`; for the full
+   operational source contract -- auth, pagination, rate limits,
+   incremental/mutability semantics, PHI, reconciliation -- see
+   `docs/SOURCE_CONTRACT.md`) describing one snapshot's per-table CSV
+   artifacts, downloads each one
    (checksum-verified, retried, bearer-authenticated), and publishes
    the snapshot atomically under `RAW_DATA_DIR`. A partial download can
    never appear complete to a later step.

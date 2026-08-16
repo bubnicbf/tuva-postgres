@@ -2,23 +2,36 @@
 [project.scripts]).
 
 Subcommands:
-  extract      fetch + validate a manifest for exactly one --endpoint
-               (optionally scoped by --since) and publish a raw snapshot
-               for it (see docs/API_MANIFEST.md, endpoints.py)
-  load         load a previously extracted run (--run-id, required) --
-               the exact snapshot `extract` published -- into that one
-               endpoint's raw table only; never touches any other raw
-               table. Safe/idempotent to repeat for the same --run-id.
-  sync         extract, then load, the same run, for one --endpoint;
-               stops immediately (nonzero exit, no load attempted) if
-               extraction fails
+  extract      paginated extraction (see pagination.py,
+               docs/SOURCE_CONTRACT.md "Pagination") for exactly one
+               --endpoint, optionally starting from --since (an explicit
+               override) or, if --since is omitted, the endpoint's
+               currently committed high-water mark (one short read-only
+               database lookup -- see cli._resolve_since). Requests one
+               page at a time, validates every response envelope, and
+               publishes every page as an immutable, checksummed,
+               gzip-compressed JSONL file under a fresh run_id. Never
+               writes to the database and never advances the durable
+               watermark itself -- that only ever happens transactionally
+               inside `load`/`sync`.
+  load         verify (independently re-checksummed/re-counted) and load
+               a previously extracted, published run (--run-id,
+               required) into that one endpoint's raw table only --
+               idempotent to repeat for the same --run-id. Reconciles
+               source/file/database counts and, only after every check
+               passes, atomically commits the endpoint's new high-water
+               mark in the same transaction as the data load.
+  sync         obtains the endpoint's last committed high-water mark (or
+               an explicit --since override), extracts from that point,
+               then loads the resulting run -- stopping immediately
+               (nonzero exit, load never attempted) if extraction fails,
+               and never reporting success after a partial failure.
   load-raw     load-raw *legacy* full-manifest snapshot (all three raw
-               tables in one manifest -- the pre-existing `extract`/
-               `run` flow with no --endpoint) into the raw schema
-               (default: current). Kept as a documented, tested,
-               backward-compatible command -- not superseded by `load`,
-               which only ever resolves an endpoint-scoped `extract`
-               run.
+               tables in one manifest -- the original `extract`/`run`
+               flow) into the raw schema (default: current). Kept as a
+               documented, tested, backward-compatible command; uses the
+               legacy CSV/manifest contract in docs/API_MANIFEST.md, not
+               the paginated contract `extract`/`load`/`sync` use today.
   migrate      apply pending operational migrations, or print status with --status
   dbt          run `dbt` against this project with the connector's vars/target wired in
   run          full legacy pipeline: extract (full manifest, all three
@@ -28,8 +41,8 @@ Subcommands:
   healthcheck  verify DB connectivity, migration state, and run freshness
 
 Every subcommand loads only the IngestConfig fields it actually needs
-(see config.REQUIRE_*), so e.g. `tuva-ingest migrate` never requires
-TUVA_API_TOKEN to be set.
+(see config.REQUIRE_*), so e.g. `tuva-ingest migrate` never requires an
+API credential to be resolvable.
 
 Exit codes: 0 on success, 1 for any handled `ConnectorError` (a clean,
 sanitized, single-line error to stderr -- see logging_utils.sanitize_error),
@@ -57,8 +70,15 @@ from datetime import date
 from pathlib import Path
 
 from . import __version__
-from .config import ALL_REQUIREMENTS, REQUIRE_API, REQUIRE_DB, REQUIRE_RAW_DATA, IngestConfig
-from .errors import CliUsageError, ConnectorError, RawLoadError, RunNotFoundError
+from .config import ALL_REQUIREMENTS, REQUIRE_DB, REQUIRE_PAGINATED, REQUIRE_RAW_DATA, IngestConfig
+from .errors import (
+    CliUsageError,
+    ConnectorError,
+    RawLoadError,
+    ReconciliationError,
+    RunNotFoundError,
+    WatermarkError,
+)
 from .logging_utils import configure_logging, log_event, sanitize_error
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -91,8 +111,8 @@ def _validate_since(value: str | None) -> str | None:
     """Reject a malformed --since before any HTTP request is issued.
     Only a plain ISO-8601 calendar date (YYYY-MM-DD) is accepted --
     never a datetime, never a relative expression -- matching the
-    manifest/API query-parameter contract (see extract.extract_endpoint_snapshot,
-    docs/API_MANIFEST.md)."""
+    paginated page-request query-parameter contract (see
+    pagination.extract_paginated_run, docs/SOURCE_CONTRACT.md)."""
     if value is None:
         return None
     try:
@@ -105,11 +125,11 @@ def _validate_since(value: str | None) -> str | None:
 # --- extract / load / sync (endpoint-scoped) --------------------------------
 
 
-def _build_api_client(config: IngestConfig, logger, *, run_id: str | None = None):
+def _build_api_client(config: IngestConfig, logger, *, token: str | None, run_id: str | None = None):
     from .api_client import ApiClient
 
     return ApiClient(
-        token=config.api_token_value or "",
+        token=token or "",
         timeout=config.httpx_timeout(),
         max_retries=config.api_max_retries,
         max_retry_delay_seconds=config.api_max_retry_delay_seconds,
@@ -118,18 +138,44 @@ def _build_api_client(config: IngestConfig, logger, *, run_id: str | None = None
     )
 
 
+def _resolve_since(config: IngestConfig, *, endpoint: str, since_override: str | None) -> str | None:
+    """An explicit `--since` always overrides the stored watermark for
+    *this extraction's request* -- but never permanently lowers the
+    durable watermark itself (see `_run_paginated_load`'s backward-
+    movement guard, which applies uniformly regardless of why a
+    candidate happens to be behind the current value). When `--since` is
+    omitted, the endpoint's last committed high-water mark is used, so a
+    plain `extract`/`sync` naturally continues from where the previous
+    successful run left off."""
+    from . import state
+    from .db import connect
+
+    if since_override is not None:
+        return since_override
+    conn = connect(config.pg_dsn_value)
+    try:
+        prior = state.get_watermark(conn, config.ops_schema, config.source_name, endpoint)
+    finally:
+        conn.close()
+    return prior["high_water_mark"] if prior else None
+
+
 def _cmd_extract(args: argparse.Namespace) -> int:
-    from .extract import extract_endpoint_snapshot
+    from .pagination import extract_paginated_run
+    from .secrets import retrieve_api_credential
 
     endpoint = _validate_endpoint(args.endpoint)
-    since = _validate_since(args.since)
+    since_override = _validate_since(args.since)
 
-    config = IngestConfig.load(required=REQUIRE_API | REQUIRE_RAW_DATA)
+    config = IngestConfig.load(required=REQUIRE_PAGINATED)
     logger = configure_logging(config.log_level)
 
-    client = _build_api_client(config, logger)
+    since = _resolve_since(config, endpoint=endpoint, since_override=since_override)
+    credential = retrieve_api_credential(config, logger=logger)
+
+    client = _build_api_client(config, logger, token=credential.api_token_value)
     try:
-        result = extract_endpoint_snapshot(config, client, logger, endpoint=endpoint, since=since)
+        result = extract_paginated_run(config, client, logger, endpoint=endpoint, since=since)
     finally:
         client.close()
 
@@ -142,49 +188,52 @@ def _cmd_extract(args: argparse.Namespace) -> int:
             "since": result.since,
             "status": "skipped" if result.skipped else "succeeded",
             "path": str(result.path),
+            "page_count": result.page_count,
+            "record_count": result.total_record_count,
+            "candidate_high_water_mark": result.candidate_high_water_mark,
         }
     )
     return 0
 
 
-def _run_load(run_id: str, *, config: IngestConfig, logger) -> dict:
-    """Resolve `run_id` to the exact published, endpoint-scoped extraction
-    it names, verify its success marker and checksums, and transactionally
-    load only that one endpoint's raw table -- never any other raw table
-    (see raw_loader.load_single_endpoint_snapshot). Safe/deterministic to
-    call again for the same `run_id` (see state.upsert_running_run/
-    state.upsert_table_load_pending).
+def _run_paginated_load(run_id: str, *, config: IngestConfig, logger) -> dict:
+    """Resolve `run_id` to a published paginated extraction, independently
+    re-verify every page's checksum and record count, then
+    transactionally load only that one endpoint's raw table, reconcile
+    counts, and -- only after every check passes -- commit the endpoint's
+    new high-water mark in the same transaction as the data load.
 
     Returns a JSON-able result dict on success. Raises a `ConnectorError`
-    subclass (`RunNotFoundError`, `RawLoadError`, ...) on any failure --
-    callers (both `_cmd_load` and `_cmd_sync`) let `main()` translate that
-    into a single sanitized stderr line and exit code 1, so `sync` can
-    never report success after a partial failure, and a caller never sees
-    a JSON "success" result for a run that actually failed.
+    subclass (`RunNotFoundError`, `ReconciliationError`, `RawLoadError`,
+    `WatermarkError`, ...) on any failure; callers (`_cmd_load` and
+    `_cmd_sync`) let `main()` translate that into a single sanitized
+    stderr line and exit code 1 -- the watermark is never committed, and
+    the transaction is always rolled back, on any failure path.
     """
-    from . import raw_loader, state
+    from . import state
     from .db import connect
     from .endpoints import table_for_endpoint
-    from .extract import RawSnapshotStore
+    from .pagination import PaginatedRunStore
+    from .paginated_loader import load_paginated_run, loaded_row_count, verify_run_manifest
 
-    store = RawSnapshotStore(config.raw_data_dir, config.source_name)
+    store = PaginatedRunStore(config.raw_data_dir, config.source_name)
     if not store.is_published(run_id):
         raise RunNotFoundError(
-            f"run_id {run_id!r} does not resolve to a published extraction under "
-            f"{store.snapshot_dir(run_id)} (missing _SUCCESS marker) -- run `tuva-ingest extract` first"
+            f"run_id {run_id!r} does not resolve to a published paginated extraction under "
+            f"{store.run_dir(run_id)} (missing _SUCCESS marker) -- run `tuva-ingest extract` first"
         )
 
-    manifest = store.read_manifest(run_id)
-    checksums = store.read_checksums(run_id)
-    endpoint = manifest.get("_requested_endpoint")
-    since = manifest.get("_requested_since")
-    if endpoint is None:
-        raise RunNotFoundError(
-            f"run_id {run_id!r} is a legacy full-manifest snapshot (published by `extract` with no "
-            "--endpoint, or by `run`) -- use `tuva-ingest load-raw --snapshot-id ...` for it instead"
-        )
+    # Independently re-verify every page's checksum and decompressed
+    # record count against the manifest before touching the database --
+    # never trust the manifest's own numbers blindly (defense against
+    # on-disk corruption/tampering between extract and load).
+    manifest = verify_run_manifest(store, run_id)
+    endpoint = manifest["endpoint"]
     table = table_for_endpoint(endpoint)
-    snapshot_dir = store.snapshot_dir(run_id)
+    since = manifest.get("since")
+    candidate_hwm = manifest["candidate_high_water_mark"]
+    total_record_count = manifest["total_record_count"]
+    total_compressed_bytes = sum(p["compressed_size_bytes"] for p in manifest["pages"])
 
     conn = connect(config.pg_dsn_value)
     try:
@@ -193,28 +242,66 @@ def _run_load(run_id: str, *, config: IngestConfig, logger) -> dict:
             endpoint=endpoint, requested_since=since, environment=config.pipeline_environment,
             app_version=__version__, host=_run_host_identity(),
         )
-        table_checksum = checksums.get(table, {})
+        # table_loads' expected_sha256/expected_size_bytes columns assume
+        # one file per table (the legacy CSV contract's shape) -- a
+        # paginated run has many page files, so there is no single
+        # checksum to record here; the real, independent verification
+        # already happened above (verify_run_manifest), per-page. The
+        # aggregate compressed byte total is still meaningful and is
+        # recorded for operator visibility.
         state.upsert_table_load_pending(
             conn, config.ops_schema, run_id, table=table,
-            expected_sha256=table_checksum.get("sha256", ""), expected_size_bytes=table_checksum.get("size_bytes", 0),
+            expected_sha256="", expected_size_bytes=total_compressed_bytes,
         )
 
         try:
-            row_count = raw_loader.load_single_endpoint_snapshot(conn, config, snapshot_dir, run_id, table, checksums)
-        except RawLoadError as exc:
+            prior = state.get_watermark(conn, config.ops_schema, config.source_name, endpoint)
+            if prior and prior["high_water_mark"] is not None and candidate_hwm < prior["high_water_mark"]:
+                raise WatermarkError(
+                    f"candidate high_water_mark {candidate_hwm!r} for endpoint {endpoint!r} would move "
+                    f"the committed watermark backward from {prior['high_water_mark']!r} -- refusing to "
+                    "commit (see docs/SOURCE_CONTRACT.md 'Watermark backward-movement guard')"
+                )
+
+            load_paginated_run(conn, config, store, run_id, manifest)
+            actual_loaded = loaded_row_count(conn, config.raw_schema, table, run_id)
+            log_event(
+                logger, "raw_load_completed", run_id=run_id, endpoint=endpoint, table=table,
+                row_count=actual_loaded,
+            )
+            if actual_loaded != total_record_count:
+                raise ReconciliationError(
+                    f"run {run_id!r}: loaded row count ({actual_loaded}) does not equal the manifest's "
+                    f"total_record_count ({total_record_count})"
+                )
+            log_event(
+                logger, "reconciliation_completed", run_id=run_id, endpoint=endpoint,
+                record_count=total_record_count,
+            )
+        except (RawLoadError, ReconciliationError, WatermarkError) as exc:
             conn.rollback()
-            state.mark_failed(conn, config.ops_schema, run_id, stage="load", error_category="raw_load", error_message=str(exc))
+            category = getattr(exc, "category", "raw_load")
+            state.mark_failed(conn, config.ops_schema, run_id, stage="load", error_category=category, error_message=str(exc))
             state.mark_table_load_failed(conn, config.ops_schema, run_id, table, error_message=str(exc))
+            log_event(logger, "run_failed", run_id=run_id, endpoint=endpoint, error_category=category, error_message=str(exc))
             raise
 
         state.mark_table_load_succeeded(
-            conn, config.ops_schema, run_id, table, row_count=row_count,
-            actual_sha256=table_checksum.get("sha256", ""), actual_size_bytes=table_checksum.get("size_bytes", 0),
+            conn, config.ops_schema, run_id, table, row_count=actual_loaded, actual_sha256="",
+            actual_size_bytes=total_compressed_bytes,
         )
+        # The watermark commit and the data load share this one
+        # transaction -- both, or neither, become visible at conn.commit()
+        # below. This must be the last write before commit.
+        state.commit_watermark(
+            conn, config.ops_schema, config.source_name, endpoint,
+            high_water_mark=candidate_hwm, successful_run_id=run_id,
+        )
+        state.mark_succeeded(conn, config.ops_schema, run_id, rows_loaded={table: actual_loaded}, tables_loaded=[table])
         conn.commit()
-        state.mark_succeeded(conn, config.ops_schema, run_id, rows_loaded={table: row_count}, tables_loaded=[table])
 
-        log_event(logger, "raw_table_loaded", run_id=run_id, endpoint=endpoint, table=table, row_count=row_count)
+        log_event(logger, "watermark_committed", run_id=run_id, endpoint=endpoint, high_water_mark=candidate_hwm)
+        log_event(logger, "run_succeeded", run_id=run_id, endpoint=endpoint)
         return {
             "event": "load",
             "run_id": run_id,
@@ -222,8 +309,9 @@ def _run_load(run_id: str, *, config: IngestConfig, logger) -> dict:
             "table": table,
             "since": since,
             "status": "succeeded",
-            "row_count": row_count,
-            "path": str(snapshot_dir),
+            "row_count": actual_loaded,
+            "path": str(store.run_dir(run_id)),
+            "high_water_mark": candidate_hwm,
         }
     finally:
         conn.close()
@@ -232,31 +320,36 @@ def _run_load(run_id: str, *, config: IngestConfig, logger) -> dict:
 def _cmd_load(args: argparse.Namespace) -> int:
     config = IngestConfig.load(required=REQUIRE_DB | REQUIRE_RAW_DATA)
     logger = configure_logging(config.log_level)
-    result = _run_load(args.run_id, config=config, logger=logger)
+    result = _run_paginated_load(args.run_id, config=config, logger=logger)
     _print_json(result)
     return 0
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
-    from .extract import extract_endpoint_snapshot
+    from .pagination import extract_paginated_run
+    from .secrets import retrieve_api_credential
 
     endpoint = _validate_endpoint(args.endpoint)
-    since = _validate_since(args.since)
+    since_override = _validate_since(args.since)
 
-    config = IngestConfig.load(required=ALL_REQUIREMENTS)
+    config = IngestConfig.load(required=REQUIRE_PAGINATED)
     logger = configure_logging(config.log_level)
+
+    since = _resolve_since(config, endpoint=endpoint, since_override=since_override)
+    credential = retrieve_api_credential(config, logger=logger)
 
     # Extraction failure must stop the pipeline immediately -- any
     # exception here propagates straight out of _cmd_sync (never
     # caught/swallowed), so main() reports it as a sanitized, nonzero-exit
-    # error and `_run_load` below is never reached.
-    client = _build_api_client(config, logger)
+    # error and `_run_paginated_load` below is never reached, and no
+    # watermark is ever committed.
+    client = _build_api_client(config, logger, token=credential.api_token_value)
     try:
-        extracted = extract_endpoint_snapshot(config, client, logger, endpoint=endpoint, since=since)
+        extracted = extract_paginated_run(config, client, logger, endpoint=endpoint, since=since)
     finally:
         client.close()
 
-    load_result = _run_load(extracted.run_id, config=config, logger=logger)
+    load_result = _run_paginated_load(extracted.run_id, config=config, logger=logger)
 
     log_event(logger, "sync_succeeded", run_id=extracted.run_id, endpoint=endpoint, table=extracted.table)
     _print_json(
@@ -269,6 +362,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             "status": "succeeded",
             "row_count": load_result.get("row_count"),
             "path": str(extracted.path),
+            "high_water_mark": load_result.get("high_water_mark"),
         }
     )
     return 0
@@ -399,7 +493,7 @@ def _cmd_run(_args: argparse.Namespace) -> int:
             environment=config.pipeline_environment, app_version=__version__, host=_run_host_identity(),
         )
 
-        client = _build_api_client(config, logger, run_id=run_id)
+        client = _build_api_client(config, logger, token=config.api_token_value, run_id=run_id)
         try:
             state.update_stage(conn, config.ops_schema, run_id, "extract")
             extracted = extract_snapshot(config, client, logger)

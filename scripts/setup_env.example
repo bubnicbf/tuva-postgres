@@ -17,10 +17,17 @@ export INGEST_ROLE="tuva_ingest_role"
 export TRANSFORM_ROLE="tuva_transform_role"
 
 # --- Ingestion API (leave unset for migrate/healthcheck-only workflows) --
-# TUVA_API_MANIFEST_URL must resolve a manifest for exactly one endpoint
-# per request -- `extract`/`sync` call it with `?endpoint=<name>` (and
-# `&since=<date>` when --since is given), see docs/API_MANIFEST.md.
+# TUVA_API_MANIFEST_URL is the page-request URL for `extract`/`sync`
+# (paginated JSON contract, see docs/SOURCE_CONTRACT.md "Pagination") --
+# requested with `?endpoint=<name>` (`&since=<date>` when resolved, and
+# `&page_token=...`/`&page_size=...` as pagination proceeds). The legacy
+# `run`/`load-raw` full-manifest CSV contract (docs/API_MANIFEST.md)
+# reuses this same URL, unparameterized.
 export TUVA_API_MANIFEST_URL=""
+# TUVA_API_TOKEN is read directly ONLY when TUVA_API_SECRET_PROVIDER=env
+# (the default -- see below). With TUVA_API_SECRET_PROVIDER=aws, leave
+# this unset; the credential is retrieved at runtime from AWS Secrets
+# Manager instead (src/tuva_ingest/secrets.py).
 export TUVA_API_TOKEN=""
 # TUVA_API_TIMEOUT_SECONDS is the fallback for every httpx timeout phase
 # (connect/read/write/pool) -- set the phase-specific variables below
@@ -37,6 +44,28 @@ export TUVA_API_MAX_RETRIES="5"
 # never honored as-is.
 export TUVA_API_MAX_RETRY_DELAY_SECONDS="30"
 export TUVA_API_ALLOW_INSECURE_HTTP="0"
+
+# --- Cloud secret manager (src/tuva_ingest/secrets.py) ------------------
+# "env" (default): read TUVA_API_TOKEN above directly -- every existing
+#   local-dev/CI/test workflow keeps working unchanged.
+# "aws": retrieve the credential from AWS Secrets Manager at runtime,
+#   using ambient identity only (an IAM role, an assumed role,
+#   AWS_PROFILE, or a local developer profile) -- never a static access
+#   key configured here. Requires TUVA_API_SECRET_ID. Expected secret
+#   JSON shape: {"api_token": "<the bearer token>"}.
+export TUVA_API_SECRET_PROVIDER="env"
+export TUVA_API_SECRET_ID=""
+export AWS_REGION=""
+
+# --- Paginated extraction (src/tuva_ingest/pagination.py) ---------------
+# TUVA_API_PAGE_SIZE is optional -- omit to let the source pick its own
+# default page size; when set, sent as the `page_size` query parameter.
+export TUVA_API_PAGE_SIZE=""
+# Hard ceiling on pagination loop iterations -- the final defense against
+# an infinite pagination loop.
+export TUVA_API_MAX_PAGES="10000"
+# Per-page response size ceiling, in bytes.
+export TUVA_API_MAX_PAGE_BYTES="67108864"
 
 # --- Extraction / raw snapshots ---------------------------------------
 export RAW_DATA_DIR="data/raw"

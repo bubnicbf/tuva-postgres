@@ -53,7 +53,7 @@ confirmation are marked **Repository-derived assumption**.
 - Required headers: **Verified.** `Authorization`, `User-Agent: tuva-ingest/{__version__}`, `Accept: application/json, text/csv;q=0.9, */*;q=0.1` (`api_client.py`).
 - Scopes, token endpoint, signing rules: **Unverified.** No OAuth flow, token endpoint, or request signing exists in the code -- the token is a pre-issued opaque bearer credential supplied via environment variable. **Decision/gap:** a vendor that requires OAuth client-credentials with expiring tokens is not yet supported; `ApiClient` has no refresh capability today.
 - Token lifetime: **Unverified.**
-- Secret management: **Verified.** `TUVA_API_TOKEN` is read only from the process environment (`config.py`); `.env` is git-ignored (`.gitignore`); `IngestConfig.safe_dict()`/`__repr__` redact it as `"***REDACTED***"`; `docs/RUNBOOK.md` "Security notes" documents rotation via `.env`/secret store with no code change required.
+- Secret management: **Verified.** For the paginated `extract`/`load`/`sync` commands, the credential is retrieved at runtime from a configured secret provider (`src/tuva_ingest/secrets.py`), never read from a plaintext `.env` value directly except through the `"env"` provider (the default, kept for full backward compatibility -- it reads `TUVA_API_TOKEN`, same as before). The `"aws"` provider retrieves the credential from AWS Secrets Manager via `boto3`, authenticating with ambient identity only (an IAM role, an assumed role, `AWS_PROFILE`, or a local developer profile) -- this connector never accepts or configures a static AWS access key. The secret is retrieved exactly once per process/run, never once per page, and never written to disk. `TUVA_API_SECRET_PROVIDER`/`TUVA_API_SECRET_ID`/`AWS_REGION` are non-secret lookup information only (`scripts/setup_env.example`). The legacy `run`/`load-raw` commands still read `TUVA_API_TOKEN` directly via `config.api_token_value` (unchanged). `.env` is git-ignored (`.gitignore`); `IngestConfig.safe_dict()`/`__repr__` redact `api_token`/`pg_dsn` as `"***REDACTED***"`; `secrets.ApiCredential.api_token` is a `pydantic.SecretStr`, never a bare `str`, so it can never leak through an accidental `print()`/log call either. `docs/RUNBOOK.md` "Security notes" documents rotation via `.env`/secret store with no code change required.
 - Secrets and PHI must never be committed to this repository. Examples below are redacted placeholders only, consistent with `scripts/setup_env.example`'s empty-string convention -- no real token, DSN, or patient data appears in this document.
 
 Redacted example (never a real value):
@@ -65,10 +65,11 @@ export TUVA_API_TOKEN="<redacted>"
 
 ## 3. Endpoints and expected record grain
 
-Two endpoint *shapes*, not fixed paths (**Verified**, `api_client.py` / `manifest.py`):
+Three endpoint *shapes*, not fixed paths (**Verified**, `api_client.py` / `manifest.py` / `pagination.py`):
 
-1. `GET {TUVA_API_MANIFEST_URL}` -- returns the manifest JSON document (see `docs/API_MANIFEST.md` "Shape", reproduced below). Purpose: enumerate one snapshot's per-table CSV artifacts and their checksums. Grain: one document per snapshot, not itself record-grained.
-2. `GET {artifact.url}` (one per table, URL supplied inside the manifest, never a fixed path) -- returns one complete CSV file for that table. Purpose: full extract of one raw table's current complete contents.
+1. `GET {TUVA_API_MANIFEST_URL}?endpoint=<name>&since=<watermark>&page_token=<token>&page_size=<n>` -- the paginated JSON page request (see Section 4 below). Purpose: incrementally extract one endpoint's records, one page at a time. Grain: one JSON object (a page of records plus metadata) per request; this is the mechanism `extract`/`load`/`sync` use today.
+2. `GET {TUVA_API_MANIFEST_URL}` (legacy, no query parameters) -- returns the full manifest JSON document (see `docs/API_MANIFEST.md` "Shape", reproduced below). Purpose: enumerate one snapshot's per-table CSV artifacts and their checksums. Grain: one document per snapshot, not itself record-grained. Still used by `run`/`load-raw`.
+3. `GET {artifact.url}` (one per table, URL supplied inside the legacy manifest, never a fixed path) -- returns one complete CSV file for that table. Purpose: full extract of one raw table's current complete contents (legacy contract only).
 
 ```json
 {
@@ -101,13 +102,28 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
 
 ## 4. Pagination
 
-- Verified mechanism: **none.** This connector does not paginate. Each artifact URL returns one complete CSV file per table per snapshot; `ApiClient.download_artifact` streams the entire response body. No page/cursor/offset parameter or `Link` header handling exists in `api_client.py` or `manifest.py`.
-- Request parameters / response fields: not applicable.
-- Termination condition: **Verified.** End of the streamed HTTP response body, with a hard safety ceiling: `DEFAULT_MAX_ARTIFACT_BYTES` (5 GiB) and `size_limit = min(max_artifact_bytes, max(declared_size * 2, 1024))` abort an oversized or runaway response before it exhausts memory or disk (`api_client.py`).
-- Ordering guarantees: **Unverified.** CSV row order is whatever the source emits. `_source_row_number` (`raw_loader.py`) is assigned sequentially at load time as a within-file position marker only, not a vendor-guaranteed sort order.
-- Token expiry / safe restart: not applicable to pagination; see Section 7 for this design's snapshot-level analogue.
-- Duplicate/missing records across boundaries: not applicable -- there are no pages. A whole raw table is replaced by `TRUNCATE` + `COPY` per snapshot (`raw_loader.load_table`), so partial or duplicated rows cannot straddle a boundary by construction.
-- **Decision, restated in Readiness:** if a real, eventually-connected vendor's actual API is paginated (e.g. a JSON REST API rather than bulk CSV), this section and the underlying client must be revised together before extraction against that vendor is considered ready.
+- Mechanism: **Verified.** `extract`/`load`/`sync` (the current, primary extraction path) request one JSON page at a time from `TUVA_API_MANIFEST_URL` (reused as the page-request URL) and continue via `next_page_token` until the source explicitly signals completion (`src/tuva_ingest/pagination.py`). The legacy `run`/`load-raw` full-manifest CSV path (Sections above/`docs/API_MANIFEST.md`) genuinely does not paginate -- one complete CSV file per table per snapshot -- and both mechanisms coexist unchanged in this codebase (see README.md "Backward compatibility").
+- Response envelope (**Decision** -- this repository does not integrate a specific named vendor, so these are this connector's own fixed, documented field names, chosen here since none were established elsewhere):
+
+  ```json
+  {
+    "records": [{"...": "..."}],
+    "metadata": {
+      "record_count": 1,
+      "page_token": "eyJvZmZzZXQiOjB9",
+      "next_page_token": "eyJvZmZzZXQiOjEwfQ==",
+      "high_water_mark": "2025-06-01T00:00:00Z"
+    }
+  }
+  ```
+
+- Request parameters: **Verified.** `endpoint`, `since` (the prior committed watermark, or an explicit `--since` override), `page_token`, and `page_size` (`TUVA_API_PAGE_SIZE`, optional) are always sent as real httpx query parameters (`ApiClient.get_json_page`), never concatenated into the URL (`pagination.extract_paginated_run`).
+- Response fields: **Verified**, validated before anything is written to disk (`pagination.validate_page_envelope`): `records` must be a JSON array of JSON objects; `metadata.record_count` must be a non-negative integer equal to the actual number of records; a returned `metadata.page_token` (when present) must match the requested token; `metadata.next_page_token` is null/absent only on the final page and, when present, must be a non-empty string; `metadata.high_water_mark` is required and must be a non-empty string.
+- Termination condition: **Verified.** `metadata.next_page_token` being null or absent. A hard safety ceiling (`TUVA_API_MAX_PAGES`, default 10,000) additionally aborts pagination that never terminates, and every requested/returned token is tracked for the run's lifetime so a repeated token (a pagination cycle) fails loudly (`PaginationError`) rather than looping forever (`pagination.py`).
+- Ordering guarantees: **Unverified.** The paginated contract's within-page record order, and whether pages themselves are guaranteed non-overlapping/gap-free by any real, eventually-connected vendor, are not established anywhere in this repository -- this connector requests pages strictly in the order the source's own `next_page_token` chain dictates and never reorders or re-sorts records itself.
+- Token expiry / safe restart: **Unverified** for a real vendor (whether a `page_token`/`next_page_token` value expires, and after how long). This connector holds no long-lived pagination state across process restarts -- a killed/restarted `extract` simply starts a fresh run from page 1 using the current watermark; a `load`/`sync` failure never leaves an inconsistent watermark (Section 14 below; `state.get_watermark`/`commit_watermark`).
+- Duplicate/missing records across boundaries: **Decision.** Loading is idempotent per run (`_snapshot_id`, `_source_row_number` unique index -- `migrations/005_paginated_extraction_state.sql`), so repeating a load never duplicates rows within one run; whether a real vendor's own pagination can itself produce duplicate or missing records across two different runs' page boundaries (e.g. under concurrent writes on the source side) is **Unverified**, restated in Readiness.
+- **Decision, restated in Readiness:** the specific real vendor eventually connected must be confirmed to implement this exact minimal envelope (or this section, `pagination.py`, and `docs/API_MANIFEST.md` must be revised together) before extraction against that vendor is considered ready.
 
 ## 5. Rate limits and retry behavior
 
@@ -123,12 +139,14 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
 
 ## 6. Incremental extraction field
 
-**Verified:** this connector does not perform field-based incremental/delta extraction. Every `extract` run fetches the manifest's current full state and (unless byte-identical to the already-published snapshot for that `snapshot_id`) downloads complete, full-population CSV artifacts for all three raw tables (`extract.extract_snapshot`; `raw_loader.py`'s `TRUNCATE` + `COPY` per table per run).
+**Verified:** the paginated `extract`/`load`/`sync` path performs true incremental extraction, keyed by an opaque, source-supplied **high-water mark** -- not a connector-chosen field name/column. Every page response's `metadata.high_water_mark` is a candidate value for the *next* incremental run; this connector never inspects, types, or filters by any specific row-level field itself (e.g. no hardcoded `updated_at` column) -- the source alone decides what "since `X`" means and returns accordingly (`pagination.py`, `docs/SOURCE_CONTRACT.md` Section 4). The legacy `run`/`load-raw` full-manifest path (Section 4) remains snapshot-level, non-incremental, and unchanged.
 
-- Cursor field, data type, precision, timezone, ordering, nullability, inclusive/exclusive filtering, tie-breaking: not applicable. **Decision, not a gap:** no `updated_at`/service-date filter parameter is ever sent to the source. "Incremental-ness" is expressed at the snapshot level (`snapshot_id`, `created_at`), never at the row level.
-- Overlap/lookback window: not applicable at the row level. At the snapshot level, none is configured -- each run either idempotently skips (identical `snapshot_id` and content already published) or fully replaces (`extract.check_idempotent_or_conflicting`).
-- Watermark persistence and restart: **Verified.** The watermark is `RawSnapshotStore.current_snapshot_id()` (a text file at `RAW_DATA_DIR/{source}/current`) plus `ingest_ops.ingestion_runs.snapshot_id`. Restart safety is snapshot-level idempotency: same `snapshot_id` + same content is a no-op; same `snapshot_id` + different content is a loud `ExtractError`, never a silent overwrite.
-- Why this captures corrections and late-arriving changes: **Decision/assumption.** Full-snapshot replacement inherently captures any correction the vendor has already applied to its own current state as of `created_at`, at the cost of no row-level change history and no way to determine from the wire format alone which rows changed between two snapshots. This is an explicit trade-off; see Section 7.
+- Cursor field, data type, precision, timezone, ordering, nullability, inclusive/exclusive filtering, tie-breaking: **Unverified** for a real vendor -- the minimal contract treats `high_water_mark`/`since` as an opaque string this connector never parses or types itself (`pagination.validate_page_envelope` requires only "non-empty string"). **Decision:** the backward-movement guard (below) assumes `high_water_mark` values are lexicographically sortable (e.g. ISO-8601 UTC timestamps, or monotonically increasing opaque tokens) -- a real vendor whose values are not lexicographically orderable would need this section and `cli._run_paginated_load`'s comparison revised together.
+- `--since` override: **Verified.** An operator-supplied `--since` overrides the *request* for one extraction (`cli._resolve_since`), but never permanently lowers the durable watermark -- the same backward-movement guard applies uniformly regardless of why a candidate value happens to be behind the currently committed one (see Section 14).
+- Multiple candidate watermarks within one run: **Decision.** When a run spans several pages, each may report its own candidate `high_water_mark`; this connector selects the **last page's** value deterministically (`pagination.extract_paginated_run`), because pages are fetched strictly in the order the source's own `next_page_token` chain dictates, so the final page necessarily reflects the most complete traversal of that run's result set.
+- Overlap/lookback window: **Unverified** for a real vendor (whether "since `X`" is inclusive/exclusive, or how far back a fresh backfill can safely reach) -- not established anywhere in this repository today.
+- Watermark persistence and restart: **Verified.** The durable watermark is `ingest_ops.source_watermarks` (`migrations/005_paginated_extraction_state.sql`), keyed by `(source, endpoint)`, and is only ever advanced transactionally -- in the same commit as the data load, after every reconciliation count matches (`state.commit_watermark`, `cli._run_paginated_load`; see Section 14). It is never advanced during extraction itself. The legacy snapshot-level watermark (`RawSnapshotStore.current_snapshot_id()`) is unchanged and still governs `run`/`load-raw` only.
+- Why this captures corrections and late-arriving changes: **Unverified** for a real vendor -- whether "since `X`" reliably re-surfaces a corrected/late-arriving record depends entirely on how the (not-yet-connected) vendor implements its own watermark semantics; this connector has no way to confirm that from the wire contract alone.
 
 ## 7. Historical mutability
 
@@ -186,28 +204,30 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
 
 ## 14. Reconciliation totals
 
-- Vendor-provided totals: **Verified absent** from the current wire contract. The manifest (`manifest.py`) provides only `sha256` and `size_bytes` per artifact -- no vendor-supplied record count, claim count, line count, or billed/paid/denied amount total appears anywhere in `docs/API_MANIFEST.md`'s shape.
-- Compensating controls actually implemented (**Verified**):
-  - Per-artifact SHA-256 and byte-count verification at download time (`ApiClient.download_artifact`) and again at raw-load time (`raw_loader.verify_file_checksum`) -- detects corruption/tampering, not business-total correctness.
-  - Per-table row counts recorded at load time: `ingest_ops.table_loads.row_count` (`migrations/002_ingestion_control.sql`; `state.mark_table_load_succeeded`), aggregated per run into `ingest_ops.ingestion_runs.rows_loaded` (a JSON object such as `{"eligibility": 1000, "medical_claim": 5000, "pharmacy_claim": 2000}`, `state.mark_succeeded`).
-  - `state.table_load_row_counts()` lets an operator or test confirm every expected raw table was actually loaded for a given run, not just that the run's overall status is `succeeded`.
-- Comparison tolerances, frequency, alert thresholds, investigation procedure: **Unverified.** None are defined in this repository; row counts are recorded but nothing currently compares them run-over-run or alerts on an unexpected swing.
-- **Blocking note:** without vendor-provided totals, business-level reconciliation (for example, "did we receive every claim the payer sent this period") cannot be confirmed by this connector alone -- only structural/technical completeness (checksums plus row counts) is currently verifiable.
+- Vendor-provided totals: **Verified absent** from both wire contracts. Neither the legacy manifest (`manifest.py`, only `sha256`/`size_bytes` per artifact) nor the paginated envelope (`pagination.py`, only a per-page `record_count`) carries a vendor-supplied *aggregate* record count, claim count, line count, or billed/paid/denied amount total for a whole run.
+- Compensating controls actually implemented for the paginated contract (**Verified**, `paginated_loader.py`/`cli._run_paginated_load`), all three enforced as part of one transactional load, any mismatch failing the whole run:
+  1. Each page's `metadata.record_count` is checked against its actual decompressed JSONL line count, independently re-verified at load time (`paginated_loader.verify_run_manifest`) -- not just trusted from the manifest written at extract time.
+  2. The sum of every page's `record_count` is checked against the run manifest's own `total_record_count` (`verify_run_manifest`).
+  3. The number of raw rows actually present in the database for the run (`paginated_loader.loaded_row_count`, a fresh `COUNT(*) WHERE _snapshot_id = run_id` -- correct whether this is the first load or an idempotent repeat) is checked against that same `total_record_count` (`cli._run_paginated_load`).
+  Any of the three mismatching raises `ReconciliationError`, rolls back the whole transaction, and never commits the watermark (Section 6) -- see `run_failed`/`reconciliation_completed` structured log events.
+- Compensating controls for the legacy full-manifest contract (**Verified**, unchanged): per-artifact SHA-256/byte-count verification (`ApiClient.download_artifact`, `raw_loader.verify_file_checksum`) and per-table row counts (`ingest_ops.table_loads.row_count`, `state.table_load_row_counts()`).
+- Comparison tolerances, frequency, alert thresholds, investigation procedure: **Unverified.** None are defined in this repository for either contract; counts are recorded/reconciled per run but nothing currently compares them run-over-run or alerts on an unexpected swing.
+- **Blocking note:** without vendor-provided *business* totals (as opposed to this connector's own structural/technical reconciliation above), whether "did we receive every claim the payer sent this period" holds cannot be confirmed by this connector alone -- only structural/technical completeness (checksums, per-page/per-run/per-database record counts) is currently verifiable.
 
 ## Readiness
 
-Extraction **may proceed** for the generic, already-implemented manifest/snapshot mechanism itself -- the wire protocol (Sections 1-4), the retry policy (Section 5), the composite dedup-key strategy (Section 11), and the conservative PHI handling (Section 13) are already built and tested (`api_client.py`, `manifest.py`, `extract.py`, `raw_loader.py`, plus `tests/unit/` and `tests/integration/`).
+Extraction **may proceed** for the generic, already-implemented mechanisms themselves -- both the paginated JSON envelope/watermark/reconciliation contract (Sections 1-4, 6, 14; `secrets.py`, `pagination.py`, `paginated_loader.py`, `state.get_watermark`/`commit_watermark`) and the legacy manifest/snapshot mechanism (`api_client.py`, `manifest.py`, `extract.py`, `raw_loader.py`), plus the retry policy (Section 5), the composite dedup-key strategy (Section 11), and the conservative PHI handling (Section 13), are already built and tested (`tests/unit/`, `tests/integration/`).
 
 Extraction against a **real, specific external vendor is blocked** until all of the following are resolved for that vendor:
 
-1. Its actual base URL, authentication flow (confirm static bearer token vs. OAuth/other), and published rate limits are confirmed (Sections 1, 2, 5).
-2. Its actual CSV column layout is confirmed to supply the fields the Input Layer contract requires, and whether it carries claim-status/denial/reversal columns (Sections 3, 8).
+1. Its actual base URL, authentication flow (confirm static bearer token vs. OAuth/other; confirm the secret-manager provider and secret shape it will actually be issued through), and published rate limits are confirmed (Sections 1, 2, 5).
+2. For the paginated contract: its exact page-request/response envelope field names, page-token/watermark semantics (ordering, expiry, inclusive/exclusive `since` filtering), and typical page/backfill volume are confirmed to match Sections 4, 6, 9 -- or this connector's minimal contract, `pagination.py`, and `docs/API_MANIFEST.md`/this document are revised together first. For the legacy contract: its actual CSV column layout is confirmed to supply the fields the Input Layer contract requires, and whether it carries claim-status/denial/reversal columns (Sections 3, 8).
 3. PHI storage, encryption, access-control, and retention controls are put in place for `RAW_DATA_DIR` and the `raw`/`ingest_ops` schemas beyond database role grants -- currently unverified/absent (Section 13).
 4. A deletion/tombstone or snapshot-diff strategy is decided if any downstream consumer needs delete-detection (Section 8).
 5. Backfill volume is estimated and a batching/runtime plan is confirmed to fit operational constraints -- currently entirely unverified (Section 9).
 6. Reconciliation tolerances and alerting are defined even in the absence of vendor-provided totals (Section 14).
 
-Until items 1-6 are resolved for a specific vendor, this connector must only be pointed at a manifest-contract-compliant test or mock server (as already done in `tests/unit/` and `tests/integration/`), never at a live vendor endpoint carrying real PHI.
+Until items 1-6 are resolved for a specific vendor, this connector must only be pointed at a contract-compliant test or mock server (as already done in `tests/unit/` and `tests/integration/`), never at a live vendor endpoint carrying real PHI.
 
 ## Owner
 
@@ -215,4 +235,4 @@ This repository has no `CODEOWNERS` file or other documented team-ownership conv
 
 ## Last verified
 
-2026-08-16, against commit `5b3786a` (`feat(etl): enforce Tuva input layer contract`) -- the repository state this document was written against. Re-verify this document (and update this date) whenever `src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state}.py`, `docs/API_MANIFEST.md`, or the connected upstream source changes.
+2026-08-16, against the state of this repository after adding the paginated extraction/secret-manager/watermark mechanism (`src/tuva_ingest/{secrets,pagination,paginated_loader}.py`, `migrations/005_paginated_extraction_state.sql`). Re-verify this document (and update this date) whenever `src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state,secrets,pagination,paginated_loader}.py`, `docs/API_MANIFEST.md`, or the connected upstream source changes.

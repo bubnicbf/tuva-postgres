@@ -1,58 +1,37 @@
-# API manifest contract
+# API manifest contract (legacy full-manifest CSV path)
+
+**This document describes the legacy, full-manifest CSV contract used
+only by `tuva-ingest run`/`load-raw` today.** The current, primary
+`extract`/`load`/`sync` commands use a different, paginated JSON
+contract instead -- see `docs/SOURCE_CONTRACT.md` Section 4
+("Pagination") and `src/tuva_ingest/pagination.py` for that one. Both
+contracts are documented, tested, and supported; see README.md
+"Backward compatibility" for which commands use which.
 
 This repository does not integrate with a specific, named upstream vendor
 API. Instead, `TUVA_API_MANIFEST_URL` points at a versioned JSON document
 ("the manifest") that describes one snapshot and its per-table CSV
 artifacts. Any HTTP server -- a real vendor API, an internal file service,
-or (in tests) `httpx.MockTransport` -- can serve this contract.
+or (in tests) `httpx.MockTransport` -- can serve this contract. The same
+`TUVA_API_MANIFEST_URL` value is reused as the paginated contract's
+page-request URL (see `docs/SOURCE_CONTRACT.md`) -- both contracts
+request the one configured URL, just with different query parameters and
+different response shapes.
 
 Implemented in `src/tuva_ingest/manifest.py`; validated by
 `tests/unit/test_manifest.py`. Fetched (with bounded, tenacity-driven
 retries) by `src/tuva_ingest/api_client.py`'s `ApiClient`, built on
 `httpx`.
 
-## Endpoint-scoped requests (`extract`/`sync`)
+## The legacy, un-scoped `tuva-ingest run`/`load-raw` pipeline
 
-`tuva-ingest extract --endpoint <name> [--since <date>]` and
-`tuva-ingest sync --endpoint <name> [--since <date>]` request a manifest
-scoped to exactly **one** endpoint at a time -- never all three raw
-tables in one call. `--endpoint` and `--since` are sent as httpx query
-parameters on `TUVA_API_MANIFEST_URL` (encoded by httpx itself, never
-string-concatenated):
-
-```
-GET {TUVA_API_MANIFEST_URL}?endpoint=medical-claims&since=2025-01-01
-Authorization: Bearer {TUVA_API_TOKEN}
-```
-
-| `--endpoint` value | Raw table (see `src/tuva_ingest/endpoints.py`) |
-| --- | --- |
-| `medical-claims` | `medical_claim` |
-| `pharmacy-claims` | `pharmacy_claim` |
-| `eligibility` | `eligibility` |
-
-`--since` is an optional `YYYY-MM-DD` date, validated locally (rejected
-before any HTTP request is made if malformed) and passed straight
-through as the `since` query parameter -- this connector does not
-interpret it further; the upstream source is expected to filter/paginate
-by it.
-
-For a scoped request, the manifest response's `artifacts` list must
-contain **exactly one** entry -- for the one table `--endpoint` maps to,
-no more, no fewer (`manifest.parse_and_validate`'s `expected_tables`
-parameter enforces this; see `extract.extract_endpoint_snapshot`). The
-legacy, un-scoped `tuva-ingest run` pipeline (see README.md) still
-fetches one manifest containing all three tables' artifacts in a single
-request -- the shape below is the same either way, only the required
-`artifacts` membership differs.
-
-The published `manifest.json` for a scoped extraction additionally
-records the exact request that produced it -- `_requested_endpoint` and
-`_requested_since` -- alongside the source's own fields, so a run can be
-audited and reloaded deterministically from disk alone. These two keys
-are added by this connector after validating the source's response; they
-are never required or interpreted as part of the source's own manifest
-contract.
+`tuva-ingest run` fetches one manifest containing all three raw tables'
+artifacts in a single request, downloads and checksums each CSV
+artifact, and loads all three tables together (`extract.extract_snapshot`,
+`raw_loader.load_snapshot`). `tuva-ingest load-raw [--snapshot-id ...]`
+loads an already-published snapshot the same way. Neither command
+accepts `--endpoint`/`--since` -- see the paginated contract
+(`docs/SOURCE_CONTRACT.md`) for endpoint-scoped, incremental extraction.
 
 For the operational contract of whatever source is actually configured
 behind this wire format -- authentication, pagination, rate limits,
@@ -89,7 +68,7 @@ extraction change is considered complete (validated by
 | `source` | Nonempty string identifying the upstream source (used as the top-level directory name under `RAW_DATA_DIR`). |
 | `snapshot_id` | 1-128 chars, `[A-Za-z0-9][A-Za-z0-9_.-]*` -- must be safe to use as a filesystem directory name; no `/`, `..`, or path separators. |
 | `created_at` | ISO-8601 timestamp (`Z` or explicit offset). |
-| `artifacts` | Exactly one entry per *requested* table, no more, no fewer, no duplicates, no unknown tables. For a `--endpoint`-scoped request (see "Endpoint-scoped requests" above) that means exactly one artifact, for the one table requested; for the legacy un-scoped flow (`tuva-ingest run`), exactly one entry for every table in `manifest.RAW_TABLES` (`eligibility`, `medical_claim`, `pharmacy_claim`). |
+| `artifacts` | Exactly one entry for every table in `manifest.RAW_TABLES` (`eligibility`, `medical_claim`, `pharmacy_claim`), no more, no fewer, no duplicates, no unknown tables (`manifest.parse_and_validate`'s `expected_tables` parameter, defaulted to all three for this legacy, un-scoped flow). |
 | `artifacts[].table` | Lowercase `[a-z][a-z0-9_]*`; must be one of the three raw tables above. |
 | `artifacts[].url` | `https://` by default; `http://` is only accepted when `TUVA_API_ALLOW_INSECURE_HTTP=1` (local tests). No `..` path-traversal segments. Must have a host. |
 | `artifacts[].sha256` | Lowercase 64-character hex SHA-256 of the exact bytes the client will download. |
@@ -116,19 +95,15 @@ every problem found) before any artifact is downloaded.
    into any Tuva-managed core, terminology, or output schema; dbt (see
    `models/`) is what maps it into the Tuva Input Layer.
 
-## Run IDs and `load`/`sync`
+## Run identifiers in this legacy path
 
-A successful `extract` prints a JSON result to stdout including `run_id`
--- this connector reuses the manifest's own immutable `snapshot_id` as
-the run id (rather than minting a second identifier to keep in sync),
-since the on-disk snapshot layout is already keyed by `snapshot_id` (see
-`extract.py`'s `RawSnapshotStore`). `tuva-ingest load --run-id <value>`
-resolves that exact run directly from `RAW_DATA_DIR` -- no database
-lookup required to find it -- verifies its `_SUCCESS` marker and
-checksums, and loads only that one endpoint's raw table. `tuva-ingest
-sync --endpoint ... [--since ...]` runs `extract` then `load` for the
-same run in one command, and stops immediately (nonzero exit, `load`
-never attempted) if `extract` fails.
+`tuva-ingest run` mints its own `run_id` (`run-<uuid4 prefix>`) for its
+`ingest_ops.ingestion_runs` bookkeeping row, independent of the
+manifest's own `snapshot_id`. `tuva-ingest load-raw [--snapshot-id ...]`
+does the same (`load-<snapshot_id>-<random suffix>`). Neither is the
+same `run_id` concept the paginated `extract`/`load`/`sync` commands use
+-- see `docs/SOURCE_CONTRACT.md`/`pagination.py` for that one, where
+`run_id` is what `load --run-id <value>` resolves directly.
 
 ## Local testing
 

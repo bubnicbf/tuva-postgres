@@ -59,6 +59,15 @@ REQUIRE_RAW_DATA = frozenset({"raw_data_dir"})
 
 ALL_REQUIREMENTS = REQUIRE_API | REQUIRE_DB | REQUIRE_RAW_DATA
 
+# The paginated extract/load/sync commands (see cli.py, pagination.py,
+# paginated_loader.py) retrieve their API credential from the configured
+# secret provider (see secrets.py) rather than requiring TUVA_API_TOKEN
+# directly -- so, unlike REQUIRE_API above, this set deliberately omits
+# "api_token". They do need TUVA_API_MANIFEST_URL (reused as the page-
+# request URL), RAW_DATA_DIR (immutable page-file staging/publish), and
+# PG_DSN (watermark lookups plus the load/reconcile/commit transaction).
+REQUIRE_PAGINATED = frozenset({"api_manifest_url", "raw_data_dir", "pg_dsn"})
+
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 # Single source of truth mapping each pydantic field name to the exact
@@ -94,6 +103,12 @@ _ENV_ALIASES: dict[str, str] = {
     "source_name": "SOURCE_NAME",
     "ingest_role": "INGEST_ROLE",
     "transform_role": "TRANSFORM_ROLE",
+    "api_secret_provider": "TUVA_API_SECRET_PROVIDER",
+    "api_secret_id": "TUVA_API_SECRET_ID",
+    "aws_region": "AWS_REGION",
+    "api_page_size": "TUVA_API_PAGE_SIZE",
+    "api_max_pages": "TUVA_API_MAX_PAGES",
+    "api_max_page_bytes": "TUVA_API_MAX_PAGE_BYTES",
 }
 
 
@@ -215,6 +230,31 @@ class IngestConfig(BaseSettings):
     ingest_role: str = Field(default="tuva_ingest_role", validation_alias=_ENV_ALIASES["ingest_role"])
     transform_role: str = Field(default="tuva_transform_role", validation_alias=_ENV_ALIASES["transform_role"])
 
+    # --- cloud secret manager (see secrets.py) --------------------------
+    # Non-secret lookup information only -- the credential itself is
+    # always retrieved at runtime from the configured provider, never
+    # read from a plaintext env var here (except the "env" provider,
+    # which *is* TUVA_API_TOKEN by design -- see secrets.EnvSecretProvider
+    # and this field's own default, kept for full backward compatibility
+    # with every existing local/CI/test workflow).
+    api_secret_provider: str = Field(default="env", validation_alias=_ENV_ALIASES["api_secret_provider"])
+    api_secret_id: str | None = Field(default=None, validation_alias=_ENV_ALIASES["api_secret_id"])
+    aws_region: str | None = Field(default=None, validation_alias=_ENV_ALIASES["aws_region"])
+
+    # --- paginated extraction (see pagination.py) -----------------------
+    api_page_size: int | None = Field(default=None, gt=0, validation_alias=_ENV_ALIASES["api_page_size"])
+    # Hard ceiling on pagination loop iterations -- the final defense
+    # against an infinite pagination loop (a source that never returns a
+    # null next_page_token, or a pagination cycle this connector's own
+    # repeated-token detection somehow missed).
+    api_max_pages: int = Field(default=10_000, gt=0, validation_alias=_ENV_ALIASES["api_max_pages"])
+    # Per-page response size ceiling (mirrors api_client.MAX_MANIFEST_BYTES'
+    # role for the manifest contract, sized larger since a page of JSON
+    # records is expected to be larger than a manifest document).
+    api_max_page_bytes: int = Field(
+        default=64 * 1024 * 1024, gt=0, validation_alias=_ENV_ALIASES["api_max_page_bytes"]
+    )
+
     # --- field-level validators (always run, regardless of `required`) ---
 
     @field_validator("raw_schema")
@@ -259,6 +299,15 @@ class IngestConfig(BaseSettings):
     def _check_source_name(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("must not be empty")
+        return value
+
+    @field_validator("api_secret_provider")
+    @classmethod
+    def _check_api_secret_provider(cls, value: str) -> str:
+        from .secrets import SUPPORTED_SECRET_PROVIDERS
+
+        if value not in SUPPORTED_SECRET_PROVIDERS:
+            raise ValueError(f"must be one of {sorted(SUPPORTED_SECRET_PROVIDERS)}")
         return value
 
     @field_validator("api_manifest_url")
@@ -310,6 +359,12 @@ class IngestConfig(BaseSettings):
             )
         if self.ingest_role == self.transform_role:
             errors.append("INGEST_ROLE and TRANSFORM_ROLE must differ (least-privilege role separation)")
+
+        if self.api_secret_provider == "aws" and not self.api_secret_id:
+            errors.append(
+                "TUVA_API_SECRET_PROVIDER=aws requires TUVA_API_SECRET_ID to be set (the AWS Secrets "
+                "Manager secret name or ARN to retrieve -- see secrets.py)"
+            )
 
         if errors:
             raise ValueError("; ".join(errors))
@@ -416,6 +471,12 @@ class IngestConfig(BaseSettings):
             "source_name": self.source_name,
             "ingest_role": self.ingest_role,
             "transform_role": self.transform_role,
+            "api_secret_provider": self.api_secret_provider,
+            "api_secret_id": self.api_secret_id,
+            "aws_region": self.aws_region,
+            "api_page_size": self.api_page_size,
+            "api_max_pages": self.api_max_pages,
+            "api_max_page_bytes": self.api_max_page_bytes,
         }
 
     def __repr__(self) -> str:  # never let a stray print() leak secrets

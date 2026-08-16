@@ -70,13 +70,26 @@ def _require(condition: bool, message: str, errors: list[str]) -> None:
         errors.append(message)
 
 
-def parse_and_validate(raw: dict, *, allow_insecure_http: bool) -> Manifest:
+def parse_and_validate(
+    raw: dict, *, allow_insecure_http: bool, expected_tables: tuple[str, ...] | None = None
+) -> Manifest:
     """Validate a decoded manifest JSON object and return a `Manifest`.
 
     Raises `ManifestError` (listing every problem found, not just the
     first) if the manifest is malformed, incomplete, or unsafe.
+
+    `expected_tables` scopes which raw table(s) the `artifacts` list must
+    contain -- exactly those, no more, no fewer. Defaults to
+    `RAW_TABLES` (every managed table), which is what the legacy,
+    full-pipeline `run`/`load-raw` flow still fetches in one manifest.
+    The new endpoint-scoped `extract --endpoint <name>` flow (see
+    `extract.extract_endpoint_snapshot`) passes a single-table tuple --
+    `(endpoints.table_for_endpoint(endpoint),)` -- so a manifest response
+    for one endpoint is never rejected for "missing" the other two
+    endpoints' artifacts.
     """
     errors: list[str] = []
+    required_tables = expected_tables if expected_tables is not None else RAW_TABLES
 
     if not isinstance(raw, dict):
         raise ManifestError("manifest is not a JSON object")
@@ -136,6 +149,11 @@ def parse_and_validate(raw: dict, *, allow_insecure_http: bool) -> Manifest:
 
         if table not in RAW_TABLES:
             errors.append(f"artifacts[{i}].table {table!r} is not a managed raw table")
+        elif table not in required_tables:
+            errors.append(
+                f"artifacts[{i}].table {table!r} is a managed raw table but was not requested for this "
+                f"extraction (expected only: {sorted(required_tables)})"
+            )
 
         if not isinstance(url, str) or not url:
             errors.append(f"artifacts[{i}] ({table}): 'url' must be a nonempty string")
@@ -168,7 +186,7 @@ def parse_and_validate(raw: dict, *, allow_insecure_http: bool) -> Manifest:
     if duplicates:
         errors.append(f"duplicate artifact table name(s): {duplicates}")
 
-    missing = sorted(set(RAW_TABLES) - set(seen_tables))
+    missing = sorted(set(required_tables) - set(seen_tables))
     if missing:
         errors.append(f"missing artifact(s) for managed raw table(s): {missing}")
 

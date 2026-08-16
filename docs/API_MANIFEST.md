@@ -6,7 +6,7 @@ API. Instead, `TUVA_API_MANIFEST_URL` points at a versioned JSON document
 artifacts. Any HTTP server -- a real vendor API, an internal file service,
 or (in tests) an in-process mock server -- can serve this contract.
 
-Implemented in `src/tuva_postgres/manifest.py`; validated by
+Implemented in `src/tuva_ingest/manifest.py`; validated by
 `tests/unit/test_manifest.py`.
 
 ## Shape
@@ -19,8 +19,8 @@ Implemented in `src/tuva_postgres/manifest.py`; validated by
   "created_at": "2026-08-14T06:00:00Z",
   "artifacts": [
     {
-      "table": "patient",
-      "url": "https://example.invalid/snapshots/2026-08-14T060000Z/patient.csv",
+      "table": "eligibility",
+      "url": "https://example.invalid/snapshots/2026-08-14T060000Z/eligibility.csv",
       "sha256": "3f786850e387550fdab836ed7e6dc881de23001b52c250d8b7fd54f8e10f0a2",
       "size_bytes": 12345
     }
@@ -36,8 +36,8 @@ Implemented in `src/tuva_postgres/manifest.py`; validated by
 | `source` | Nonempty string identifying the upstream source (used as the top-level directory name under `RAW_DATA_DIR`). |
 | `snapshot_id` | 1-128 chars, `[A-Za-z0-9][A-Za-z0-9_.-]*` -- must be safe to use as a filesystem directory name; no `/`, `..`, or path separators. |
 | `created_at` | ISO-8601 timestamp (`Z` or explicit offset). |
-| `artifacts` | Exactly one entry for every table in `MANAGED_TABLES` (currently sourced from `scripts/load_to_postgres.sh`'s `MANAGED_TABLES` array -- see `manifest.py`'s `MANAGED_TABLES` and its sync test). No unknown tables, no duplicates. |
-| `artifacts[].table` | Lowercase `[a-z][a-z0-9_]*`; must be one of the managed tables. |
+| `artifacts` | Exactly one entry for every table in `manifest.RAW_TABLES` (`eligibility`, `medical_claim`, `pharmacy_claim` -- the three claims Input Layer source feeds this connector maps, see `models/sources.yml`). No unknown tables, no duplicates. |
+| `artifacts[].table` | Lowercase `[a-z][a-z0-9_]*`; must be one of the three raw tables above. |
 | `artifacts[].url` | `https://` by default; `http://` is only accepted when `TUVA_API_ALLOW_INSECURE_HTTP=1` (local tests). No `..` path-traversal segments. Must have a host. |
 | `artifacts[].sha256` | Lowercase 64-character hex SHA-256 of the exact bytes the client will download. |
 | `artifacts[].size_bytes` | Nonnegative integer; the exact byte count of the artifact. Verified against the actual number of bytes streamed. |
@@ -57,7 +57,11 @@ every problem found) before any artifact is downloaded.
 4. Otherwise, stream each artifact (bearer-authenticated, retried,
    checksummed) into a temporary staging directory, then atomically publish
    it as `RAW_DATA_DIR/<source>/<snapshot_id>/` (see
-   `docs/RUNBOOK.md` and `landing.py` for the full landing-layer contract).
+   `docs/RUNBOOK.md` and `extract.py`'s `RawSnapshotStore` for the full
+   snapshot-store contract). A published snapshot is only ever loaded into
+   the configured raw warehouse schema (`raw_loader.py`) -- never directly
+   into any Tuva-managed core, terminology, or output schema; dbt (see
+   `models/`) is what maps it into the Tuva Input Layer.
 
 ## Local testing
 

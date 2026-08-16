@@ -1,0 +1,178 @@
+# Local development/testing stack: a disposable Postgres + the
+# tuva-ingest connector/dbt image built from ./Dockerfile. NOT for
+# production use -- there is no TLS, no backup/HA, and no production
+# secret management here; the Postgres credentials below are
+# clearly-labeled, local-only placeholders that must never be reused
+# outside a developer's own machine.
+#
+# One-command workflow (see the Makefile's `local-db-*`/`local-*`
+# targets and README.md's "Local development" section for the full
+# walkthrough):
+#
+#   make local-db-ready     # start postgres, wait for health
+#   make local-migrate      # apply operational migrations (001-003)
+#   make local-dbt-deps     # fetch the pinned Tuva 0.18.0 package
+#   make local-extract      # pull a snapshot via the ingestion API client
+#   make local-load-raw     # load the snapshot into the raw schema
+#   make local-dbt-build    # build+test staging -> Input Layer -> Tuva
+#   make local-db-down      # stop containers, KEEP the data volume
+#   make local-db-reset     # DESTRUCTIVE: drop the local data volume too
+#
+# Equivalent raw `docker compose` commands, if you'd rather not go
+# through make:
+#
+#   docker compose up -d postgres                    # start just the database
+#   docker compose run --rm migrate                  # apply operational migrations
+#   docker compose run --rm dbt-deps                  # fetch dbt packages
+#   docker compose run --rm ingest healthcheck
+#   TUVA_API_MANIFEST_URL=... TUVA_API_TOKEN=... docker compose run --rm ingest run
+#
+# `ingest run`/`ingest extract` additionally require a real (or
+# locally-mocked) TUVA_API_MANIFEST_URL -- this compose file does not
+# stand one up, since the point of the manifest contract is that it's
+# vendor-agnostic and this repo does not assume a specific upstream
+# host. Neither `docker compose up` (bare) nor any `local-db-*` target
+# ever requires TUVA_API_MANIFEST_URL/TUVA_API_TOKEN.
+
+x-tuva-build: &tuva-build
+  context: .
+  dockerfile: Dockerfile
+
+# Shared connection settings for every service that talks to the local
+# database or dbt project. Defined once so the local-only DSN/schema
+# names never drift between them -- all local-development-only values
+# (see the POSTGRES_* block below), never production configuration.
+x-tuva-db-env: &tuva-db-env
+  PG_DSN: postgresql://tuva_local:local-only-example-password-change-me@postgres:5432/tuva
+  RAW_SCHEMA: raw
+  OPS_SCHEMA: ingest_ops
+  INPUT_LAYER_SCHEMA: input_layer
+  SOURCE_NAME: tuva
+
+x-tuva-dbt-env: &tuva-dbt-env
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGUSER: tuva_local
+  PGPASSWORD: local-only-example-password-change-me
+  PGDATABASE: tuva
+  DBT_SCHEMA: dbt_dev
+  DBT_TARGET: dev
+  DBT_PROFILES_DIR: /app
+  DBT_PROJECT_DIR: /app
+
+services:
+  postgres:
+    # Pinned to the same major version this repository's CI validates
+    # against. Prefer a pinned tag over `latest` so local behavior stays
+    # reproducible across machines and over time.
+    image: postgres:16
+    environment:
+      # LOCAL-ONLY EXAMPLE CREDENTIALS -- never used outside this compose
+      # file's disposable container. Do not reuse this password for
+      # anything beyond a developer's own machine.
+      POSTGRES_USER: tuva_local
+      POSTGRES_PASSWORD: local-only-example-password-change-me
+      POSTGRES_DB: tuva
+    ports:
+      # Loopback-only: never bind Postgres to all interfaces (0.0.0.0).
+      # Host port is configurable (POSTGRES_PORT) so it doesn't collide
+      # with a developer's own local Postgres already using 5432; the
+      # *container* port always stays Postgres's normal 5432 regardless.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tuva_local -d tuva"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    # Local-dev convenience only: restart if it crashes, but never loop
+    # indefinitely trying to start (that's `on-failure`'s job, not
+    # `always`, and this is explicitly not a production restart policy).
+    restart: on-failure
+
+  # One-shot migration runner: applies migrations/001_operational_schemas.sql,
+  # 002_ingestion_control.sql, and 003_roles_and_grants.sql (see
+  # src/tuva_ingest/migrations.py) against the local database, then
+  # exits. Never creates or touches Tuva-managed core/terminology/output
+  # schemas -- only the raw and operational-control namespaces (see
+  # README.md "This repository does not own Tuva's DDL"). Idempotent and
+  # safe to rerun; already-applied migrations are skipped.
+  migrate:
+    build: *tuva-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *tuva-db-env
+    command: ["migrate"]
+    restart: "no"
+
+  # One-shot: fetches the pinned Tuva package (packages.yml, exactly
+  # 0.18.0) plus dbt_utils. Requires network access to dbt Hub -- not
+  # something `docker compose up` (bare) depends on, since it's only
+  # needed before `dbt-build`/`ingest run`.
+  dbt-deps:
+    build: *tuva-build
+    environment: *tuva-dbt-env
+    volumes:
+      - dbt-packages:/app/dbt_packages
+    entrypoint: ["dbt"]
+    command: ["deps"]
+    restart: "no"
+
+  # One-shot: builds+tests models/staging -> models/final (the Input
+  # Layer contract) -> the Tuva package's own core/terminology/mart
+  # models, against whatever is currently in the raw schema (loaded by
+  # `ingest load-raw` / `ingest run`). Requires `dbt-deps` and `migrate`
+  # to have completed successfully first.
+  dbt-build:
+    build: *tuva-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment: *tuva-dbt-env
+    volumes:
+      - dbt-packages:/app/dbt_packages
+    entrypoint: ["dbt"]
+    command:
+      [
+        "build",
+        "--vars",
+        "{raw_schema: raw, input_layer_schema: input_layer, claims_enabled: true}",
+      ]
+    restart: "no"
+
+  ingest:
+    build: *tuva-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *tuva-db-env
+      PIPELINE_ENVIRONMENT: local
+      LOG_LEVEL: INFO
+      RAW_DATA_DIR: /app/data/raw
+      DBT_PROFILES_DIR: /app
+      DBT_PROJECT_DIR: /app
+      DBT_TARGET: dev
+      # Not set here on purpose (see usage note above): TUVA_API_MANIFEST_URL,
+      # TUVA_API_TOKEN. Supply them on the command line or a local .env
+      # file (never committed) to run `ingest extract`/`ingest run` end to end.
+    volumes:
+      - raw-data:/app/data/raw
+      - dbt-packages:/app/dbt_packages
+    # Safe default for `docker compose up`: only needs the database,
+    # never the (unset-by-default) API credentials. Override with `run`
+    # or `extract` once TUVA_API_MANIFEST_URL/TUVA_API_TOKEN are supplied.
+    command: ["healthcheck"]
+    restart: "no"
+
+volumes:
+  pgdata:
+  raw-data:
+  dbt-packages:

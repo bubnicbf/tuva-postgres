@@ -1,0 +1,66 @@
+version: 2
+
+models:
+  - name: stg_eligibility
+    description: >
+      Typed, trimmed view over raw.eligibility (see models/sources.yml).
+      Field-level extraction/casting only -- see the model's header
+      comment for the normalization approach. No Tuva-specific business
+      logic; that begins in models/final/eligibility.sql.
+    columns:
+      - name: patient_id
+        description: Source person identifier, carried through unmapped as the Input Layer's patient_id.
+        data_tests: [not_null]
+      - name: member_id
+        description: Source member/subscriber-line identifier.
+      - name: enrollment_start_date
+        description: Coverage start date, or NULL if the source value did not parse as YYYY-MM-DD.
+      - name: enrollment_end_date
+        description: Coverage end date, or NULL if the source value did not parse as YYYY-MM-DD.
+      - name: payer
+        description: Source payer name.
+      - name: data_source
+        description: Source system tag; defaults to 'tuva' when the source row does not supply one.
+        data_tests: [not_null]
+
+  - name: stg_medical_claim
+    description: >
+      Typed, trimmed view over raw.medical_claim (see models/sources.yml).
+      Field-level extraction/casting only; no Tuva-specific business
+      logic. See models/final/medical_claim.sql for the Input Layer
+      contract model.
+    columns:
+      - name: claim_id
+        description: Source claim identifier.
+        data_tests: [not_null]
+      - name: claim_line_number
+        description: 1-based claim line number within claim_id, or NULL if unparseable.
+      - name: patient_id
+        description: Source person identifier, carried through unmapped as the Input Layer's patient_id.
+        data_tests: [not_null]
+      - name: paid_amount
+        description: Amount paid on this claim line, or NULL if the source value did not parse as numeric.
+      - name: data_source
+        description: Source system tag; defaults to 'tuva' when the source row does not supply one.
+        data_tests: [not_null]
+
+  - name: stg_pharmacy_claim
+    description: >
+      Typed, trimmed view over raw.pharmacy_claim (see models/sources.yml).
+      Field-level extraction/casting only; no Tuva-specific business
+      logic. See models/final/pharmacy_claim.sql for the Input Layer
+      contract model.
+    columns:
+      - name: claim_id
+        description: Source claim identifier.
+        data_tests: [not_null]
+      - name: patient_id
+        description: Source person identifier, carried through unmapped as the Input Layer's patient_id.
+        data_tests: [not_null]
+      - name: ndc_code
+        description: Source National Drug Code for the dispensed product.
+      - name: paid_amount
+        description: Amount paid on this claim line, or NULL if the source value did not parse as numeric.
+      - name: data_source
+        description: Source system tag; defaults to 'tuva' when the source row does not supply one.
+        data_tests: [not_null]

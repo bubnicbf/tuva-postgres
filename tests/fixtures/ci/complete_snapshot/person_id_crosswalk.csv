@@ -1,2 +1,0 @@
-person_id,patient_id,member_id,payer,plan,data_source
-person-1,patient-1,member-1,,,ci-fixture

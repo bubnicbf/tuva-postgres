@@ -1,11 +1,10 @@
-"""Standard-library unit tests for tuva_postgres.manifest.
+"""Standard-library unit tests for tuva_ingest.manifest.
 
 Run directly: python3 -m unittest tests.unit.test_manifest
 or via `make test-unit` (python3 -m unittest discover -s tests/unit).
 """
 from __future__ import annotations
 
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -13,8 +12,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from tuva_postgres.errors import ManifestError  # noqa: E402
-from tuva_postgres.manifest import MANAGED_TABLES, parse_and_validate  # noqa: E402
+from tuva_ingest.errors import ManifestError  # noqa: E402
+from tuva_ingest.manifest import RAW_TABLES, parse_and_validate  # noqa: E402
 
 
 def _valid_manifest() -> dict:
@@ -30,22 +29,31 @@ def _valid_manifest() -> dict:
                 "sha256": "a" * 64,
                 "size_bytes": 1234,
             }
-            for t in MANAGED_TABLES
+            for t in RAW_TABLES
         ],
     }
 
 
-class TestManagedTablesSyncedWithLoader(unittest.TestCase):
-    """MANAGED_TABLES must be the authoritative expected dataset -- proven
-    by asserting it matches scripts/load_to_postgres.sh's bash array
-    exactly, so the two can never silently drift apart."""
+class TestRawTablesMatchesInputLayer(unittest.TestCase):
+    """RAW_TABLES is the authoritative claims Input Layer source set --
+    exactly the three tables models/sources.yml declares and
+    models/final/*.sql produces, so the manifest contract can never
+    silently drift from what the dbt project actually maps."""
 
-    def test_matches_loader_bash_array(self):
-        loader_text = (REPO_ROOT / "scripts" / "load_to_postgres.sh").read_text(encoding="utf-8")
-        m = re.search(r"declare -a MANAGED_TABLES=\((.*?)\)", loader_text, re.DOTALL)
-        self.assertIsNotNone(m, "could not find MANAGED_TABLES array in load_to_postgres.sh")
-        bash_tables = tuple(re.findall(r'"([a-z_]+)"', m.group(1)))
-        self.assertEqual(bash_tables, MANAGED_TABLES)
+    def test_raw_tables_are_the_three_claims_feeds(self):
+        self.assertEqual(RAW_TABLES, ("eligibility", "medical_claim", "pharmacy_claim"))
+
+    def test_sources_yml_declares_exactly_raw_tables(self):
+        sources_text = (REPO_ROOT / "models" / "sources.yml").read_text(encoding="utf-8")
+        for table in RAW_TABLES:
+            self.assertIn(f"name: {table}", sources_text)
+
+    def test_final_model_exists_for_every_raw_table(self):
+        for table in RAW_TABLES:
+            self.assertTrue(
+                (REPO_ROOT / "models" / "final" / f"{table}.sql").is_file(),
+                f"missing models/final/{table}.sql for raw table {table!r}",
+            )
 
 
 class TestManifestValidation(unittest.TestCase):
@@ -53,7 +61,7 @@ class TestManifestValidation(unittest.TestCase):
         manifest = parse_and_validate(_valid_manifest(), allow_insecure_http=False)
         self.assertEqual(manifest.version, 1)
         self.assertEqual(manifest.snapshot_id, "2026-08-14T060000Z")
-        self.assertEqual(len(manifest.artifacts), len(MANAGED_TABLES))
+        self.assertEqual(len(manifest.artifacts), len(RAW_TABLES))
 
     def test_unsupported_version_rejected(self):
         raw = _valid_manifest()
@@ -142,6 +150,12 @@ class TestManifestValidation(unittest.TestCase):
         raw["artifacts"][0]["url"] = "https://example.invalid/snapshots/../../etc/passwd"
         with self.assertRaises(ManifestError):
             parse_and_validate(raw, allow_insecure_http=False)
+
+    def test_artifact_for_looks_up_by_table(self):
+        manifest = parse_and_validate(_valid_manifest(), allow_insecure_http=False)
+        artifact = manifest.artifact_for("eligibility")
+        self.assertEqual(artifact.table, "eligibility")
+        self.assertEqual(artifact.filename, "eligibility.csv")
 
 
 if __name__ == "__main__":

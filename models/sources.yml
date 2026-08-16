@@ -1,0 +1,74 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: "{{ var('raw_schema') }}"
+    description: >
+      Raw landing tables loaded by the tuva_ingest Python connector
+      (src/tuva_ingest/raw_loader.py) from the extracted, checksum-
+      verified snapshot published under RAW_DATA_DIR (see
+      src/tuva_ingest/extract.py). Every row is stored as a single
+      `raw_row` JSONB column, keyed exactly by that source CSV's own
+      header -- no type coercion, renaming, or filtering happens before
+      this point. dbt only ever reads from this source; it is never
+      written to by any dbt model (see models/staging/ for where typing
+      and normalization happens).
+    loaded_at_field: _loaded_at
+    freshness:
+      warn_after: { count: 24, period: hour }
+      error_after: { count: 72, period: hour }
+    tables:
+      - name: eligibility
+        description: >
+          Raw eligibility/enrollment source rows for the currently
+          loaded snapshot (see models/staging/stg_eligibility.sql for
+          the field-level mapping into normalized staging columns).
+        columns:
+          - name: _snapshot_id
+            description: The extraction snapshot_id this row belongs to (see extract.py).
+            data_tests: [not_null]
+          - name: _source_row_number
+            description: 1-based row number within the source CSV file.
+            data_tests: [not_null]
+          - name: _loaded_at
+            description: Timestamp this row was loaded into the raw schema.
+            data_tests: [not_null]
+          - name: raw_row
+            description: The full source row as JSON, keyed by the source CSV's own header.
+            data_tests: [not_null]
+
+      - name: medical_claim
+        description: >
+          Raw medical claim line source rows for the currently loaded
+          snapshot (see models/staging/stg_medical_claim.sql).
+        columns:
+          - name: _snapshot_id
+            description: The extraction snapshot_id this row belongs to (see extract.py).
+            data_tests: [not_null]
+          - name: _source_row_number
+            description: 1-based row number within the source CSV file.
+            data_tests: [not_null]
+          - name: _loaded_at
+            description: Timestamp this row was loaded into the raw schema.
+            data_tests: [not_null]
+          - name: raw_row
+            description: The full source row as JSON, keyed by the source CSV's own header.
+            data_tests: [not_null]
+
+      - name: pharmacy_claim
+        description: >
+          Raw pharmacy claim line source rows for the currently loaded
+          snapshot (see models/staging/stg_pharmacy_claim.sql).
+        columns:
+          - name: _snapshot_id
+            description: The extraction snapshot_id this row belongs to (see extract.py).
+            data_tests: [not_null]
+          - name: _source_row_number
+            description: 1-based row number within the source CSV file.
+            data_tests: [not_null]
+          - name: _loaded_at
+            description: Timestamp this row was loaded into the raw schema.
+            data_tests: [not_null]
+          - name: raw_row
+            description: The full source row as JSON, keyed by the source CSV's own header.
+            data_tests: [not_null]

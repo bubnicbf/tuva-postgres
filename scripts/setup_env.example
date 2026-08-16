@@ -1,42 +1,38 @@
-# Copy to .env and fill in. Never commit the real .env (see .gitignore).
+# Copy to .env (git-ignored) and fill in real values:
+#   cp scripts/setup_env.example .env
 #
-# This file is shell-sourced (`. .env`, see the Makefile) -- a completely
-# different mechanism from Docker Compose's own `${VAR:-default}`
-# interpolation in compose.yaml, which Compose resolves from your shell
-# environment or a `.env` file *at `docker compose` invocation time*, not
-# by sourcing this file. If you're pointing this .env at the local
-# Compose database (see "Database" below and README.md's "Local
-# PostgreSQL with Docker Compose" section), the two files must simply
-# agree on user/password/database/port -- one is not loaded by the other.
+# `make init` does this for you automatically (never overwriting an
+# existing .env). Every value below is either a safe local-development
+# placeholder or empty -- never a real credential. See README.md's
+# "Configuration" section for the full, authoritative list of variables
+# (src/tuva_ingest/config.py's IngestConfig.load() is the single source
+# of truth for defaults and validation).
 
-# --- Database -------------------------------------------------------------
-# Defaults below match compose.yaml's local-only Postgres service out of
-# the box (`make local-db-ready`), connected from the HOST (127.0.0.1),
-# not from inside another container. If you're running Postgres some
-# other way (a system install, a different container, a shared dev
-# database), replace PG_DSN accordingly -- nothing here is Compose-
-# specific except the default value itself.
-export PG_DSN="postgresql://tuva_local:local-only-example-password-change-me@127.0.0.1:${POSTGRES_PORT:-5432}/tuva"
-export PG_SCHEMA="tuva"                 # core data schema
-export TERMINOLOGY_SCHEMA="tuva_term"   # optional; defaults to ${PG_SCHEMA}_term
-export OPS_SCHEMA="tuva_ops"            # operational tables: pipeline_runs, pipeline_artifacts, schema_migrations
-export DATA_DIR="data"                  # legacy: where CSVs live for the plain scripts/load_to_postgres.sh path
+# --- PostgreSQL -------------------------------------------------------
+export PG_DSN="postgresql://tuva_local:local-only-example-password-change-me@127.0.0.1:5432/tuva"
+export RAW_SCHEMA="raw"
+export OPS_SCHEMA="ingest_ops"
+export INPUT_LAYER_SCHEMA="input_layer"
+export INGEST_ROLE="tuva_ingest_role"
+export TRANSFORM_ROLE="tuva_transform_role"
 
-# --- API client (fetch) --------------------------------------------------
-# TUVA_API_MANIFEST_URL points at a versioned JSON manifest -- see
-# docs/API_MANIFEST.md for the full contract. HTTPS is required unless
-# TUVA_API_ALLOW_INSECURE_HTTP=1 (local mock-server tests only).
-export TUVA_API_MANIFEST_URL="https://example.invalid/snapshots/latest/manifest.json"
-export TUVA_API_TOKEN="replace-with-a-real-bearer-token"   # NEVER commit a real token
+# --- Ingestion API (leave unset for migrate/healthcheck-only workflows) --
+export TUVA_API_MANIFEST_URL=""
+export TUVA_API_TOKEN=""
 export TUVA_API_TIMEOUT_SECONDS="30"
 export TUVA_API_MAX_RETRIES="5"
-export TUVA_API_ALLOW_INSECURE_HTTP="0"  # set to 1 only for local http:// mock-server tests
+export TUVA_API_ALLOW_INSECURE_HTTP="0"
 
-# --- Raw landing ----------------------------------------------------------
-export RAW_DATA_DIR="data/raw"   # immutable landing directory; see docs/API_MANIFEST.md
+# --- Extraction / raw snapshots ---------------------------------------
+export RAW_DATA_DIR="data/raw"
+export SOURCE_NAME="tuva"
 
-# --- Pipeline / observability ---------------------------------------------
-export PIPELINE_ENVIRONMENT="local"        # local | staging | production
-export PIPELINE_MAX_SUCCESS_AGE_HOURS="30" # healthcheck fails if the last successful run is older than this
-export LOG_LEVEL="INFO"                    # DEBUG | INFO | WARNING | ERROR | CRITICAL
-export METRICS_FILE="tmp/tuva_postgres_metrics.prom"  # optional Prometheus textfile output; unset to disable
+# --- dbt ---------------------------------------------------------------
+export DBT_TARGET="dev"
+export DBT_PROFILES_DIR="."
+export DBT_PROJECT_DIR="."
+
+# --- Pipeline / logging --------------------------------------------------
+export PIPELINE_ENVIRONMENT="local"
+export PIPELINE_MAX_SUCCESS_AGE_HOURS="30"
+export LOG_LEVEL="INFO"

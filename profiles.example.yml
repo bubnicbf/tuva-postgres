@@ -1,0 +1,43 @@
+# Example dbt profile for this project (profile name "tuva_ingest",
+# matching dbt_project.yml's `profile:` key). Contains ONLY safe
+# placeholders -- never real credentials. Copy to a profiles.yml
+# (git-ignored, see .gitignore) in your DBT_PROFILES_DIR (default: this
+# project's own root -- see config.py's DBT_PROFILES_DIR) and fill in
+# real values there, or supply the same values via environment
+# variables as shown below (recommended for CI/containers, since it
+# keeps credentials out of any file at all).
+#
+# `tuva-ingest dbt`/`tuva-ingest run` (see src/tuva_ingest/cli.py) invoke
+# `dbt --target {DBT_TARGET}`, so DBT_TARGET must name one of the
+# outputs below (default: "dev").
+tuva_ingest:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('PGHOST', 'localhost') }}"
+      port: "{{ env_var('PGPORT', '5432') | as_number }}"
+      user: "{{ env_var('PGUSER', 'tuva_local') }}"
+      password: "{{ env_var('PGPASSWORD', 'local-only-example-password-change-me') }}"
+      dbname: "{{ env_var('PGDATABASE', 'tuva') }}"
+      # dbt's own working/output schema (models with no +schema override
+      # land here; models/final/*.sql overrides this via
+      # INPUT_LAYER_SCHEMA -- see macros/generate_schema_name.sql).
+      schema: "{{ env_var('DBT_SCHEMA', 'dbt_dev') }}"
+      threads: 4
+      keepalives_idle: 0
+      connect_timeout: 10
+      retries: 1
+
+    ci:
+      type: postgres
+      host: "{{ env_var('PGHOST', 'localhost') }}"
+      port: "{{ env_var('PGPORT', '5432') | as_number }}"
+      user: "{{ env_var('PGUSER', 'postgres') }}"
+      password: "{{ env_var('PGPASSWORD', 'postgres') }}"
+      dbname: "{{ env_var('PGDATABASE', 'tuva') }}"
+      schema: "{{ env_var('DBT_SCHEMA', 'dbt_ci') }}"
+      threads: 4
+      keepalives_idle: 0
+      connect_timeout: 10
+      retries: 1

@@ -1,2 +1,0 @@
-observation_id,person_id,patient_id,encounter_id,panel_id,observation_date,observation_type,source_code_type,source_code,source_description,normalized_code_type,normalized_code,normalized_description,mapping_method,result,source_units,normalized_units,source_reference_range_low,source_reference_range_high,normalized_reference_range_low,normalized_reference_range_high,data_source,tuva_last_run
-observation-1,person-1,patient-1,encounter-1,,2024-01-11,,,,,,,,,,,,,,,,ci-fixture,2024-01-15 00:00:00

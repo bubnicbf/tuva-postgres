@@ -1,20 +1,24 @@
 [project]
-name = "tuva-postgres"
+name = "tuva-ingest"
 version = "0.1.0"
-description = "Reproducible PostgreSQL load of Tuva seed datasets"
+description = "Raw-to-Input-Layer ingestion connector for the Tuva Project dbt package (0.18.0)"
 requires-python = ">=3.12"
-# Minimal, deliberate runtime dependency set for the src/tuva_postgres
-# ingestion pipeline (API client + streaming downloads, PostgreSQL driver
-# for migrations/orchestration). Structured logging and the CLI are
-# stdlib-only (argparse + the json logging module) -- see
-# src/tuva_postgres/logging_utils.py and cli.py.
+# Minimal, deliberate runtime dependency set for the src/tuva_ingest
+# connector: API client + streaming downloads (requests), PostgreSQL
+# driver for raw loading/migrations/state (psycopg), and the dbt
+# toolchain that maps raw tables into the Tuva Input Layer and then
+# invokes the pinned Tuva package (see packages.yml). Structured logging
+# and the CLI are stdlib-only (argparse + the json logging module) --
+# see src/tuva_ingest/logging_utils.py and cli.py.
 dependencies = [
   "requests==2.34.2",
   "psycopg[binary]==3.2.3",
+  "dbt-core==1.11.11",
+  "dbt-postgres==1.10.0",
 ]
 
 [project.scripts]
-tuva-postgres = "tuva_postgres.cli:main"
+tuva-ingest = "tuva_ingest.cli:main"
 
 [tool.uv]
 package = true
@@ -37,11 +41,11 @@ build-backend = "setuptools.build_meta"
 # [tool.pytest.ini_options] below), SQLFluff + pre-commit (already
 # present), and PyYAML (already a transitive dependency of both sqlfluff
 # and pre-commit -- see uv.lock -- declared directly only so the
-# structural tests that parse compose.yaml / deploy/kubernetes/*.yaml /
-# ci.yml run for real via `make test-unit` / CI instead of skipping).
+# structural tests that parse compose.yml / ci.yml run for real via
+# `make test-unit` / CI instead of skipping).
 # types-requests is the one type-stub package mypy genuinely needs, for
 # the `requests` runtime dependency's public API surface used by
-# src/tuva_postgres/api_client.py.
+# src/tuva_ingest/api_client.py.
 #
 # Every entry here is an exact `==` pin, resolved via `uv lock` and
 # installed only through `uv sync --locked` -- never an ad hoc
@@ -72,7 +76,7 @@ template_blocks_indent = false  # keep Jinja blocks flush. :contentReference[oai
 unwrap_wrapped_queries = true
 
 [tool.sqlfluff.templater.jinja]
-apply_dbt_builtins = true  # makes {{ ref() }}, {{ var() }} etc. safe if you add dbt later. :contentReference[oaicite:1]{index=1}
+apply_dbt_builtins = true  # makes {{ ref() }}, {{ var() }}, {{ source() }} etc. resolve for models/**/*.sql.
 
 # Global rule knobs (common conveniences)
 [tool.sqlfluff.rules]
@@ -154,6 +158,9 @@ extend-exclude = [
   ".git",
   "tmp",
   "data",
+  "dbt_packages",
+  "target",
+  "logs",
 ]
 
 [tool.ruff.lint]
@@ -168,9 +175,9 @@ select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
 # tests/**/*.py and scripts/tests/*.py deliberately do
-# `sys.path.insert(0, ...)` before importing tuva_postgres (see each
+# `sys.path.insert(0, ...)` before importing tuva_ingest (see each
 # file's own module docstring/comment) -- this is how they find
-# src/tuva_postgres without requiring an editable install first, and is
+# src/tuva_ingest without requiring an editable install first, and is
 # load-bearing, not an oversight. E402 (module-level import not at top
 # of file) would otherwise flag every one of these files for a pattern
 # they use intentionally and consistently.
@@ -185,18 +192,18 @@ indent-style = "space"
 line-ending = "lf"
 
 # --- mypy ------------------------------------------------------------------
-# Applied primarily to production code (src/tuva_postgres) -- see `files`
+# Applied primarily to production code (src/tuva_ingest) -- see `files`
 # below, which must match what `make typecheck`/CI/pre-commit actually
 # check. This is the strongest configuration the codebase can plausibly
 # pass without disallow_untyped_defs (several functions, mostly ones
 # taking a psycopg connection, intentionally leave a couple of parameters
-# unannotated rather than typed as Any -- see src/tuva_postgres/ops.py) --
+# unannotated rather than typed as Any -- see src/tuva_ingest/state.py) --
 # not full strict mode. No ignore_errors, no blanket
 # ignore_missing_imports, and no directory-wide exclusions: every module
-# under src/tuva_postgres is checked.
+# under src/tuva_ingest is checked.
 [tool.mypy]
 python_version = "3.12"
-files = ["src/tuva_postgres"]
+files = ["src/tuva_ingest"]
 check_untyped_defs = true
 no_implicit_optional = true
 warn_redundant_casts = true

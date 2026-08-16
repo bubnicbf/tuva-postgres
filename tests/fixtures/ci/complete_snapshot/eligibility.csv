@@ -1,2 +1,0 @@
-eligibility_id,person_id,member_id,subscriber_id,birth_date,death_date,enrollment_start_date,enrollment_end_date,payer,payer_type,plan,original_reason_entitlement_code,dual_status_code,medicare_status_code,subscriber_relation,group_id,group_name,normalized_state_name,fips_state_code,fips_state_abbreviation,data_source,file_date,tuva_last_run
-eligibility-1,person-1,member-1,,1980-01-01,,2024-01-01,2024-12-31,,,,,,,,,,,,,ci-fixture,2024-01-15,2024-01-15 00:00:00

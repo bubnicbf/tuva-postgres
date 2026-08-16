@@ -6,8 +6,25 @@ manifest contract `extract` consumes.
 
 ## Routine operation
 
-Full pipeline, one command (requires `.env` populated -- see
-`scripts/setup_env.example`):
+Endpoint-scoped, one endpoint at a time (the current, recommended way to
+operate this connector -- see README.md's "extract / load / sync"
+section for the full JSON output/run-id/retry contract):
+
+```bash
+uv run tuva-ingest extract --endpoint medical-claims --since 2025-01-01
+# {"event": "extract", "run_id": "019...", ...}
+uv run tuva-ingest load --run-id 019...
+# or, in one command:
+uv run tuva-ingest sync --endpoint medical-claims --since 2025-01-01
+```
+
+Repeat for each endpoint (`medical-claims`, `pharmacy-claims`,
+`eligibility`) your operational schedule needs -- each is independent;
+loading one never truncates or touches another endpoint's raw table.
+
+Legacy full pipeline (all three tables, one manifest request), one
+command (requires `.env` populated -- see `scripts/setup_env.example`;
+see README.md's "Backward compatibility" section):
 
 ```bash
 make run   # migrate -> extract -> load-raw -> dbt deps ->
@@ -24,7 +41,7 @@ Or step by step, for more control/visibility between stages:
 
 ```bash
 make migrate           # apply pending operational migrations (idempotent)
-make extract           # fetch + publish a raw snapshot
+make extract           # fetch + publish a raw snapshot (all 3 tables, legacy full manifest)
 make load-raw          # load the current published snapshot into RAW_SCHEMA
 make dbt-debug          # connection/profile sanity check
 make dbt-deps            # fetch the pinned Tuva 0.18.0 package (needs network)

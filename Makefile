@@ -1,4 +1,4 @@
-.PHONY: init deps migrate migrate-status extract load-raw run health \
+.PHONY: init deps migrate migrate-status extract load sync load-raw run health \
         dbt-debug dbt-deps dbt-parse dbt-compile dbt-build dbt-test \
         dbt-input-layer dbt-dq-structural dbt-dq-logical dbt-dq-analytical \
         test-unit test-integration test-python check-python-deps \
@@ -30,7 +30,7 @@ init:
 deps:
 	uv sync --locked
 
-# Applies pending migrations/001-003 (see src/tuva_ingest/migrations.py).
+# Applies pending migrations/001-004 (see src/tuva_ingest/migrations.py).
 # Never creates or touches any Tuva-managed core/terminology/output
 # schema -- only the configured raw and operational-control schemas.
 # Idempotent and safe to rerun.
@@ -46,11 +46,32 @@ migrate-status:
 # Fetches + validates the manifest and publishes a raw snapshot only (no
 # load-raw/dbt). Requires TUVA_API_MANIFEST_URL/TUVA_API_TOKEN/
 # RAW_DATA_DIR (see .env / scripts/setup_env.example).
-extract:
-	. .env && uv run tuva-ingest extract
+# ENDPOINT/SINCE are the only two --endpoint/--since values `extract`/
+# `sync` need; override on the command line, e.g.
+# `make extract ENDPOINT=pharmacy-claims SINCE=2025-01-01`. ENDPOINT
+# defaults to medical-claims only so `make extract`/`make sync` have a
+# sane one-command default -- always pass ENDPOINT explicitly for
+# anything beyond local smoke-testing.
+ENDPOINT ?= medical-claims
+SINCE ?=
+_SINCE_ARG = $(if $(SINCE),--since $(SINCE),)
 
-# Loads the current (or --snapshot-id) published raw snapshot into the
-# configured raw schema only. Requires PG_DSN and RAW_DATA_DIR.
+extract:
+	. .env && uv run tuva-ingest extract --endpoint $(ENDPOINT) $(_SINCE_ARG)
+
+# RUN_ID is required -- the run_id `make extract` (or a direct
+# `tuva-ingest extract`) printed in its JSON result.
+load:
+	. .env && uv run tuva-ingest load --run-id $(RUN_ID)
+
+sync:
+	. .env && uv run tuva-ingest sync --endpoint $(ENDPOINT) $(_SINCE_ARG)
+
+# [legacy] Loads the current (or --snapshot-id) published full-manifest
+# (all three tables) raw snapshot into the configured raw schema only.
+# Requires PG_DSN and RAW_DATA_DIR. Superseded by `load` for the
+# endpoint-scoped flow -- kept for backward compatibility (see README.md
+# "Backward compatibility").
 load-raw:
 	. .env && uv run tuva-ingest load-raw
 

@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from tuva_ingest.config import ALL_REQUIREMENTS, REQUIRE_DB, IngestConfig  # noqa: E402
+from pydantic import SecretStr  # noqa: E402
 from tuva_ingest.errors import ConfigError  # noqa: E402
 
 _ENV_KEYS = [
@@ -32,6 +33,11 @@ _ENV_KEYS = [
     "SOURCE_NAME",
     "INGEST_ROLE",
     "TRANSFORM_ROLE",
+    "TUVA_API_CONNECT_TIMEOUT_SECONDS",
+    "TUVA_API_READ_TIMEOUT_SECONDS",
+    "TUVA_API_WRITE_TIMEOUT_SECONDS",
+    "TUVA_API_POOL_TIMEOUT_SECONDS",
+    "TUVA_API_MAX_RETRY_DELAY_SECONDS",
 ]
 
 
@@ -211,6 +217,75 @@ class TestIngestConfig(_EnvIsolatedTestCase):
         config = IngestConfig.load()
         self.assertNotIn("test-token", repr(config))
         self.assertNotIn("user:pass", repr(config))
+
+
+class TestIngestConfigPydanticTypes(_EnvIsolatedTestCase):
+    """Config is now a pydantic-settings BaseSettings model: credentials
+    must be SecretStr (never a bare str), timeout fields must be
+    positive floats or None, and httpx_timeout() must build a real
+    httpx.Timeout using per-phase overrides when present."""
+
+    def test_api_token_is_a_secret_str(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertIsInstance(config.api_token, SecretStr)
+        self.assertNotIn("test-token", str(config.api_token))
+        self.assertEqual(config.api_token_value, "test-token")
+
+    def test_pg_dsn_is_a_secret_str(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertIsInstance(config.pg_dsn, SecretStr)
+        self.assertNotIn("user:pass", str(config.pg_dsn))
+        self.assertEqual(config.pg_dsn_value, "postgresql://user:pass@localhost:5432/db")
+
+    def test_config_is_frozen(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        with self.assertRaises(Exception):
+            config.source_name = "other"  # type: ignore[misc]
+
+    def test_per_phase_timeout_overrides_used_when_set(self):
+        env = _valid_env()
+        env["TUVA_API_CONNECT_TIMEOUT_SECONDS"] = "2.5"
+        env["TUVA_API_READ_TIMEOUT_SECONDS"] = "9.5"
+        env["TUVA_API_WRITE_TIMEOUT_SECONDS"] = "9.5"
+        env["TUVA_API_POOL_TIMEOUT_SECONDS"] = "1.0"
+        self._set(**env)
+        config = IngestConfig.load()
+        timeout = config.httpx_timeout()
+        self.assertEqual(timeout.connect, 2.5)
+        self.assertEqual(timeout.read, 9.5)
+        self.assertEqual(timeout.write, 9.5)
+        self.assertEqual(timeout.pool, 1.0)
+
+    def test_timeout_falls_back_to_api_timeout_seconds_when_unset(self):
+        env = _valid_env()
+        env["TUVA_API_TIMEOUT_SECONDS"] = "12"
+        self._set(**env)
+        config = IngestConfig.load()
+        timeout = config.httpx_timeout()
+        self.assertEqual(timeout.connect, 12.0)
+        self.assertEqual(timeout.read, 12.0)
+
+    def test_negative_connect_timeout_rejected(self):
+        env = _valid_env()
+        env["TUVA_API_CONNECT_TIMEOUT_SECONDS"] = "-1"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_negative_max_retry_delay_rejected(self):
+        env = _valid_env()
+        env["TUVA_API_MAX_RETRY_DELAY_SECONDS"] = "0"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_max_retry_delay_defaults_to_30(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertEqual(config.api_max_retry_delay_seconds, 30.0)
 
 
 _HOSTILE_IDENTIFIERS = [

@@ -4,14 +4,19 @@ version = "0.1.0"
 description = "Raw-to-Input-Layer ingestion connector for the Tuva Project dbt package (0.18.0)"
 requires-python = ">=3.12"
 # Minimal, deliberate runtime dependency set for the src/tuva_ingest
-# connector: API client + streaming downloads (requests), PostgreSQL
-# driver for raw loading/migrations/state (psycopg), and the dbt
-# toolchain that maps raw tables into the Tuva Input Layer and then
-# invokes the pinned Tuva package (see packages.yml). Structured logging
-# and the CLI are stdlib-only (argparse + the json logging module) --
-# see src/tuva_ingest/logging_utils.py and cli.py.
+# connector: an httpx-based API client with streaming downloads and
+# tenacity-bounded retries, pydantic-settings for validated
+# environment-driven configuration, the PostgreSQL driver for raw
+# loading/migrations/state (psycopg), and the dbt toolchain that maps
+# raw tables into the Tuva Input Layer and then invokes the pinned Tuva
+# package (see packages.yml). Structured JSON logging and the CLI are
+# otherwise stdlib-only (argparse + the json logging module) -- see
+# src/tuva_ingest/logging_utils.py and cli.py.
 dependencies = [
-  "requests==2.34.2",
+  "httpx==0.28.1",
+  "tenacity==9.0.0",
+  "pydantic==2.10.5",
+  "pydantic-settings==2.7.1",
   "psycopg[binary]==3.2.3",
   "dbt-core==1.11.11",
   "dbt-postgres==1.10.0",
@@ -43,9 +48,10 @@ build-backend = "setuptools.build_meta"
 # and pre-commit -- see uv.lock -- declared directly only so the
 # structural tests that parse compose.yml / ci.yml run for real via
 # `make test-unit` / CI instead of skipping).
-# types-requests is the one type-stub package mypy genuinely needs, for
-# the `requests` runtime dependency's public API surface used by
-# src/tuva_ingest/api_client.py.
+#
+# httpx and pydantic ship their own inline type hints (PEP 561) so no
+# `types-httpx`/`types-pydantic` stub package is needed -- unlike the
+# `requests` dependency this replaces, which required `types-requests`.
 #
 # Every entry here is an exact `==` pin, resolved via `uv lock` and
 # installed only through `uv sync --locked` -- never an ad hoc
@@ -55,7 +61,6 @@ dev = [
   "ruff==0.14.4",
   "mypy==1.19.0",
   "pytest==8.4.2",
-  "types-requests==2.34.2.20250809",
   "pre-commit==4.6.2",
   "sqlfluff==4.3.0",
   "pyyaml==6.0.3",
@@ -212,3 +217,4 @@ warn_unreachable = true
 strict_equality = true
 show_error_codes = true
 pretty = true
+plugins = ["pydantic.mypy"]

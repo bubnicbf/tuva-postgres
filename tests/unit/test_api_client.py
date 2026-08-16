@@ -1,259 +1,405 @@
-"""Unit tests for tuva_ingest.api_client, against a real in-process mock
-HTTP server (http.server), not a proprietary/external API.
+"""Standard-library unit tests for tuva_ingest.api_client.ApiClient.
 
-Requires the `requests` runtime dependency (see pyproject.toml /
-scripts/tests/test_python_dependencies.py-style lock verification) --
-these tests are skipped with a clear reason if it isn't installed, rather
-than failing the whole suite in an environment where deps haven't been
-synced yet.
+Zero real network access: every test drives a scripted httpx.MockTransport
+(see `_StepTransport` below) instead of a live HTTP server, per this
+repository's testing policy (see the module docstring of api_client.py
+and README.md's "Testing" section). `sleep_fn` is always injected as a
+no-op recorder so retry/backoff tests run instantly and deterministically
+-- no test in this file sleeps for real.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import tempfile
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-try:
-    import requests as _requests  # noqa: F401
-
-    HAVE_REQUESTS = True
-except ImportError:
-    HAVE_REQUESTS = False
-
-if HAVE_REQUESTS:
-    from tuva_ingest.api_client import ApiClient
-    from tuva_ingest.errors import ChecksumError, DownloadError
-    from tuva_ingest.manifest import Artifact
-
-TOKEN = "s3cr3t-test-token-do-not-leak"
-CONTENT = b"id,name\n1,alice\n2,bob\n"
-CONTENT_SHA256 = hashlib.sha256(CONTENT).hexdigest()
+from tuva_ingest.api_client import ApiClient, user_agent  # noqa: E402
+from tuva_ingest.errors import ChecksumError, DownloadError, ManifestError  # noqa: E402
+from tuva_ingest.manifest import Artifact  # noqa: E402
 
 
-class _Server:
-    """A minimal in-process HTTP server whose behavior for each request is
-    decided by a caller-supplied handler function, so each test can script
-    exactly the response sequence it needs (retries, auth failures, etc.)
-    without any real network access."""
+class _StepTransport:
+    """A scripted httpx transport: each call to `_handle` pops the next
+    step off `steps` and either returns it (an httpx.Response) or raises
+    it (an Exception) -- no real socket, DNS lookup, or server involved.
+    `calls` records every httpx.Request actually sent, so tests can
+    assert exact retry counts and header/query-param contents."""
 
-    def __init__(self, handle_fn):
-        self.requests_seen: list[dict] = []
-        handle_fn_ref = handle_fn
-        requests_seen_ref = self.requests_seen
+    def __init__(self, steps):
+        self.steps = list(steps)
+        self.calls: list[httpx.Request] = []
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):  # silence test output
-                pass
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.calls.append(request)
+        if not self.steps:
+            raise AssertionError("transport ran out of scripted responses/errors")
+        step = self.steps.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
 
-            def do_GET(self):
-                requests_seen_ref.append({"path": self.path, "headers": dict(self.headers)})
-                handle_fn_ref(self)
-
-        self.httpd = HTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self.thread.start()
-
-    @property
-    def base_url(self) -> str:
-        return f"http://127.0.0.1:{self.httpd.server_port}"
-
-    def stop(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
+    def as_httpx_transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._handle)
 
 
-@unittest.skipUnless(HAVE_REQUESTS, "requests is not installed in this environment")
-class TestApiClient(unittest.TestCase):
+def _client(steps, **kwargs) -> tuple[ApiClient, _StepTransport]:
+    transport = _StepTransport(steps)
+    sleeps: list[float] = kwargs.pop("_sleeps", None)
+    if sleeps is None:
+        sleeps = []
+    kwargs.setdefault("sleep_fn", sleeps.append)
+    kwargs.setdefault("max_retries", 3)
+    client = ApiClient(token="test-token-xyz", transport=transport.as_httpx_transport(), **kwargs)
+    return client, transport
+
+
+def _manifest_response(payload: dict, status: int = 200) -> httpx.Response:
+    return httpx.Response(status, content=json.dumps(payload).encode("utf-8"))
+
+
+class TestHeadersAndAuth(unittest.TestCase):
+    def test_bearer_token_sent_on_every_request(self):
+        client, transport = _client([_manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(transport.calls[0].headers["Authorization"], "Bearer test-token-xyz")
+
+    def test_user_agent_header_matches_convention(self):
+        client, transport = _client([_manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(transport.calls[0].headers["User-Agent"], user_agent())
+        self.assertTrue(user_agent().startswith("tuva-ingest/"))
+
+    def test_token_never_appears_in_a_raised_exception_message(self):
+        client, transport = _client([httpx.Response(401)])
+        with self.assertRaises(DownloadError) as ctx:
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertNotIn("test-token-xyz", str(ctx.exception))
+
+    def test_token_never_appears_in_exhausted_retry_exception_message(self):
+        client, transport = _client(
+            [httpx.ConnectError("boom"), httpx.ConnectError("boom"), httpx.ConnectError("boom"), httpx.ConnectError("boom")],
+            max_retries=3,
+        )
+        with self.assertRaises(DownloadError) as ctx:
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertNotIn("test-token-xyz", str(ctx.exception))
+
+
+class TestQueryParamEncoding(unittest.TestCase):
+    def test_params_passed_as_real_query_params_not_concatenated(self):
+        client, transport = _client([_manifest_response({"ok": True})])
+        client.fetch_manifest_json(
+            "https://example.invalid/manifest.json", params={"endpoint": "medical-claims", "since": "2025-01-01"}
+        )
+        request = transport.calls[0]
+        self.assertEqual(request.url.params["endpoint"], "medical-claims")
+        self.assertEqual(request.url.params["since"], "2025-01-01")
+
+    def test_params_with_special_characters_are_percent_encoded(self):
+        client, transport = _client([_manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json", params={"since": "2025 01 01&x=1"})
+        request = transport.calls[0]
+        # httpx's own query encoding round-trips this back to the exact
+        # original value -- proving it was never string-concatenated
+        # into the URL path (which would corrupt/inject into it).
+        self.assertEqual(request.url.params["since"], "2025 01 01&x=1")
+
+    def test_no_params_means_no_query_string(self):
+        client, transport = _client([_manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(str(transport.calls[0].url.params), "")
+
+
+class TestFetchManifestJson(unittest.TestCase):
+    def test_successful_fetch_parses_json_body(self):
+        client, transport = _client([_manifest_response({"version": 1, "snapshot_id": "snap-1"})])
+        result = client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(result, {"version": 1, "snapshot_id": "snap-1"})
+
+    def test_401_raises_without_retry(self):
+        client, transport = _client([httpx.Response(401)])
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_403_raises_without_retry(self):
+        client, transport = _client([httpx.Response(403)])
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_404_raises_without_retry(self):
+        client, transport = _client([httpx.Response(404)])
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_400_raises_without_retry(self):
+        client, transport = _client([httpx.Response(400)])
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_invalid_json_raises_manifest_error(self):
+        client, transport = _client([httpx.Response(200, content=b"not-json{{{")])
+        with self.assertRaises(ManifestError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+
+    def test_oversized_manifest_raises_manifest_error(self):
+        from tuva_ingest.api_client import MAX_MANIFEST_BYTES
+
+        oversized = b"x" * (MAX_MANIFEST_BYTES + 1)
+        client, transport = _client([httpx.Response(200, content=oversized)])
+        with self.assertRaises(ManifestError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+
+
+class TestRetryBehavior(unittest.TestCase):
+    def test_connect_error_then_success(self):
+        client, transport = _client([httpx.ConnectError("boom"), _manifest_response({"ok": True})])
+        result = client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_read_timeout_then_success(self):
+        client, transport = _client([httpx.ReadTimeout("boom"), _manifest_response({"ok": True})])
+        result = client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_429_then_success(self):
+        client, transport = _client([httpx.Response(429), _manifest_response({"ok": True})])
+        result = client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_500_then_success(self):
+        client, transport = _client([httpx.Response(500), _manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_502_then_success(self):
+        client, transport = _client([httpx.Response(502), _manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_503_then_success(self):
+        client, transport = _client([httpx.Response(503), _manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_504_then_success(self):
+        client, transport = _client([httpx.Response(504), _manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_retry_exhaustion_stops_at_exact_configured_count(self):
+        # max_retries=2 -> stop_after_attempt(3) -> exactly 3 attempts,
+        # never a 4th.
+        steps = [httpx.ConnectError("boom")] * 3
+        client, transport = _client(steps, max_retries=2)
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 3)
+
+    def test_401_is_never_retried(self):
+        client, transport = _client([httpx.Response(401), _manifest_response({"ok": True})])
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_403_is_never_retried(self):
+        client, transport = _client([httpx.Response(403), _manifest_response({"ok": True})])
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_404_is_never_retried(self):
+        client, transport = _client([httpx.Response(404), _manifest_response({"ok": True})])
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_400_is_never_retried(self):
+        client, transport = _client([httpx.Response(400), _manifest_response({"ok": True})])
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_retry_after_honored_but_capped_at_configured_max_delay(self):
+        sleeps: list[float] = []
+        client, transport = _client(
+            [httpx.Response(429, headers={"Retry-After": "9999"}), _manifest_response({"ok": True})],
+            max_retry_delay_seconds=2.0,
+            _sleeps=sleeps,
+        )
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(sleeps), 1)
+        self.assertLessEqual(sleeps[0], 2.0)
+
+    def test_exponential_backoff_never_exceeds_configured_max_delay(self):
+        sleeps: list[float] = []
+        client, transport = _client(
+            [httpx.ConnectError("boom"), httpx.ConnectError("boom"), _manifest_response({"ok": True})],
+            max_retry_delay_seconds=1.0,
+            max_retries=3,
+            _sleeps=sleeps,
+        )
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(sleeps), 2)
+        for sleep_value in sleeps:
+            self.assertLessEqual(sleep_value, 1.0)
+
+    def test_non_numeric_retry_after_falls_back_to_exponential_backoff(self):
+        sleeps: list[float] = []
+        client, transport = _client(
+            [httpx.Response(503, headers={"Retry-After": "Wed, 21 Oct 2099 07:28:00 GMT"}), _manifest_response({"ok": True})],
+            max_retry_delay_seconds=5.0,
+            _sleeps=sleeps,
+        )
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(len(sleeps), 1)
+        self.assertLessEqual(sleeps[0], 5.0)
+
+    def test_response_closed_before_each_retry(self):
+        # A 429/5xx response's body must be closed (never left open) as
+        # soon as retryability is determined -- otherwise a connection
+        # pool slot would leak on every retried attempt.
+        closed_flags: list[bool] = []
+
+        real_response = httpx.Response(429)
+        original_close = real_response.close
+
+        def _tracking_close():
+            closed_flags.append(True)
+            return original_close()
+
+        real_response.close = _tracking_close  # type: ignore[method-assign]
+
+        client, transport = _client([real_response, _manifest_response({"ok": True})])
+        client.fetch_manifest_json("https://example.invalid/manifest.json")
+        self.assertEqual(closed_flags, [True])
+
+
+class TestRedirectsNeverFollowed(unittest.TestCase):
+    def test_redirect_response_is_not_transparently_followed(self):
+        client, transport = _client(
+            [httpx.Response(302, headers={"Location": "https://attacker.invalid/steal"})]
+        )
+        with self.assertRaises(DownloadError):
+            client.fetch_manifest_json("https://example.invalid/manifest.json")
+        # Exactly one request -- the client never automatically issued a
+        # second request to the redirect target.
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(str(transport.calls[0].url), "https://example.invalid/manifest.json")
+
+
+class TestDownloadArtifact(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.dest_dir = Path(self._tmp.name)
-        self._servers: list[_Server] = []
 
-    def tearDown(self):
-        for server in self._servers:
-            server.stop()
-
-    def _start(self, handle_fn) -> _Server:
-        server = _Server(handle_fn)
-        self._servers.append(server)
-        return server
-
-    def _artifact(self, url: str) -> Artifact:
-        return Artifact(table="patient", url=url, sha256=CONTENT_SHA256, size_bytes=len(CONTENT))
-
-    def _client(self, max_retries=2, sleep_fn=lambda s: None) -> ApiClient:
-        return ApiClient(
-            token=TOKEN, timeout_seconds=5, max_retries=max_retries, logger=None, sleep_fn=sleep_fn
+    def _artifact(self, content: bytes) -> Artifact:
+        return Artifact(
+            table="eligibility",
+            url="https://example.invalid/snap-1/eligibility.csv",
+            sha256=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
         )
 
-    # --- happy path -----------------------------------------------------
-    def test_bearer_auth_header_sent(self):
-        seen_auth = {}
+    def test_successful_download_writes_file_and_returns_result(self):
+        content = b"patient_id\n1\n2\n"
+        artifact = self._artifact(content)
+        client, transport = _client([httpx.Response(200, content=content)])
+        result = client.download_artifact(artifact, self.dest_dir)
+        self.assertEqual(result.sha256, artifact.sha256)
+        self.assertEqual(result.size_bytes, len(content))
+        self.assertTrue((self.dest_dir / "eligibility.csv").is_file())
+        self.assertFalse((self.dest_dir / "eligibility.csv.part").exists())
 
-        def handle(h):
-            seen_auth["value"] = h.headers.get("Authorization")
-            h.send_response(200)
-            h.send_header("Content-Length", str(len(CONTENT)))
-            h.end_headers()
-            h.wfile.write(CONTENT)
+    def test_checksum_mismatch_raises_and_removes_part_file(self):
+        content = b"patient_id\n1\n2\n"
+        artifact = self._artifact(content)
+        # Serve different bytes than the manifest declared a checksum for.
+        client, transport = _client([httpx.Response(200, content=b"tampered-content")])
+        with self.assertRaises(ChecksumError):
+            client.download_artifact(artifact, self.dest_dir)
+        self.assertFalse((self.dest_dir / "eligibility.csv").exists())
+        self.assertFalse((self.dest_dir / "eligibility.csv.part").exists())
 
-        server = self._start(handle)
-        client = self._client()
-        result = client.download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
-        self.assertEqual(seen_auth["value"], f"Bearer {TOKEN}")
-        self.assertEqual(result.sha256, CONTENT_SHA256)
-        self.assertTrue((self.dest_dir / "patient.csv").is_file())
-        self.assertFalse((self.dest_dir / "patient.csv.part").exists())
-
-    def test_user_agent_sent(self):
-        seen = {}
-
-        def handle(h):
-            seen["ua"] = h.headers.get("User-Agent")
-            h.send_response(200)
-            h.send_header("Content-Length", str(len(CONTENT)))
-            h.end_headers()
-            h.wfile.write(CONTENT)
-
-        server = self._start(handle)
-        self._client().download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
-        self.assertIn("tuva-ingest/", seen["ua"])
-
-    # --- integrity checks -------------------------------------------------
-    def test_checksum_mismatch_raises_and_cleans_up(self):
-        def handle(h):
-            h.send_response(200)
-            wrong = b"not the right content!!"
-            h.send_header("Content-Length", str(len(wrong)))
-            h.end_headers()
-            h.wfile.write(wrong)
-
-        server = self._start(handle)
-        with self.assertRaises((ChecksumError, DownloadError)):
-            self._client().download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
-        self.assertFalse((self.dest_dir / "patient.csv").exists())
-        self.assertFalse((self.dest_dir / "patient.csv.part").exists())
-
-    def test_size_mismatch_raises_and_cleans_up(self):
-        def handle(h):
-            h.send_response(200)
-            short = CONTENT[:5]
-            h.send_header("Content-Length", str(len(short)))
-            h.end_headers()
-            h.wfile.write(short)
-
-        server = self._start(handle)
+    def test_size_mismatch_raises_and_removes_part_file(self):
+        content = b"patient_id\n1\n2\n"
+        artifact = self._artifact(content)
+        client, transport = _client([httpx.Response(200, content=content + b"extra-unexpected-bytes")])
         with self.assertRaises(DownloadError):
-            self._client().download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
-        self.assertFalse((self.dest_dir / "patient.csv").exists())
-        self.assertFalse((self.dest_dir / "patient.csv.part").exists())
+            client.download_artifact(artifact, self.dest_dir)
+        self.assertFalse((self.dest_dir / "eligibility.csv").exists())
+        self.assertFalse((self.dest_dir / "eligibility.csv.part").exists())
 
-    # --- retry behavior -----------------------------------------------------
-    def test_429_is_retried_then_succeeds(self):
-        attempts = {"n": 0}
-
-        def handle(h):
-            attempts["n"] += 1
-            if attempts["n"] == 1:
-                h.send_response(429)
-                h.send_header("Retry-After", "0")
-                h.send_header("Content-Length", "0")
-                h.end_headers()
-                return
-            h.send_response(200)
-            h.send_header("Content-Length", str(len(CONTENT)))
-            h.end_headers()
-            h.wfile.write(CONTENT)
-
-        server = self._start(handle)
-        result = self._client().download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
-        self.assertEqual(attempts["n"], 2)
-        self.assertEqual(result.sha256, CONTENT_SHA256)
-
-    def test_503_is_retried_then_succeeds(self):
-        attempts = {"n": 0}
-
-        def handle(h):
-            attempts["n"] += 1
-            if attempts["n"] <= 2:
-                h.send_response(503)
-                h.send_header("Content-Length", "0")
-                h.end_headers()
-                return
-            h.send_response(200)
-            h.send_header("Content-Length", str(len(CONTENT)))
-            h.end_headers()
-            h.wfile.write(CONTENT)
-
-        server = self._start(handle)
-        result = self._client(max_retries=3).download_artifact(
-            self._artifact(server.base_url + "/patient.csv"), self.dest_dir
+    def test_exceeding_configured_max_artifact_bytes_aborts_and_cleans_up(self):
+        artifact = Artifact(
+            table="eligibility", url="https://example.invalid/snap-1/eligibility.csv",
+            sha256="a" * 64, size_bytes=10,
         )
-        self.assertEqual(attempts["n"], 3)
-        self.assertEqual(result.sha256, CONTENT_SHA256)
-
-    def test_404_is_not_retried(self):
-        attempts = {"n": 0}
-
-        def handle(h):
-            attempts["n"] += 1
-            h.send_response(404)
-            h.send_header("Content-Length", "0")
-            h.end_headers()
-
-        server = self._start(handle)
+        oversized_content = b"x" * 5000
+        client, transport = _client([httpx.Response(200, content=oversized_content)], max_artifact_bytes=1024)
         with self.assertRaises(DownloadError):
-            self._client(max_retries=3).download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
-        self.assertEqual(attempts["n"], 1)
+            client.download_artifact(artifact, self.dest_dir)
+        self.assertFalse((self.dest_dir / "eligibility.csv").exists())
+        self.assertFalse((self.dest_dir / "eligibility.csv.part").exists())
 
-    def test_401_is_not_retried_and_token_not_leaked(self):
-        attempts = {"n": 0}
-
-        def handle(h):
-            attempts["n"] += 1
-            h.send_response(401)
-            h.send_header("Content-Length", "0")
-            h.end_headers()
-
-        server = self._start(handle)
-        with self.assertRaises(DownloadError) as ctx:
-            self._client(max_retries=3).download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
-        self.assertEqual(attempts["n"], 1)
-        self.assertNotIn(TOKEN, str(ctx.exception))
-
-    def test_exhausted_retries_raises(self):
-        def handle(h):
-            h.send_response(500)
-            h.send_header("Content-Length", "0")
-            h.end_headers()
-
-        server = self._start(handle)
+    def test_401_raises_without_retry(self):
+        artifact = self._artifact(b"x")
+        client, transport = _client([httpx.Response(401)])
         with self.assertRaises(DownloadError):
-            self._client(max_retries=1).download_artifact(self._artifact(server.base_url + "/patient.csv"), self.dest_dir)
+            client.download_artifact(artifact, self.dest_dir)
+        self.assertEqual(len(transport.calls), 1)
 
-    def test_manifest_fetch_and_json_parsing(self):
-        import json
+    def test_404_raises_without_retry(self):
+        artifact = self._artifact(b"x")
+        client, transport = _client([httpx.Response(404)])
+        with self.assertRaises(DownloadError):
+            client.download_artifact(artifact, self.dest_dir)
+        self.assertEqual(len(transport.calls), 1)
 
-        payload = {"version": 1, "source": "tuva"}
-        body = json.dumps(payload).encode("utf-8")
+    def test_transient_failure_then_success_downloads_correctly(self):
+        content = b"patient_id\n1\n2\n3\n"
+        artifact = self._artifact(content)
+        client, transport = _client([httpx.Response(503), httpx.Response(200, content=content)])
+        result = client.download_artifact(artifact, self.dest_dir)
+        self.assertEqual(result.sha256, artifact.sha256)
+        self.assertEqual(len(transport.calls), 2)
 
-        def handle(h):
-            h.send_response(200)
-            h.send_header("Content-Length", str(len(body)))
-            h.end_headers()
-            h.wfile.write(body)
+    def test_no_part_file_left_over_after_success(self):
+        content = b"a,b\n1,2\n"
+        artifact = self._artifact(content)
+        client, transport = _client([httpx.Response(200, content=content)])
+        client.download_artifact(artifact, self.dest_dir)
+        leftover_parts = list(self.dest_dir.glob("*.part"))
+        self.assertEqual(leftover_parts, [])
 
-        server = self._start(handle)
-        result = self._client().fetch_manifest_json(server.base_url + "/manifest.json")
-        self.assertEqual(result, payload)
+
+class TestClientLifecycle(unittest.TestCase):
+    def test_context_manager_closes_underlying_httpx_client(self):
+        client, transport = _client([_manifest_response({"ok": True})])
+        with client as ctx_client:
+            self.assertIs(ctx_client, client)
+            self.assertFalse(client._client.is_closed)
+        self.assertTrue(client._client.is_closed)
+
+    def test_close_is_idempotent_and_closes_httpx_client(self):
+        client, transport = _client([_manifest_response({"ok": True})])
+        client.close()
+        self.assertTrue(client._client.is_closed)
 
 
 if __name__ == "__main__":

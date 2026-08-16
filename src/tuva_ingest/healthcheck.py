@@ -44,7 +44,7 @@ class HealthCheckResult:
 
 def run_healthcheck(config, *, connect_fn=connect, migrations_mod=migrations, state_mod=state) -> HealthCheckResult:
     try:
-        conn = connect_fn(config.pg_dsn)
+        conn = connect_fn(config.pg_dsn_value)
     except Exception:  # noqa: BLE001 - deliberately broad: any connect failure is "unhealthy"
         return HealthCheckResult(
             db_connect_ok=False,

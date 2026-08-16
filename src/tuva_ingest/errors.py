@@ -59,3 +59,21 @@ class StateError(ConnectorError):
 
 class HealthCheckError(ConnectorError):
     category = "healthcheck"
+
+
+class CliUsageError(ConnectorError):
+    """Invalid CLI input caught by validation *before* any HTTP request or
+    SQL statement is issued -- an unknown --endpoint, an invalid --since
+    date, or any other unsafe/malformed argument value. Deliberately a
+    distinct category from ConfigError (environment-driven configuration)
+    so operators/monitoring can tell "bad deployment" apart from "bad
+    invocation" at a glance."""
+
+    category = "validation"
+
+
+class RunNotFoundError(ConnectorError):
+    """Raised by `load --run-id` when the given run_id does not resolve to
+    a published, successful extraction -- never a silent no-op."""
+
+    category = "run_not_found"

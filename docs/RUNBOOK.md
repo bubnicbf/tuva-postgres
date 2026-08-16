@@ -10,18 +10,35 @@ Full pipeline, one command (requires `.env` populated -- see
 `scripts/setup_env.example`):
 
 ```bash
-make run   # migrate -> extract -> load-raw -> dbt deps -> dbt build
+make run   # migrate -> extract -> load-raw -> dbt deps ->
+           # dbt build --select tag:input_layer -> dbt build --select tag:dq_structural
 ```
+
+`tuva-ingest run` (what `make run` invokes) stops at the first failed
+stage -- it never attempts `dbt build --select tag:dq_structural` after
+`tag:input_layer` fails, and never marks the run `succeeded` unless both
+pass. See README.md's "Validation order" for why this gate exists and
+how the same order is enforced in `make pipeline` and CI.
 
 Or step by step, for more control/visibility between stages:
 
 ```bash
-make migrate          # apply pending operational migrations (idempotent)
-make extract          # fetch + publish a raw snapshot
+make migrate           # apply pending operational migrations (idempotent)
+make extract           # fetch + publish a raw snapshot
 make load-raw          # load the current published snapshot into RAW_SCHEMA
-make dbt-deps           # fetch the pinned Tuva 0.18.0 package (needs network)
-make dbt-build           # staging -> Input Layer -> Tuva's own models + tests
-make health              # DB connectivity + migration state + freshness
+make dbt-debug          # connection/profile sanity check
+make dbt-deps            # fetch the pinned Tuva 0.18.0 package (needs network)
+make dbt-parse            # Jinja/YAML/ref() validation, no database needed
+make dbt-input-layer       # this connector's own staging + Input Layer models + tests
+make dbt-dq-structural      # the pinned Tuva package's structural DQ (must pass before anything below)
+make dbt-build                # (equivalent to the old unconditional "build everything")
+make health                    # DB connectivity + migration state + freshness
+```
+
+Or the whole stop-on-first-failure validation order in one command:
+
+```bash
+make pipeline   # quality -> dbt-debug -> dbt-deps -> dbt-parse -> dbt-input-layer -> dbt-dq-structural
 ```
 
 Every command reads its configuration from `.env` (or the process
@@ -63,13 +80,49 @@ designed to be retry-safe:
   bookkeeping) rolled back together; no partial snapshot is visible.
   Rerun `make load-raw` -- the same snapshot_id reloads cleanly (raw
   tables are `TRUNCATE`d and reloaded per snapshot, never appended to).
-- **`dbt deps`/`dbt build` failed**: fix the underlying issue (network
-  access for `dbt deps`; a failing model/test for `dbt build`) and
-  rerun `make dbt-deps`/`make dbt-build`. Neither mutates the raw
-  schema, so this never requires re-running `extract`/`load-raw`.
+- **`dbt deps` failed**: almost always a network-access problem
+  reaching dbt Hub -- fix connectivity and rerun `make dbt-deps`.
+- **`dbt build --select tag:input_layer` failed**: a bug in this
+  connector's own staging/final models or their schema tests. Fix it,
+  then rerun `make dbt-input-layer` (or `make dbt-dq-structural`
+  afterward, since a failure here means that stage never ran).
+- **`dbt build --select tag:dq_structural` failed**: the pinned Tuva
+  package's structural DQ found a problem with the Input Layer models'
+  shape (missing model/column, wrong type, broken key). See README.md's
+  "Validation order" -- fix `models/final/*.sql`/`schema.yml` and rerun
+  `make dbt-input-layer` then `make dbt-dq-structural` (never skip
+  straight to logical/analytical DQ or `make run` again until this
+  passes).
+- None of the `dbt-*` targets mutate the raw schema, so any of the
+  above failures never requires re-running `extract`/`load-raw`.
 - **Migration checksum mismatch**: a previously applied migration file
   changed on disk. Migrations are immutable once applied -- revert the
   change and add a new migration instead of editing an applied one.
+
+### Other common failure modes
+
+- **"could not find model" / package resolution errors**: usually means
+  `dbt deps` was not (re)run after a `packages.yml` change, or
+  `flags.require_ref_searches_node_package_before_root` was removed
+  from `dbt_project.yml` -- the pinned Tuva package needs that flag to
+  `ref()` this project's `models/final/*.sql` by name.
+- **Unexpected schema name**: see README.md's "Actual generated
+  PostgreSQL schema names" -- confirm `macros/generate_schema_name.sql`
+  is still present and unmodified, and that `INPUT_LAYER_SCHEMA`/
+  `input_layer_schema` is set to what you expect.
+- **Missing column / type mismatch reported by `dbt build --select
+  tag:dq_structural`**: `models/final/*.sql` has drifted from the
+  pinned package's actual contract. Re-derive the column list from an
+  official Tuva source for the pinned version (never from this
+  repository's own prior SQL alone -- see README.md "Upgrading beyond
+  Tuva 0.18.0") and update the model + `models/final/schema.yml`
+  together.
+- **`tag:dq_structural` selects zero nodes**: the tag name this
+  connector assumes does not match the installed package version. Run
+  `dbt ls --select tag:dq_structural` after `dbt deps` to find the
+  correct selector for your pinned version and update
+  `Makefile`/`README.md`/`.github/workflows/ci.yml` together (see
+  README.md "Known limitations").
 
 ## Retention and reruns
 

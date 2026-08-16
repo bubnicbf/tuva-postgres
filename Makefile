@@ -1,8 +1,9 @@
 .PHONY: init deps migrate migrate-status extract load-raw run health \
-        dbt-deps dbt-parse dbt-compile dbt-build dbt-test \
+        dbt-debug dbt-deps dbt-parse dbt-compile dbt-build dbt-test \
+        dbt-input-layer dbt-dq-structural dbt-dq-logical dbt-dq-analytical \
         test-unit test-integration test-python check-python-deps \
         lint-python format-python format-python-check typecheck lint-sql \
-        quality lint fmt \
+        quality lint fmt pipeline \
         docker-build test-container \
         compose-up compose-down \
         local-db-up local-db-migrate local-db-ready local-db-status \
@@ -53,6 +54,13 @@ extract:
 load-raw:
 	. .env && uv run tuva-ingest load-raw
 
+# Checks the dbt profile/connection (PG_DSN, target config) resolves
+# and can actually reach the configured PostgreSQL database. The first
+# step of the structural-DQ-gated pipeline (see README.md "Validation
+# order") -- run before dbt-deps so a bad connection fails fast.
+dbt-debug:
+	. .env && uv run tuva-ingest dbt -- debug
+
 # Fetches the pinned Tuva package (packages.yml, tuva-health/
 # the_tuva_project == 0.18.0) plus dbt_utils. Requires network access to
 # dbt Hub.
@@ -78,6 +86,53 @@ dbt-build:
 
 dbt-test:
 	. .env && uv run tuva-ingest dbt -- test
+
+# --- Structural DQ gate (see README.md "Validation order" and
+#     "Structural DQ must pass before logical/analytical DQ") ---------
+#
+# Stage 1: build ONLY this connector's own models (models/staging/*.sql
+# + models/final/*.sql, both tagged `input_layer` in dbt_project.yml --
+# see that file's own comment for why staging is tagged too, not just
+# final) plus their schema tests (models/staging/schema.yml,
+# models/final/schema.yml). This must pass before the pinned Tuva
+# package's own models are built at all.
+dbt-input-layer:
+	. .env && uv run tuva-ingest dbt -- build --select tag:input_layer
+
+# Stage 2: the pinned Tuva package's own structural data-quality
+# checks -- the package-provided tests that validate the Input Layer's
+# STRUCTURE (required models exist, required columns exist with
+# compatible types, primary keys hold) as opposed to the logical/
+# analytical DQI checks that validate the VALUES within that structure.
+# Requires dbt-input-layer to have already succeeded (a structural
+# failure here means Tuva's own package cannot safely resolve this
+# project's Input Layer models; never proceed to logical/analytical DQ
+# or downstream marts when this fails -- see README.md).
+#
+# NOTE: this repository's sandboxed development/validation environment
+# has no outbound network access to dbt Hub/PyPI and no local
+# PostgreSQL, so `tag:dq_structural`'s exact node selection could not be
+# executed and confirmed against the live pinned package here (see
+# README.md "Known limitations" and the final PR description for the
+# full record of what was, and was not, run). Before relying on this
+# target in production, run it once in a network-enabled environment and
+# confirm `dbt ls --select tag:dq_structural` selects a non-empty,
+# expected set of nodes.
+dbt-dq-structural:
+	. .env && uv run tuva-ingest dbt -- build --select tag:dq_structural
+
+# Stage 3 (optional): the pinned Tuva package's logical DQI checks, if/
+# when this project selects them explicitly (see
+# https://thetuvaproject.com/data-quality-overview). Never runs unless
+# dbt-dq-structural has already succeeded.
+dbt-dq-logical:
+	. .env && uv run tuva-ingest dbt -- build --select tag:dq_logical
+
+# Stage 4 (optional): the pinned Tuva package's analytical/metric-level
+# DQI checks, if/when this project selects them explicitly. Never runs
+# unless dbt-dq-logical has already succeeded.
+dbt-dq-analytical:
+	. .env && uv run tuva-ingest dbt -- build --select tag:dq_analytical
 
 # Runs the full production pipeline once: migrate -> extract -> load-raw
 # -> dbt deps -> dbt build (src/tuva_ingest/cli.py's `run` subcommand).
@@ -298,3 +353,22 @@ ci-full: quality dbt-parse
 	. .env && uv run tuva-ingest dbt -- deps
 	$(MAKE) test-integration
 	@echo "ci-full: quality gate, dbt parse/deps, and the full disposable-database integration suite all passed."
+
+# The complete, stop-on-first-failure validation pipeline in the exact
+# order required by README.md's "Validation order" (structural DQ must
+# gate logical/analytical DQ, which in turn gate any downstream Tuva
+# models/marts). Each step is a separate `make` invocation via `&&`, so
+# the whole chain stops at the first non-zero exit code -- never
+# continuing to a later stage after an earlier one fails. Requires
+# PG_DSN pointed at a disposable PostgreSQL database and network access
+# (for dbt-deps' Tuva package fetch). dbt-dq-logical/dbt-dq-analytical
+# are included only if this project ever selects those tags explicitly
+# (see those targets' own comments); until then they are effectively a
+# documented no-op extension point, never a silent skip of a real check.
+pipeline: quality
+	$(MAKE) dbt-debug
+	$(MAKE) dbt-deps
+	$(MAKE) dbt-parse
+	$(MAKE) dbt-input-layer
+	$(MAKE) dbt-dq-structural
+	@echo "pipeline: quality gate, dbt debug/deps/parse, input_layer build, and structural DQ all passed, in that order."

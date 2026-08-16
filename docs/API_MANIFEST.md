@@ -9,6 +9,14 @@ or (in tests) an in-process mock server -- can serve this contract.
 Implemented in `src/tuva_ingest/manifest.py`; validated by
 `tests/unit/test_manifest.py`.
 
+For the operational contract of whatever source is actually configured
+behind this wire format -- authentication, pagination, rate limits,
+incremental/historical-mutability semantics, corrections/deletions,
+backfill volume, PHI classification, and reconciliation -- see
+`docs/SOURCE_CONTRACT.md`. That document must stay current before any
+extraction change is considered complete (validated by
+`tests/unit/test_source_contract.py`).
+
 ## Shape
 
 ```json

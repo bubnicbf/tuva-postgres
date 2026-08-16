@@ -128,24 +128,58 @@ jobs:
           uv run tuva-ingest migrate
           uv run tuva-ingest migrate --status
 
+      - name: dbt debug (connection check)
+        run: uv run dbt debug --project-dir . --profiles-dir . --target ci
+
       - name: Fetch the pinned Tuva package (dbt deps)
         run: uv run dbt deps --project-dir . --profiles-dir . --target ci
+
+      - name: dbt parse (with a live database configured)
+        run: uv run dbt parse --project-dir . --profiles-dir . --target ci
+
+      # --- Structural DQ gate (see README.md "Validation order") -----
+      # Stages below run against an EMPTY database (no raw fixtures
+      # loaded yet) purely to prove the connector's own Input Layer
+      # models and the pinned package's structural DQ checks compile and
+      # build cleanly end to end -- including the "structurally valid
+      # empty relation" contract for any disabled-domain models (none,
+      # today, since clinical/provider_attribution/semantic_layer all
+      # stay disabled -- see dbt_project.yml). The full row-count/
+      # column-completeness assertions against real fixture data happen
+      # in the "Run the full disposable-database integration suite" step
+      # below, via tests/integration/test_pipeline_integration.py.
+      - name: dbt build --select tag:input_layer (this connector's own models)
+        run: uv run dbt build --project-dir . --profiles-dir . --target ci --select tag:input_layer
+
+      - name: dbt build --select tag:dq_structural (Tuva package structural DQ)
+        # See Makefile's dbt-dq-structural target for the documented
+        # caveat: this selector's exact node set should be reconfirmed
+        # against the live pinned package the first time this workflow
+        # runs with real network access (not available in this PR's own
+        # sandboxed development environment -- see README.md "Known
+        # limitations"). This step intentionally does NOT continue on
+        # error: a structural DQ failure must stop the job here, before
+        # the full integration suite (which includes logical assertions)
+        # ever runs.
+        run: uv run dbt build --project-dir . --profiles-dir . --target ci --select tag:dq_structural
 
       - name: Run the full disposable-database integration suite
         # migrations idempotency (re-applied above), raw fixture loading
         # (twice, proving no duplication), rollback-on-failure, state
         # transitions, and -- since dbt is now on PATH and deps succeeded
         # above -- a real `dbt build` proving raw fixtures -> staging ->
-        # Input Layer -> the pinned Tuva package's own models. See
-        # tests/integration/test_pipeline_integration.py's module
-        # docstring for the complete list of what this proves. This step
-        # must not skip: PG_DSN is set and psycopg/dbt are installed, so
-        # every test in the module runs for real -- `-rs` prints a
-        # one-line summary of any skip, and the job fails outright if
-        # one occurred (defense in depth against a silently-skipping
-        # integration suite: a skip here would mean a real bug in the
-        # test module's guard conditions, not a legitimate environment
-        # limitation, since both PG_DSN and dbt are available).
+        # Input Layer -> the pinned Tuva package's own models, gated by
+        # the same tag:input_layer -> tag:dq_structural order enforced
+        # above. See tests/integration/test_pipeline_integration.py's
+        # module docstring for the complete list of what this proves.
+        # This step must not skip: PG_DSN is set and psycopg/dbt are
+        # installed, so every test in the module runs for real -- `-rs`
+        # prints a one-line summary of any skip, and the job fails
+        # outright if one occurred (defense in depth against a
+        # silently-skipping integration suite: a skip here would mean a
+        # real bug in the test module's guard conditions, not a
+        # legitimate environment limitation, since both PG_DSN and dbt
+        # are available).
         run: |
           set -o pipefail
           uv run pytest tests/integration -v -rs 2>&1 | tee /tmp/pytest-integration.log

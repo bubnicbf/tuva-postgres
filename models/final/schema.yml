@@ -3,85 +3,139 @@ version: 2
 models:
   - name: eligibility
     description: >
-      Tuva Input Layer contract model. Consumed directly by the Tuva
-      package (packages.yml, pinned to tuva-health/the_tuva_project
+      Tuva Input Layer contract model (35 columns). Consumed directly by
+      the Tuva package (packages.yml, pinned to tuva-health/the_tuva_project
       0.18.0) via ref('eligibility'). See the model's header comment for
-      the documented assumption behind this column mapping.
+      how the full column contract was confirmed against official Tuva
+      sources, and for which fields this connector's source cannot
+      supply (typed NULL, never a guess).
+    config:
+      tags: ["input_layer"]
     columns:
-      - name: patient_id
-        description: Person identifier, unique per patient within a data_source.
+      - name: person_id
+        description: Person identifier; part of the eligibility primary key.
         data_tests: [not_null]
       - name: member_id
-        description: Member/subscriber-line identifier.
+        description: Payer-assigned member identifier; part of the eligibility primary key.
+        data_tests: [not_null]
       - name: enrollment_start_date
-        description: Coverage start date.
+        description: Coverage start date; part of the eligibility primary key.
+        data_tests: [not_null]
       - name: enrollment_end_date
-        description: Coverage end date.
+        description: Coverage end date; part of the eligibility primary key.
+        data_tests: [not_null]
       - name: payer
         description: Payer name.
-      - name: data_source
-        description: Source system tag distinguishing this connector's data within a shared Tuva warehouse.
+      - name: plan
+        description: Health insurance plan/sub-contract.
+      - name: death_flag
+        description: 1 if death_date is populated, else 0.
         data_tests:
-          - not_null
           - accepted_values:
-              values: ["tuva"]
+              values: [0, 1]
+      - name: data_source
+        description: >
+          User-defined source system tag (typically payer + state);
+          part of the eligibility primary key. Not restricted to a
+          fixed set of values -- this connector may ingest additional
+          data sources over time.
+        data_tests: [not_null]
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - person_id
+            - member_id
+            - enrollment_start_date
+            - enrollment_end_date
+            - data_source
 
   - name: medical_claim
     description: >
-      Tuva Input Layer contract model. Consumed directly by the Tuva
-      package via ref('medical_claim'). See the model's header comment
-      for the documented assumption behind this column mapping.
+      Tuva Input Layer contract model (148 columns). Consumed directly
+      by the Tuva package via ref('medical_claim'). See the model's
+      header comment for how the full column contract was confirmed
+      against official Tuva sources, and for which fields this
+      connector's source cannot supply (typed NULL, never a guess).
+    config:
+      tags: ["input_layer"]
     columns:
       - name: claim_id
-        description: Claim identifier.
+        description: Claim identifier; part of the medical_claim primary key.
         data_tests: [not_null]
       - name: claim_line_number
-        description: 1-based claim line number within claim_id.
-      - name: patient_id
-        description: Person identifier; expected to match eligibility.patient_id for the same data_source.
+        description: 1-based claim line number within claim_id; part of the medical_claim primary key.
         data_tests: [not_null]
       - name: claim_type
-        description: Source-supplied claim type (e.g. institutional/professional).
-      - name: paid_amount
-        description: Amount paid on this claim line.
-      - name: data_source
-        description: Source system tag distinguishing this connector's data within a shared Tuva warehouse.
+        description: institutional, professional, or undetermined; consistent for all lines of a claim_id.
         data_tests:
           - not_null
           - accepted_values:
-              values: ["tuva"]
+              values: ["institutional", "professional", "undetermined"]
+      - name: person_id
+        description: Person identifier; expected to match eligibility.person_id for the same data_source.
+        data_tests: [not_null]
+      - name: member_id
+        description: Payer-assigned member identifier.
+        data_tests: [not_null]
+      - name: payer
+        description: Payer name.
+        data_tests: [not_null]
+      - name: plan
+        description: Health insurance plan/sub-contract.
+        data_tests: [not_null]
+      - name: paid_amount
+        description: Amount paid on this claim line by the payer.
+      - name: data_source
+        description: >
+          User-defined source system tag (typically payer + state);
+          part of the medical_claim primary key. Not restricted to a
+          fixed set of values -- this connector may ingest additional
+          data sources over time.
+        data_tests: [not_null]
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns:
             - claim_id
             - claim_line_number
+            - data_source
 
   - name: pharmacy_claim
     description: >
-      Tuva Input Layer contract model. Consumed directly by the Tuva
-      package via ref('pharmacy_claim'). See the model's header comment
-      for the documented assumption behind this column mapping.
+      Tuva Input Layer contract model (25 columns). Consumed directly by
+      the Tuva package via ref('pharmacy_claim'). See the model's header
+      comment for how the full column contract was confirmed against
+      official Tuva sources, and for which fields this connector's
+      source cannot supply (typed NULL, never a guess).
+    config:
+      tags: ["input_layer"]
     columns:
       - name: claim_id
-        description: Claim identifier.
+        description: Claim identifier; part of the pharmacy_claim primary key.
         data_tests: [not_null]
       - name: claim_line_number
-        description: 1-based claim line number within claim_id.
-      - name: patient_id
-        description: Person identifier; expected to match eligibility.patient_id for the same data_source.
+        description: 1-based claim line number within claim_id; part of the pharmacy_claim primary key.
+        data_tests: [not_null]
+      - name: person_id
+        description: Person identifier; expected to match eligibility.person_id for the same data_source.
+        data_tests: [not_null]
+      - name: member_id
+        description: Payer-assigned member identifier.
         data_tests: [not_null]
       - name: ndc_code
-        description: National Drug Code for the dispensed product.
+        description: National Drug Code for the dispensed product; expected on every pharmacy claim line.
+        data_tests: [not_null]
       - name: paid_amount
-        description: Amount paid on this claim line.
+        description: Amount paid on this claim line by the payer.
       - name: data_source
-        description: Source system tag distinguishing this connector's data within a shared Tuva warehouse.
-        data_tests:
-          - not_null
-          - accepted_values:
-              values: ["tuva"]
+        description: >
+          User-defined source system tag (typically payer + state);
+          part of the pharmacy_claim primary key. Not restricted to a
+          fixed set of values -- this connector may ingest additional
+          data sources over time.
+        data_tests: [not_null]
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns:
             - claim_id
             - claim_line_number
+            - data_source

@@ -1,19 +1,31 @@
 {{
   config(
-    materialized='table'
+    materialized='table',
+    tags=['input_layer']
   )
 }}
 
 -- Tuva Input Layer contract model: `pharmacy_claim`. See models/final/
--- eligibility.sql's header for the contract-mapping approach and the
--- documented limitation on confirming the exact 0.18.0 column list
--- against the live Tuva source.
+-- eligibility.sql's header for the two-source contract-verification
+-- approach and the one documented gap (README.md "Known limitations").
+--
+-- 25 columns, matching both thetuvaproject.com/connectors/
+-- claims-mapping-guide's field list and tuva-health/connector_template's
+-- verified pharmacy_claim reference implementation exactly.
+--
+-- Primary key: claim_id, claim_line_number, data_source (enforced in
+-- models/final/schema.yml via dbt_utils.unique_combination_of_columns).
+--
+-- Financial fields use numeric(38,2), per the mapping guide's
+-- documented convention for claims financial fields (this repository
+-- targets PostgreSQL only, so there is no cross-database reason to use
+-- a lower-precision float type here).
 --
 -- All source-fidelity normalization already happened in
 -- models/staging/stg_pharmacy_claim.sql; this model selects/types the
--- Input Layer's expected column set. Fields our source does not
--- provide (e.g. NDC description, generic indicator) are typed NULLs
--- rather than invented mappings.
+-- Input Layer's full column set and fills every field our source does
+-- not provide (in_network_flag, file lineage) with an explicitly typed
+-- NULL rather than an invented mapping.
 
 with staging as (
 
@@ -24,36 +36,42 @@ with staging as (
 final as (
 
     select
+
         claim_id::text                                        as claim_id,
         claim_line_number::integer                             as claim_line_number,
 
-        patient_id::text                                       as patient_id,
-        member_id::text                                        as member_id,
-        payer::text                                             as payer,
-        plan::text                                              as plan,
+        person_id::text                                       as person_id,
+        member_id::text                                       as member_id,
+        payer::text                                           as payer,
+        plan::text                                            as plan,
 
-        prescribing_provider_npi::text                          as prescribing_provider_npi,
-        dispensing_provider_npi::text                           as dispensing_provider_npi,
+        prescribing_provider_npi::text                         as prescribing_provider_npi,
+        dispensing_provider_npi::text                          as dispensing_provider_npi,
 
-        dispensing_date::date                                   as dispensing_date,
+        dispensing_date::date                                 as dispensing_date,
 
-        ndc_code::text                                          as ndc_code,
-        cast(null as text)                                      as ndc_description,
-        cast(null as text)                                      as generic_indicator,
+        ndc_code::text                                        as ndc_code,
 
-        quantity::numeric                                       as quantity,
-        days_supply::integer                                    as days_supply,
-        refills::integer                                        as refills,
+        quantity::integer                                     as quantity,
+        days_supply::integer                                  as days_supply,
+        refills::integer                                      as refills,
 
-        paid_date::date                                         as paid_date,
-        paid_amount::numeric                                    as paid_amount,
-        allowed_amount::numeric                                 as allowed_amount,
-        charge_amount::numeric                                  as charge_amount,
-        coinsurance_amount::numeric                             as coinsurance_amount,
-        copayment_amount::numeric                               as copayment_amount,
-        deductible_amount::numeric                              as deductible_amount,
+        paid_date::date                                       as paid_date,
+        paid_amount::numeric(38, 2)                           as paid_amount,
+        allowed_amount::numeric(38, 2)                        as allowed_amount,
+        charge_amount::numeric(38, 2)                         as charge_amount,
+        coinsurance_amount::numeric(38, 2)                    as coinsurance_amount,
+        copayment_amount::numeric(38, 2)                       as copayment_amount,
+        deductible_amount::numeric(38, 2)                     as deductible_amount,
 
-        data_source::text                                       as data_source
+        -- Not supplied by this source.
+        cast(null as integer)                                 as in_network_flag,
+
+        data_source::text                                     as data_source,
+
+        cast(null as text)                                    as file_name,
+        cast(null as date)                                    as file_date,
+        cast(null as timestamp)                               as ingest_datetime
 
     from staging
 

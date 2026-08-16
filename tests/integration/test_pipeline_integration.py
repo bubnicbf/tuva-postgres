@@ -321,11 +321,80 @@ class TestStateAgainstRealDatabase(_IsolatedSchemaTestCase):
 class TestDbtLineageAgainstRealDatabase(_IsolatedSchemaTestCase):
     """Only runs when `dbt` is actually resolvable (the locked venv's
     dbt-core/dbt-postgres, see pyproject.toml). Proves raw fixtures ->
-    staging -> Input Layer models actually build with a real dbt run --
-    NOT skipped silently when a real database is present; only skipped
-    when the `dbt` executable itself genuinely cannot be found."""
+    staging -> Input Layer models actually build with a real dbt run,
+    that the pinned Tuva package's structural DQ gate passes against
+    them, and that the resulting relations carry the full Tuva 0.18.0
+    Input Layer contract -- NOT skipped silently when a real database is
+    present; only skipped when the `dbt` executable itself genuinely
+    cannot be found.
 
-    def test_dbt_build_produces_input_layer_tables_with_expected_row_counts(self):
+    The expected column contract asserted below (names + PostgreSQL
+    types) was confirmed against thetuvaproject.com/connectors/
+    claims-mapping-guide and tuva-health/connector_template's reference
+    implementation -- see models/final/*.sql's own header comments for
+    the full citation. It is intentionally re-derived here (not
+    imported from the SQL models) so this test can catch the final
+    models silently drifting from the contract, not just from
+    themselves.
+    """
+
+    # (column_name, expected udt_name-family) -- checked via a `startswith`/
+    # membership match against information_schema.columns.data_type, since
+    # PostgreSQL may report e.g. "character varying" or "text" for both
+    # dbt's `text` casts depending on adapter version.
+    _TEXT_TYPES = {"text", "character varying"}
+    _ELIGIBILITY_COLUMNS = {
+        "person_id": _TEXT_TYPES, "member_id": _TEXT_TYPES, "subscriber_id": _TEXT_TYPES,
+        "gender": _TEXT_TYPES, "race": _TEXT_TYPES,
+        "birth_date": {"date"}, "death_date": {"date"}, "death_flag": {"integer"},
+        "enrollment_start_date": {"date"}, "enrollment_end_date": {"date"},
+        "payer": _TEXT_TYPES, "payer_type": _TEXT_TYPES, "plan": _TEXT_TYPES,
+        "original_reason_entitlement_code": _TEXT_TYPES, "dual_status_code": _TEXT_TYPES,
+        "medicare_status_code": _TEXT_TYPES, "group_id": _TEXT_TYPES, "group_name": _TEXT_TYPES,
+        "name_suffix": _TEXT_TYPES, "first_name": _TEXT_TYPES, "middle_name": _TEXT_TYPES,
+        "last_name": _TEXT_TYPES, "email": _TEXT_TYPES, "ethnicity": _TEXT_TYPES,
+        "social_security_number": _TEXT_TYPES, "subscriber_relation": _TEXT_TYPES,
+        "address": _TEXT_TYPES, "city": _TEXT_TYPES, "state": _TEXT_TYPES, "zip_code": _TEXT_TYPES,
+        "phone": _TEXT_TYPES, "data_source": _TEXT_TYPES, "file_name": _TEXT_TYPES,
+        "file_date": {"date"}, "ingest_datetime": {"timestamp without time zone", "timestamp with time zone"},
+    }
+    _MEDICAL_CLAIM_REQUIRED_COLUMNS = {
+        "claim_id", "claim_line_number", "claim_type", "person_id", "member_id", "payer", "plan",
+        "claim_start_date", "claim_end_date", "claim_line_start_date", "claim_line_end_date",
+        "admission_date", "discharge_date", "paid_date",
+        "admit_source_code", "admit_type_code", "discharge_disposition_code",
+        "place_of_service_code", "bill_type_code", "revenue_center_code",
+        "drg_code_type", "drg_code",
+        "service_unit_quantity", "hcpcs_code",
+        "hcpcs_modifier_1", "hcpcs_modifier_2", "hcpcs_modifier_3", "hcpcs_modifier_4", "hcpcs_modifier_5",
+        "rendering_npi", "rendering_tin", "billing_npi", "billing_tin", "facility_npi",
+        "paid_amount", "allowed_amount", "charge_amount", "coinsurance_amount",
+        "copayment_amount", "deductible_amount", "total_cost_amount",
+        "diagnosis_code_type", "procedure_code_type",
+        "in_network_flag", "data_source", "file_name", "file_date", "ingest_datetime",
+    } | {f"diagnosis_code_{i}" for i in range(1, 26)} | {f"diagnosis_poa_{i}" for i in range(1, 26)} \
+        | {f"procedure_code_{i}" for i in range(1, 26)} | {f"procedure_date_{i}" for i in range(1, 26)}
+    _PHARMACY_CLAIM_REQUIRED_COLUMNS = {
+        "claim_id", "claim_line_number", "person_id", "member_id", "payer", "plan",
+        "prescribing_provider_npi", "dispensing_provider_npi", "dispensing_date", "ndc_code",
+        "quantity", "days_supply", "refills", "paid_date", "paid_amount", "allowed_amount",
+        "charge_amount", "coinsurance_amount", "copayment_amount", "deductible_amount",
+        "in_network_flag", "data_source", "file_name", "file_date", "ingest_datetime",
+    }
+
+    def _run_dbt(self, *args, env, common):
+        return subprocess.run(["dbt", *args, *common], env=env, capture_output=True, text=True)
+
+    def _information_schema_columns(self, schema, table):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s",
+                (schema, table),
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+    def test_dbt_build_produces_input_layer_tables_with_full_contract_and_expected_row_counts(self):
         checksums = {
             table: {"sha256": raw_loader._file_sha256(FIXTURES_DIR / f"{table}.csv")}
             for table in ("eligibility", "medical_claim", "pharmacy_claim")
@@ -338,22 +407,48 @@ class TestDbtLineageAgainstRealDatabase(_IsolatedSchemaTestCase):
         env["PG_DSN"] = PG_DSN
         env["PGHOST"] = "localhost"
         common = ["--project-dir", str(REPO_ROOT), "--profiles-dir", str(REPO_ROOT)]
-        deps = subprocess.run(["dbt", "deps", *common], env=env, capture_output=True, text=True)
-        if deps.returncode != 0:
-            self.skipTest(f"dbt deps failed (likely no network access to fetch the pinned Tuva package): {deps.stdout[-2000:]}")
-
-        build = subprocess.run(
-            [
-                "dbt", "build", *common,
-                "--vars", f"{{raw_schema: {self.raw_schema}, input_layer_schema: {input_layer_schema}}}",
-                "--select", "staging final",
-            ],
-            env=env, capture_output=True, text=True,
-        )
+        dbt_vars = ["--vars", f"{{raw_schema: {self.raw_schema}, input_layer_schema: {input_layer_schema}}}"]
         self.addCleanup(
             lambda: self.conn.cursor().execute(f'DROP SCHEMA IF EXISTS "{input_layer_schema}" CASCADE')
         )
-        self.assertEqual(build.returncode, 0, build.stdout[-4000:])
+
+        deps = self._run_dbt("deps", env=env, common=common)
+        if deps.returncode != 0:
+            self.skipTest(f"dbt deps failed (likely no network access to fetch the pinned Tuva package): {deps.stdout[-2000:]}")
+
+        # Stage 1: this connector's own Input Layer models only (see
+        # README.md "Validation order" / dbt_project.yml's `+tags:
+        # ["input_layer"]` on both staging and final).
+        input_layer_build = self._run_dbt(
+            "build", *dbt_vars, "--select", "tag:input_layer", env=env, common=common,
+        )
+        self.assertEqual(input_layer_build.returncode, 0, input_layer_build.stdout[-4000:])
+
+        # Stage 2: the pinned Tuva package's structural DQ checks must
+        # pass against those Input Layer models before anything else
+        # runs. If `tag:dq_structural` selects zero nodes, that is
+        # itself a finding worth failing loudly on (see Makefile's
+        # dbt-dq-structural target and README.md "Known limitations" --
+        # this exact selector could not be confirmed against the live
+        # package in this repository's own sandboxed development
+        # environment, which has no outbound network access).
+        dq_structural_ls = subprocess.run(
+            ["dbt", "ls", *common, *dbt_vars, "--select", "tag:dq_structural", "--resource-type", "test"],
+            env=env, capture_output=True, text=True,
+        )
+        selected_structural_tests = [line for line in dq_structural_ls.stdout.splitlines() if line.strip()]
+        if dq_structural_ls.returncode == 0 and not selected_structural_tests:
+            self.fail(
+                "tag:dq_structural selected zero tests against the pinned Tuva package -- "
+                "the tag name assumed by this connector (Makefile's dbt-dq-structural target, "
+                "README.md's Validation order) does not match the installed package. Re-run "
+                "`dbt ls --select tag:dq_structural` against dbt_packages/the_tuva_project after "
+                "`dbt deps` to find the correct selector and update Makefile/README/CI together."
+            )
+        dq_structural_build = self._run_dbt(
+            "build", *dbt_vars, "--select", "tag:dq_structural", env=env, common=common,
+        )
+        self.assertEqual(dq_structural_build.returncode, 0, dq_structural_build.stdout[-4000:])
 
         with self.conn.cursor() as cur:
             cur.execute(f'SELECT count(*) FROM "{input_layer_schema}"."eligibility"')
@@ -362,6 +457,67 @@ class TestDbtLineageAgainstRealDatabase(_IsolatedSchemaTestCase):
             self.assertEqual(cur.fetchone()[0], 3)
             cur.execute(f'SELECT count(*) FROM "{input_layer_schema}"."pharmacy_claim"')
             self.assertEqual(cur.fetchone()[0], 3)
+
+        # Structural completeness: every required Tuva 0.18.0 column
+        # exists, with a compatible PostgreSQL type, on each relation --
+        # not just the ones this source happens to populate.
+        eligibility_cols = self._information_schema_columns(input_layer_schema, "eligibility")
+        self.assertEqual(set(eligibility_cols), set(self._ELIGIBILITY_COLUMNS))
+        for col, allowed_types in self._ELIGIBILITY_COLUMNS.items():
+            self.assertIn(eligibility_cols[col], allowed_types, f"eligibility.{col} has unexpected type {eligibility_cols[col]!r}")
+
+        medical_claim_cols = set(self._information_schema_columns(input_layer_schema, "medical_claim"))
+        self.assertEqual(medical_claim_cols, self._MEDICAL_CLAIM_REQUIRED_COLUMNS)
+
+        pharmacy_claim_cols = set(self._information_schema_columns(input_layer_schema, "pharmacy_claim"))
+        self.assertEqual(pharmacy_claim_cols, self._PHARMACY_CLAIM_REQUIRED_COLUMNS)
+
+    def test_repeated_build_is_deterministic(self):
+        """Running dbt build --select tag:input_layer twice against the
+        same raw data produces the same row counts both times (proves
+        the connector's models are pure SELECT/CAST transformations with
+        no non-deterministic elements, e.g. no accidental fan-out joins
+        or timestamp-of-build-dependent values in a way that would
+        change row counts)."""
+        checksums = {
+            table: {"sha256": raw_loader._file_sha256(FIXTURES_DIR / f"{table}.csv")}
+            for table in ("eligibility", "medical_claim", "pharmacy_claim")
+        }
+        raw_loader.load_snapshot(self.conn, self.config, FIXTURES_DIR, "snap-1", checksums)
+        self.conn.commit()
+
+        input_layer_schema = f"input_layer_test_{_unique_suffix()}"
+        env = dict(os.environ)
+        env["PG_DSN"] = PG_DSN
+        env["PGHOST"] = "localhost"
+        common = ["--project-dir", str(REPO_ROOT), "--profiles-dir", str(REPO_ROOT)]
+        dbt_vars = ["--vars", f"{{raw_schema: {self.raw_schema}, input_layer_schema: {input_layer_schema}}}"]
+        self.addCleanup(
+            lambda: self.conn.cursor().execute(f'DROP SCHEMA IF EXISTS "{input_layer_schema}" CASCADE')
+        )
+
+        deps = self._run_dbt("deps", env=env, common=common)
+        if deps.returncode != 0:
+            self.skipTest(f"dbt deps failed (likely no network access to fetch the pinned Tuva package): {deps.stdout[-2000:]}")
+
+        def _row_counts():
+            counts = {}
+            with self.conn.cursor() as cur:
+                for table in ("eligibility", "medical_claim", "pharmacy_claim"):
+                    cur.execute(f'SELECT count(*) FROM "{input_layer_schema}"."{table}"')
+                    counts[table] = cur.fetchone()[0]
+            return counts
+
+        first = self._run_dbt("build", *dbt_vars, "--select", "tag:input_layer", "--full-refresh", env=env, common=common)
+        self.assertEqual(first.returncode, 0, first.stdout[-4000:])
+        first_counts = _row_counts()
+
+        second = self._run_dbt("build", *dbt_vars, "--select", "tag:input_layer", "--full-refresh", env=env, common=common)
+        self.assertEqual(second.returncode, 0, second.stdout[-4000:])
+        second_counts = _row_counts()
+
+        self.assertEqual(first_counts, second_counts)
+        self.assertEqual(first_counts, {"eligibility": 3, "medical_claim": 3, "pharmacy_claim": 3})
 
 
 if __name__ == "__main__":

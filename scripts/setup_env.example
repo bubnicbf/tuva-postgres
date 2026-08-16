@@ -17,10 +17,25 @@ export INGEST_ROLE="tuva_ingest_role"
 export TRANSFORM_ROLE="tuva_transform_role"
 
 # --- Ingestion API (leave unset for migrate/healthcheck-only workflows) --
+# TUVA_API_MANIFEST_URL must resolve a manifest for exactly one endpoint
+# per request -- `extract`/`sync` call it with `?endpoint=<name>` (and
+# `&since=<date>` when --since is given), see docs/API_MANIFEST.md.
 export TUVA_API_MANIFEST_URL=""
 export TUVA_API_TOKEN=""
+# TUVA_API_TIMEOUT_SECONDS is the fallback for every httpx timeout phase
+# (connect/read/write/pool) -- set the phase-specific variables below
+# only if you need asymmetric bounds (e.g. a slow connect but fast read).
 export TUVA_API_TIMEOUT_SECONDS="30"
+export TUVA_API_CONNECT_TIMEOUT_SECONDS=""
+export TUVA_API_READ_TIMEOUT_SECONDS=""
+export TUVA_API_WRITE_TIMEOUT_SECONDS=""
+export TUVA_API_POOL_TIMEOUT_SECONDS=""
 export TUVA_API_MAX_RETRIES="5"
+# Hard ceiling (seconds) on any single retry sleep -- bounds both the
+# exponential-backoff-with-jitter schedule and a Retry-After header from
+# a 429/5xx response; a Retry-After value larger than this is capped,
+# never honored as-is.
+export TUVA_API_MAX_RETRY_DELAY_SECONDS="30"
 export TUVA_API_ALLOW_INSECURE_HTTP="0"
 
 # --- Extraction / raw snapshots ---------------------------------------

@@ -1,0 +1,2 @@
+medication_id,person_id,encounter_id,dispensing_date,prescribing_date,source_code_type,source_code,source_description,ndc_code,ndc_description,ndc_mapping_method,rxnorm_code,rxnorm_description,rxnorm_mapping_method,atc_code,atc_description,atc_mapping_method,route,strength,quantity,quantity_unit,days_supply,practitioner_id,data_source,tuva_last_run
+medication-1,person-1,encounter-1,2024-01-11,2024-01-10,,,,,,,,,,,,,,,30,,30,practitioner-1,ci-fixture,2024-01-15 00:00:00

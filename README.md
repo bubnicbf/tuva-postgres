@@ -232,37 +232,92 @@ migration and SQL-test-runner *structure and behavior* (via stubbed
 `make migration-status` reports applied, pending, and checksum-mismatch
 states without applying anything.
 
-### Migration idempotency
+## CI fixture and the complete-run smoke test
 
-CI runs the real migration runner (`scripts/apply_schema.sh`) **twice**
-against the same unique, disposable schemas, as a dedicated step ("Run
-migration suite twice and verify idempotency") that runs before schema
-creation/fixture loading/SQL validation on every push, pull request, and
-scheduled run. The first invocation applies every pending migration; the
-second, identical invocation must be a true no-op -- it never bypasses
-`schema_migrations` to hand-rerun `one_time` SQL, and it must report zero
-migrations applied. The check compares, byte-for-byte, before and after
-the second run: the complete migration-history table (every column,
-including `execution_count`), a deterministic catalog fingerprint
-(schemas, tables, views, columns, constraints, indexes, functions, and
-non-internal triggers), and the existing focused foreign-key catalog. It
-also confirms the final `--status` output has zero pending migrations and
-no checksum/execution-mode mismatches, and that `--status` itself never
-mutates history. This protects `one_time` immutability and unchanged-
-`repeatable` reapplication-skipping -- it is a separate concern from
-testing a *changed* repeatable migration's re-execution (see
-`scripts/tests/test_migration_execution_modes.sh`).
+`tests/fixtures/ci/complete_snapshot/` is a small, deterministic,
+**synthetic** CSV snapshot -- one row per managed table (all 15 tables in
+`tuva_postgres.manifest.MANAGED_TABLES`), with fixed synthetic IDs
+(`person-1`, `practitioner-1`, `location-1`, `encounter-1`, ...), fixed
+past dates, and fixed amounts. It contains **no PHI, no real patient
+data, and no credentials** -- every coded/terminology field is left
+`NULL` (see `scripts/tests/test_ci_fixture.py`'s secret/SSN-shaped-value
+scan). It exists only to prove, deterministically and reproducibly, that
+migrations, the real loader, and the full SQL validation suite actually
+work end to end -- it is not representative of real data volume or
+terminology coverage. Never point `DATA_DIR` at this directory for a real
+load; it's for CI and local smoke testing only (see
+`tests/fixtures/ci/complete_snapshot/README.md`).
 
-Run it locally with `make test-schema-idempotency` (requires a real,
-**disposable** PostgreSQL database via `PG_DSN` in `.env` -- never point
-it at production; it creates and drops its own uniquely-named temporary
-schemas and never touches `tuva`/`tuva_term`/`tuva_ops`). It's
-intentionally excluded from `test-shell`/`test` since it needs Postgres.
-The harness's control flow (does it correctly accept a true no-op rerun
-and correctly reject every way a rerun can go wrong?) has separate,
-database-free regression coverage in
-`scripts/tests/test_schema_idempotency_harness_controls.sh`, run as part
-of `make test-shell`.
+Validating the fixture's structure without a database:
+
+```bash
+python3 scripts/tests/test_ci_fixture.py
+```
+
+This checks that all 15 managed CSVs are present (no more, no fewer),
+every header is complete and matches migration 0001's column order,
+every file has at least one data row, cross-file foreign keys resolve,
+no value looks like a secret or SSN, and no value was generated from the
+current date/time. It also runs negative-control checks (a missing CSV,
+an extra CSV, a truncated row, a duplicate header, a broken relationship)
+against scratch copies to prove the validator actually rejects a broken
+fixture, not just that it accepts the real one. `make test-shell` runs
+this test as part of the standard database-free suite.
+
+Running the full fixture-backed smoke test against a **disposable**
+PostgreSQL database (never production):
+
+```bash
+PG_DSN=postgresql://user:pass@host:port/db bash scripts/tests/test_ci_complete_run.sh
+```
+
+or, against the database already configured in `.env` (what CI itself
+runs, via `.github/workflows/ci.yml`):
+
+```bash
+make test-ci-complete-run
+```
+
+Either proves the real sequence: migrations apply, every fixture CSV
+header matches the migrated schema in ordinal order, `scripts/
+load_to_postgres.sh` loads the fixture through its normal preflight and
+atomic-transaction path (never its zero-file no-op path), every managed
+table ends up with its exact expected row count, key foreign-key
+relationships join, the real `scripts/run_tests.sh` executes the full
+`db/tests/*.sql` suite, and `scripts/verify_complete_run.py` confirms
+every expected suite is represented with zero failures and migration
+status is current. CI ties every result to its own deterministic
+`RUN_ID` (`ci-${{ github.run_id }}-${{ github.run_attempt }}`), so a
+stale result from an earlier run can never be mistaken for evidence
+about the current one.
+
+**Updating the fixture safely when migration 0001's baseline schema
+changes** (a column added, renamed, reordered, or removed):
+
+1. Apply the updated migration to a disposable database (`make
+   local-db-ready` or any other disposable Postgres).
+2. Check for drift: `PG_DSN=... uv run python3
+   scripts/generate_ci_fixture.py check --pg-schema <disposable schema>`
+   -- exits nonzero with a per-table diff if the committed fixture no
+   longer matches the migrated schema.
+3. If a new column needs a deterministic value, add it to `OVERRIDES` in
+   `scripts/generate_ci_fixture.py` (columns left unlisted are written
+   blank/NULL, matching every nullable column's default).
+4. Regenerate the committed fixture explicitly: `PG_DSN=... uv run
+   python3 scripts/generate_ci_fixture.py generate --pg-schema
+   <disposable schema> --out tests/fixtures/ci/complete_snapshot`.
+5. Review the diff, re-run `python3 scripts/tests/test_ci_fixture.py` and
+   `bash scripts/tests/test_ci_complete_run.sh`, and commit the fixture
+   together with the schema/migration change that caused the drift.
+
+`scripts/generate_ci_fixture.py` never connects to a database unless you
+pass `--pg-dsn`/`--pg-schema` explicitly, never defaults to a production
+or shared schema name, and never overwrites the committed fixture unless
+you pass `--out tests/fixtures/ci/complete_snapshot` explicitly. CI never
+regenerates the fixture before loading it -- it always loads exactly what
+is committed, so a stale fixture fails loudly (via `test_ci_fixture.py`
+and/or a header mismatch in `test_ci_complete_run.sh`) instead of being
+silently papered over.
 
 ## Python development and quality tooling
 

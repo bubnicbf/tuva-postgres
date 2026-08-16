@@ -5,7 +5,7 @@
         lint-python format-python format-python-check typecheck lint-sql quality \
         local-db-up local-db-migrate local-db-ready local-db-status \
         local-db-shell local-db-logs local-db-down local-db-reset \
-        test-compose-integration
+        test-compose-integration test-ci-complete-run
 
 # Requires uv (https://docs.astral.sh/uv/). Creates/updates .venv from the
 # committed uv.lock (exact, hash-locked versions -- no ad hoc `pip install`)
@@ -78,6 +78,7 @@ test-shell:
 	python3 scripts/tests/test_constraint_idempotency_guards.py
 	python3 scripts/tests/test_pre_commit_config.py
 	python3 scripts/tests/test_python_dependencies.py
+	python3 scripts/tests/test_ci_fixture.py
 
 # Proves the real migration runner (scripts/apply_schema.sh) is idempotent:
 # applies every discovered migration once into uniquely-named temporary
@@ -98,6 +99,39 @@ test-schema-idempotency:
 # drops its own temporary schema. Never run against production.
 test-load-integration:
 	. .env && bash scripts/tests/test_load_to_postgres_atomic_integration.sh
+
+# The canonical, committed, deterministic complete CSV snapshot used ONLY
+# for the database-backed CI smoke run below -- never the developer
+# data/ directory (see tests/fixtures/ci/complete_snapshot/'s own
+# README.md section and scripts/tests/test_ci_fixture.py). RUN_ID
+# defaults to a locally-generated timestamped id for ad hoc local runs;
+# CI supplies its own deterministic id (see .github/workflows/ci.yml) by
+# exporting RUN_ID before calling this target, which `?=` never
+# overrides.
+CI_FIXTURE_DIR := tests/fixtures/ci/complete_snapshot
+RUN_ID ?= local-complete-run-$(shell date -u +%Y%m%dt%H%M%Sz)
+
+# Requires a real, DISPOSABLE PostgreSQL database (PG_DSN/PG_SCHEMA/... --
+# from .env, or already exported by the caller, e.g. CI). Runs the real
+# migrate -> load -> test -> verify sequence against the CONFIGURED
+# database/schema (never a throwaway schema of its own -- for that, see
+# `bash scripts/tests/test_ci_complete_run.sh` instead, which is safe to
+# run against any disposable database regardless of what PG_SCHEMA is
+# set to): applies migrations, prints migration status, loads the
+# committed fixture above through the real scripts/load_to_postgres.sh
+# (never data/), runs the real scripts/run_tests.sh SQL validation suite
+# with this run's RUN_ID, then calls scripts/verify_complete_run.py to
+# prove the run was actually complete (expected row counts, results tied
+# to this exact RUN_ID, every expected suite represented, zero failures,
+# migration status current) rather than just "the previous steps exited
+# zero". Exits nonzero on any failure. NEVER run against production.
+test-ci-complete-run:
+	. .env && uv run tuva-postgres migrate
+	. .env && uv run tuva-postgres migrate --status
+	. .env && DATA_DIR=$(CI_FIXTURE_DIR) bash scripts/load_to_postgres.sh
+	. .env && RUN_ID=$(RUN_ID) bash scripts/run_tests.sh
+	. .env && RUN_ID=$(RUN_ID) uv run python3 scripts/verify_complete_run.py --fixture-dir $(CI_FIXTURE_DIR)
+	@echo "test-ci-complete-run: migrate, load (committed fixture), SQL validation, and verification all passed (RUN_ID=$(RUN_ID))."
 
 # Python unit tests for the src/tuva_postgres package (tests/unit/), run
 # through pytest (see [tool.pytest.ini_options] in pyproject.toml --

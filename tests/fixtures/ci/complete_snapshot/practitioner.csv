@@ -1,0 +1,2 @@
+practitioner_id,npi,provider_first_name,provider_last_name,practice_affiliation,specialty,sub_specialty,data_source,tuva_last_run
+practitioner-1,1234567893,Terry,Practitioner,,,,ci-fixture,2024-01-15 00:00:00

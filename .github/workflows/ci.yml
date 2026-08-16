@@ -33,6 +33,11 @@ jobs:
       PG_DSN: postgresql://postgres:postgres@localhost:5432/tuva
       PG_SCHEMA: tuva
       TERMINOLOGY_SCHEMA: tuva_term
+      # Deterministic per-run id -- every SQL-validation-result query in
+      # this workflow is scoped to this exact id (never "whichever run_id
+      # happens to sort latest"), so a stale row from an earlier run can
+      # never be mistaken for this run's evidence.
+      CI_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Checkout
@@ -70,7 +75,7 @@ jobs:
           export PG_SCHEMA="tuva"
           export TERMINOLOGY_SCHEMA="tuva_term"
           export OPS_SCHEMA="tuva_ops"
-          export DATA_DIR="data"
+          export DATA_DIR="tests/fixtures/ci/complete_snapshot"
           EOF
           cat .env
 
@@ -86,6 +91,12 @@ jobs:
       - name: Run Python unit tests (tuva_postgres package)
         run: make test-unit
 
+      - name: Validate CI fixture (database-free)
+        # Runs before any database-dependent step: catches a missing,
+        # incomplete, malformed, or drifted committed fixture immediately,
+        # without waiting on Postgres to come up first.
+        run: uv run python3 scripts/tests/test_ci_fixture.py
+
       - name: Wait for Postgres & sanity check
         run: |
           for i in {1..30}; do
@@ -94,41 +105,57 @@ jobs:
           done
           psql "$PG_DSN" -c "SELECT version();"
 
-      - name: Run migration suite twice and verify idempotency
-        run: make test-schema-idempotency
+      - name: Run database-free structural test suite (test-shell)
+        run: make test-shell
 
-      - name: Apply schemas
-        run: make create-db
-
-      - name: Print migration status
-        run: make migration-status
-
-      - name: Load seeds (if present)
-        run: make load
-
-      - name: Run smoke tests (aggregated)
-        run: make test
+      - name: Run complete migrate -> load -> validate -> verify sequence
+        # A single, deterministic RUN_ID (CI_RUN_ID, from job-run
+        # metadata -- see the `env:` block above) flows through the SQL
+        # validation run and into scripts/verify_complete_run.py, so
+        # every result queried below is unambiguously tied to *this* run,
+        # never a stale row left over from an earlier one. See `make
+        # test-ci-complete-run` (Makefile) for exactly what this proves:
+        # migrations apply, the committed fixture (tests/fixtures/ci/
+        # complete_snapshot/, set as DATA_DIR above -- never the plain
+        # data/ directory) loads through the real loader (never its
+        # zero-file no-op path), every managed table gets its expected
+        # row count, the full db/tests/*.sql suite executes, and
+        # scripts/verify_complete_run.py confirms zero failures, every
+        # expected suite represented, and current migration status.
+        run: make test-ci-complete-run RUN_ID=${{ env.CI_RUN_ID }}
 
       - name: Publish summary to job log
         run: |
-          echo "RUN_ID (latest):"
-          psql "$PG_DSN" -c "SELECT run_id FROM ${PG_SCHEMA}.test_results ORDER BY executed_at DESC LIMIT 1;"
+          declare -a MANAGED_TABLES=(
+            practitioner location patient encounter person_id_crosswalk
+            medical_claim pharmacy_claim eligibility procedure observation
+            lab_result condition medication immunization appointment
+          )
 
-          echo "## SQL Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## SQL Test Summary (run_id=${CI_RUN_ID})" >> "$GITHUB_STEP_SUMMARY"
           {
+            echo ""
+            echo "### Managed table row counts"
+            echo ""
+            echo '```'
+            for t in "${MANAGED_TABLES[@]}"; do
+              count="$(psql "$PG_DSN" -At -c "SELECT COUNT(*) FROM \"${PG_SCHEMA}\".\"${t}\";")"
+              echo "${t}=${count}"
+            done
+            echo '```'
             echo ""
             echo "### Per-suite breakdown"
             echo ""
             echo '```'
-            psql "$PG_DSN" -c "SELECT * FROM ${PG_SCHEMA}.v_test_summary ORDER BY run_id DESC, suite;"
+            psql "$PG_DSN" -c "SELECT * FROM ${PG_SCHEMA}.v_test_summary WHERE run_id = '${CI_RUN_ID}' ORDER BY suite;"
             echo '```'
             echo ""
-            echo "### Failures (if any)"
+            echo "### Failures (if any -- expect none; make test-ci-complete-run already failed the job above otherwise)"
             echo ""
             echo '```'
-            psql "$PG_DSN" -c "SELECT * FROM ${PG_SCHEMA}.v_test_failures ORDER BY run_id DESC, suite, test LIMIT 200;"
+            psql "$PG_DSN" -c "SELECT * FROM ${PG_SCHEMA}.v_test_failures WHERE run_id = '${CI_RUN_ID}' ORDER BY suite, test;"
             echo '```'
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload test artifacts
         uses: actions/upload-artifact@v4
@@ -138,19 +165,6 @@ jobs:
             tmp/test_results/
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Fail if any tests failed
-        run: |
-          LATEST_RUN_ID=$(psql "$PG_DSN" -At -c "SELECT run_id FROM ${PG_SCHEMA}.test_results ORDER BY executed_at DESC LIMIT 1;")
-          FAILS=$(psql "$PG_DSN" -At -c "SELECT COUNT(*) FROM ${PG_SCHEMA}.test_results WHERE run_id='${LATEST_RUN_ID}' AND pass = false;")
-          echo "Latest run: ${LATEST_RUN_ID} | Failures: ${FAILS}"
-          if [ "${FAILS}" -gt 0 ]; then
-            echo "❌ Some tests failed. Listing failures:"
-            psql "$PG_DSN" -c "SELECT * FROM ${PG_SCHEMA}.v_test_failures WHERE run_id='${LATEST_RUN_ID}';"
-            exit 1
-          else
-            echo "✅ All tests passed."
-          fi
 
       - name: Run migration + mock-API pipeline integration tests
         run: make test-integration

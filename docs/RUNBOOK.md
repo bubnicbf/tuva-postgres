@@ -74,6 +74,29 @@ Check status any time without applying anything:
 make migration-status           # or: uv run tuva-postgres migrate --status
 ```
 
+## CI fixture vs. a real production snapshot
+
+`tests/fixtures/ci/complete_snapshot/` (see the top-level `README.md`'s
+"CI fixture and the complete-run smoke test" section) is **not** a
+production snapshot and must never be treated like one:
+
+- it is entirely synthetic, fixed, and tiny (one row per managed table)
+  -- it proves wiring, schema compatibility, referential integrity,
+  loading, and SQL-validation *execution*, never realistic volume,
+  distribution, or terminology coverage;
+- it contains no coded/terminology values, so it cannot exercise
+  terminology-membership checks (`db/tests/*_addon.sql`) the way a real
+  snapshot with populated diagnosis/procedure/NDC codes would;
+- `make test-ci-complete-run` / `scripts/tests/test_ci_complete_run.sh`
+  load it only into disposable schemas (a CI Postgres service, or a
+  schema you explicitly created for this purpose) -- never point
+  `DATA_DIR` at it for `make load` against a real deployment's database.
+
+A real production load always goes through the normal pipeline (`make
+pipeline` / `uv run tuva-postgres run`, or the scheduled/manual runs
+described above), fetching a real vendor snapshot via the API manifest
+contract (`docs/API_MANIFEST.md`) -- never this fixture.
+
 ## Database migrations architecture
 
 `db/migrations/` is the **sole authoritative home for deployable DDL**.

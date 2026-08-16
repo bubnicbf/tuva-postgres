@@ -4,19 +4,27 @@
 # or to GitHub release downloads, so the real `uv lock` resolver could not be
 # run here. Per instruction, this file was hand-assembled as a best-effort,
 # structurally-valid placeholder so development could proceed: direct
-# versions (sqlfluff==4.3.0, pre-commit==4.6.2, and -- added in this same
-# session -- ruff==0.14.4, mypy==1.19.0, pytest==8.4.2,
-# types-requests==2.34.2.20250809) match the exact pins in pyproject.toml,
-# and the listed transitive dependencies/versions reflect their real,
-# long-stable dependency graphs. The package hashes below are NOT real
-# PyPI artifact checksums.
+# versions match the exact pins in pyproject.toml, and the listed transitive
+# dependencies/versions reflect their real, long-stable dependency graphs.
+# The package hashes below are NOT real PyPI artifact checksums.
+#
+# Updated in the httpx/pydantic-settings/tenacity ingestion-CLI change:
+# removed requests/types-requests (and their now-unneeded transitive-only
+# deps charset-normalizer/urllib3), added httpx==0.28.1 (+ httpcore, h11,
+# sniffio -- certifi/idna already present), tenacity==9.0.0 (no deps),
+# and pydantic-settings==2.7.1 (+ pydantic, pydantic-core, annotated-types,
+# python-dotenv; typing-extensions already present).
 #
 # The pyproject.toml [build-system] requires now also exact-pins
 # setuptools==75.6.0 (previously an unpinned `>=68`); this draft
 # intentionally does NOT fabricate a [[package]] entry for it, since
 # whether/how a local editable package's build-system requirement is
 # itself represented in uv.lock is exactly the kind of resolver detail
-# that must come from a real `uv lock` run, not a guess.
+# that must come from a real `uv lock` run, not a guess. The same applies
+# to dbt-core/dbt-postgres (declared in pyproject.toml's runtime
+# dependencies but -- as in every prior revision of this draft file --
+# not represented here, since dbt's real transitive dependency graph is
+# too large to hand-fabricate credibly without a real resolver run).
 #
 # REQUIRED BEFORE THIS IS TRUSTED FOR REAL INSTALLS:
 #   uv lock            # regenerate for real, once network access exists
@@ -32,14 +40,20 @@ name = "tuva-postgres"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "psycopg", extra = ["binary"] },
-    { name = "requests" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "tenacity" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "requests", specifier = "==2.34.2" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "psycopg", extras = ["binary"], specifier = "==3.2.3" },
+    { name = "pydantic", specifier = "==2.10.5" },
+    { name = "pydantic-settings", specifier = "==2.7.1" },
+    { name = "tenacity", specifier = "==9.0.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -50,23 +64,8 @@ dev = [
     { name = "pyyaml", specifier = "==6.0.3" },
     { name = "ruff", specifier = "==0.14.4" },
     { name = "sqlfluff", specifier = "==4.3.0" },
-    { name = "types-requests", specifier = "==2.34.2.20250809" },
 ]
 
-[[package]]
-name = "requests"
-version = "2.34.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "certifi" },
-    { name = "charset-normalizer" },
-    { name = "idna" },
-    { name = "urllib3" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/placeholder/requests-2.34.2.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000rq01" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/placeholder/requests-2.34.2-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000rq02" },
-]
 
 [[package]]
 name = "certifi"
@@ -77,14 +76,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/placeholder/certifi-2026.5.20-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ce02" },
 ]
 
-[[package]]
-name = "charset-normalizer"
-version = "3.4.7"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/placeholder/charset_normalizer-3.4.7.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000cn01" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/placeholder/charset_normalizer-3.4.7-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000cn02" },
-]
 
 [[package]]
 name = "idna"
@@ -95,14 +86,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/placeholder/idna-3.18-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000id11" }
 ]
 
-[[package]]
-name = "urllib3"
-version = "2.7.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/placeholder/urllib3-2.7.0.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ur01" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/placeholder/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ur02" },
-]
 
 [[package]]
 name = "psycopg"
@@ -399,16 +382,119 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/placeholder/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000pl02" },
 ]
 
+
+# --- Added for the httpx/pydantic-settings/tenacity ingestion CLI
+#     (see the DRAFT LOCKFILE banner at the top of this file) -----------
+
 [[package]]
-name = "types-requests"
-version = "2.34.2.20250809"
+name = "httpx"
+version = "0.28.1"
 source = { registry = "https://pypi.org/simple" }
-# Type-stub-only package (PEP 561): depends on urllib3 (already locked
-# above, via requests) for the request/response types it re-exports.
 dependencies = [
-    { name = "urllib3" },
+    { name = "certifi" },
+    { name = "httpcore" },
+    { name = "idna" },
+    { name = "sniffio" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/placeholder/types_requests-2.34.2.20250809.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000tr01" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/httpx-0.28.1.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000hx01" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/placeholder/types_requests-2.34.2.20250809-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000tr02" },
+    { url = "https://files.pythonhosted.org/packages/placeholder/httpx-0.28.1-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000hx02" },
+]
+
+[[package]]
+name = "httpcore"
+version = "1.0.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/httpcore-1.0.9.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000hc01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000hc02" },
+]
+
+[[package]]
+name = "h11"
+version = "0.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/h11-0.16.0.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000h101" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/h11-0.16.0-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000h102" },
+]
+
+[[package]]
+name = "sniffio"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/sniffio-1.3.1.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000sn01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000sn02" },
+]
+
+[[package]]
+name = "tenacity"
+version = "9.0.0"
+source = { registry = "https://pypi.org/simple" }
+# Pure-Python retry library -- no runtime dependencies of its own.
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/tenacity-9.0.0.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000tn01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/tenacity-9.0.0-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000tn02" },
+]
+
+[[package]]
+name = "pydantic"
+version = "2.10.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-types" },
+    { name = "pydantic-core" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/pydantic-2.10.5.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000pd51" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/pydantic-2.10.5-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000pd52" },
+]
+
+[[package]]
+name = "pydantic-core"
+version = "2.27.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/pydantic_core-2.27.2.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000pc51" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/pydantic_core-2.27.2-cp312-cp312-manylinux.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000pc52" },
+]
+
+[[package]]
+name = "annotated-types"
+version = "0.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/annotated_types-0.7.0.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000at01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/annotated_types-0.7.0-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000at02" },
+]
+
+[[package]]
+name = "python-dotenv"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/python_dotenv-1.0.1.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000dv01" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/python_dotenv-1.0.1-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000dv02" },
+]
+
+[[package]]
+name = "pydantic-settings"
+version = "2.7.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/placeholder/pydantic_settings-2.7.1.tar.gz", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ps51" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/placeholder/pydantic_settings-2.7.1-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000ps52" },
 ]

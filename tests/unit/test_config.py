@@ -130,5 +130,113 @@ class TestPipelineConfig(unittest.TestCase):
         self.assertNotIn("user:pass", repr(config))
 
 
+_HOSTILE_IDENTIFIERS = [
+    "",
+    "tuva; DROP TABLE patient",
+    "tuva--comment",
+    "tuva ops",
+    "tuva.ops",
+    'tuva"ops',
+    "tuva'ops",
+    "tuva\nops",
+    "1tuva",
+    # Note: a literal null byte is intentionally excluded here -- the
+    # OS environment itself (os.environ / putenv) cannot hold one, so it
+    # can never reach config.py via an env var in the first place. Null
+    # byte rejection by the shared policy itself is covered directly in
+    # tests/unit/test_identifiers.py.
+]
+
+
+class TestPipelineConfigHostileSchemaInputs(unittest.TestCase):
+    """Defense-in-depth: config.py must reject hostile PG_SCHEMA /
+    TERMINOLOGY_SCHEMA / OPS_SCHEMA values through the same shared
+    identifier policy that db.py's low-level SQL composition uses again
+    independently -- proving both layers are wired to the real policy,
+    not a looser or divergent local copy."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in _ENV_KEYS}
+        for k in _ENV_KEYS:
+            os.environ.pop(k, None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _set(self, **kwargs):
+        for k, v in kwargs.items():
+            os.environ[k] = v
+
+    def test_hostile_pg_schema_rejected(self):
+        for hostile in _HOSTILE_IDENTIFIERS:
+            with self.subTest(pg_schema=hostile):
+                env = _valid_env()
+                env["PG_SCHEMA"] = hostile
+                env["TERMINOLOGY_SCHEMA"] = "tuva_term"  # keep this field valid in isolation
+                self._set(**env)
+                with self.assertRaises(ConfigError) as ctx:
+                    PipelineConfig.load()
+                self.assertIn("PG_SCHEMA", str(ctx.exception))
+                self._restore()
+                for k in _ENV_KEYS:
+                    os.environ.pop(k, None)
+
+    def test_hostile_terminology_schema_rejected(self):
+        for hostile in _HOSTILE_IDENTIFIERS:
+            with self.subTest(terminology_schema=hostile):
+                env = _valid_env()
+                env["TERMINOLOGY_SCHEMA"] = hostile
+                self._set(**env)
+                with self.assertRaises(ConfigError) as ctx:
+                    PipelineConfig.load()
+                self.assertIn("TERMINOLOGY_SCHEMA", str(ctx.exception))
+                self._restore()
+                for k in _ENV_KEYS:
+                    os.environ.pop(k, None)
+
+    def test_hostile_ops_schema_rejected(self):
+        for hostile in _HOSTILE_IDENTIFIERS:
+            with self.subTest(ops_schema=hostile):
+                env = _valid_env()
+                env["OPS_SCHEMA"] = hostile
+                self._set(**env)
+                with self.assertRaises(ConfigError) as ctx:
+                    PipelineConfig.load()
+                self.assertIn("OPS_SCHEMA", str(ctx.exception))
+                self._restore()
+                for k in _ENV_KEYS:
+                    os.environ.pop(k, None)
+
+    def test_all_three_hostile_schemas_reported_together(self):
+        # Fail-fast-with-everything-listed behavior must still hold when
+        # the newly-shared validator is the one raising each error.
+        env = _valid_env()
+        env["PG_SCHEMA"] = "tuva; DROP TABLE x"
+        env["TERMINOLOGY_SCHEMA"] = "bad term"
+        env["OPS_SCHEMA"] = "bad ops"
+        self._set(**env)
+        with self.assertRaises(ConfigError) as ctx:
+            PipelineConfig.load()
+        message = str(ctx.exception)
+        self.assertIn("PG_SCHEMA", message)
+        self.assertIn("TERMINOLOGY_SCHEMA", message)
+        self.assertIn("OPS_SCHEMA", message)
+
+    def test_hostile_schema_error_never_includes_secrets(self):
+        env = _valid_env()
+        env["PG_SCHEMA"] = "tuva; DROP TABLE x"
+        self._set(**env)
+        with self.assertRaises(ConfigError) as ctx:
+            PipelineConfig.load()
+        message = str(ctx.exception)
+        self.assertNotIn("test-token", message)
+        self.assertNotIn("user:pass", message)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Shared ASCII identifier policy (same regex src/tuva_postgres/
+# identifiers.py enforces on the Python side) -- used below to sanity-
+# check this script's own generated schema names.
+source "$REPO_ROOT/scripts/lib/postgres_identifiers.sh"
+
 : "${PG_DSN:?PG_DSN not set. This integration test requires a real, DISPOSABLE test database -- set PG_DSN and re-run.}"
 
 # --- 1)-3) Generate and validate unique, disposable schema names ----------
@@ -63,10 +68,7 @@ TERM_SCHEMA_NAME="tuva_idem_test_${SUFFIX}_term"
 OPS_SCHEMA_NAME="tuva_idem_test_${SUFFIX}_ops"
 
 for name in "$SCHEMA_NAME" "$TERM_SCHEMA_NAME" "$OPS_SCHEMA_NAME"; do
-  if ! [[ "$name" =~ ^[a-z_][a-z0-9_]{2,62}$ ]]; then
-    echo "FAIL: generated schema name '$name' failed identifier validation; refusing to proceed." >&2
-    exit 1
-  fi
+  validate_postgres_identifier "$name" "generated schema name"
   # Extra belt-and-suspenders: never allow this to collide with a real,
   # meaningful schema name.
   case "$name" in

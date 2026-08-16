@@ -83,6 +83,16 @@ if HAVE_PSYCOPG:
     from tuva_postgres.manifest import MANAGED_TABLES
     from tuva_postgres.orchestrator import EXIT_FAILURE, EXIT_SUCCESS, run_pipeline
 
+    def _drop_schema_cascade(cur, schema_name: str) -> None:
+        """Validate `schema_name` through the same shared policy production
+        code uses, then drop it. Exercises the real, safe composition
+        helpers instead of demonstrating raw f-string interpolation as the
+        pattern to copy -- even though every schema name reaching this
+        helper is already this test's own generated, non-user-supplied
+        name (see setUp's `secrets.token_hex` suffix)."""
+        ident = db.quote_ident(db.validated_identifier(schema_name, "schema_name"))
+        cur.execute(f"DROP SCHEMA IF EXISTS {ident} CASCADE")
+
 
 # --- CSV fixture generation, by introspecting the real applied schema ------
 
@@ -141,7 +151,7 @@ class _TableFixtureBuilder:
                     "SELECT a.attname FROM pg_index i "
                     "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
                     "WHERE i.indrelid = %s::regclass AND i.indisprimary ORDER BY a.attnum",
-                    (f'"{self.pg_schema}"."{table}"',),
+                    (db.qualified_relation(self.pg_schema, table),),
                 )
                 self._pk_cache[table] = [r[0] for r in cur.fetchall()]
         return self._pk_cache[table]
@@ -250,7 +260,7 @@ class TestPipelineIntegration(unittest.TestCase):
         try:
             with self.conn.cursor() as cur:
                 for name in (self.pg_schema, self.term_schema, self.ops_schema):
-                    cur.execute(f'DROP SCHEMA IF EXISTS "{name}" CASCADE')
+                    _drop_schema_cascade(cur, name)
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -315,7 +325,7 @@ class TestPipelineIntegration(unittest.TestCase):
 
         self.assertEqual(run_pipeline(config), EXIT_SUCCESS)
         with self.conn.cursor() as cur:
-            cur.execute(f'SELECT COUNT(*) FROM "{self.pg_schema}".patient')
+            cur.execute(f"SELECT COUNT(*) FROM {db.qualified_relation(self.pg_schema, 'patient')}")
             first_count = cur.fetchone()[0]
         self.assertEqual(first_count, 2)
 
@@ -324,16 +334,19 @@ class TestPipelineIntegration(unittest.TestCase):
         # truncate-and-replace design means row counts must not double.
         self.assertEqual(run_pipeline(config), EXIT_SUCCESS)
         with self.conn.cursor() as cur:
-            cur.execute(f'SELECT COUNT(*) FROM "{self.pg_schema}".patient')
+            cur.execute(f"SELECT COUNT(*) FROM {db.qualified_relation(self.pg_schema, 'patient')}")
             second_count = cur.fetchone()[0]
         self.assertEqual(second_count, 2, "row count changed on a retried, already-loaded snapshot")
 
         with self.conn.cursor() as cur:
-            cur.execute(f'SELECT COUNT(*) FROM "{self.ops_schema}".pipeline_runs WHERE status = %s', ("succeeded",))
+            cur.execute(
+                f"SELECT COUNT(*) FROM {db.qualified_relation(self.ops_schema, 'pipeline_runs')} WHERE status = %s",
+                ("succeeded",),
+            )
             succeeded_runs = cur.fetchone()[0]
-            cur.execute(f'SELECT COUNT(*) FROM "{self.ops_schema}".schema_migrations')
+            cur.execute(f"SELECT COUNT(*) FROM {db.qualified_relation(self.ops_schema, 'schema_migrations')}")
             migration_count = cur.fetchone()[0]
-            cur.execute(f'SELECT COUNT(*) FROM "{self.ops_schema}".pipeline_artifacts')
+            cur.execute(f"SELECT COUNT(*) FROM {db.qualified_relation(self.ops_schema, 'pipeline_artifacts')}")
             artifact_rows = cur.fetchone()[0]
         self.assertEqual(succeeded_runs, 2)
         self.assertGreater(migration_count, 0)
@@ -349,7 +362,7 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertEqual(run_pipeline(good_config), EXIT_SUCCESS)
 
         with self.conn.cursor() as cur:
-            cur.execute(f'SELECT COUNT(*) FROM "{self.pg_schema}".patient')
+            cur.execute(f"SELECT COUNT(*) FROM {db.qualified_relation(self.pg_schema, 'patient')}")
             baseline_count = cur.fetchone()[0]
         self.assertEqual(baseline_count, 1)
 
@@ -359,7 +372,7 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertEqual(run_pipeline(bad_config), EXIT_FAILURE)
 
         with self.conn.cursor() as cur:
-            cur.execute(f'SELECT COUNT(*) FROM "{self.pg_schema}".patient')
+            cur.execute(f"SELECT COUNT(*) FROM {db.qualified_relation(self.pg_schema, 'patient')}")
             after_bad_count = cur.fetchone()[0]
         self.assertEqual(after_bad_count, baseline_count, "a rejected snapshot must never change loaded data")
 
@@ -368,8 +381,8 @@ class TestPipelineIntegration(unittest.TestCase):
 
         with self.conn.cursor() as cur:
             cur.execute(
-                f'SELECT status, error_category FROM "{self.ops_schema}".pipeline_runs '
-                f'WHERE snapshot_id = %s', ("2026-08-16",),
+                f"SELECT status, error_category FROM {db.qualified_relation(self.ops_schema, 'pipeline_runs')} "
+                f"WHERE snapshot_id = %s", ("2026-08-16",),
             )
             row = cur.fetchone()
         self.assertIsNotNone(row)
@@ -450,7 +463,7 @@ class TestMigrationExecutionModesIntegration(unittest.TestCase):
         try:
             with self.conn.cursor() as cur:
                 for name in (self.pg_schema, f"{self.pg_schema}_term", self.ops_schema):
-                    cur.execute(f'DROP SCHEMA IF EXISTS "{name}" CASCADE')
+                    _drop_schema_cascade(cur, name)
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -524,7 +537,7 @@ class TestMigrationExecutionModesIntegration(unittest.TestCase):
         self.assertEqual(third[0].execution_count, 2)
 
         with self.conn.cursor() as cur:
-            cur.execute(f'SELECT marker FROM "{self.ops_schema}".ft_view LIMIT 0')
+            cur.execute(f"SELECT marker FROM {db.qualified_relation(self.ops_schema, 'ft_view')} LIMIT 0")
             colnames = [d.name for d in cur.description]
         self.assertIn("marker", colnames)
 
@@ -588,17 +601,18 @@ class TestMigrationExecutionModesIntegration(unittest.TestCase):
         # execution/execution_count columns) and seed it with a row, as if
         # this database applied 0001 before execution-mode tracking
         # existed -- bypassing ensure_history_table() entirely.
+        history_relation = db.qualified_relation(self.ops_schema, "schema_migrations")
         with self.conn.cursor() as cur:
-            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.ops_schema}"')
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {db.quote_ident(db.validated_identifier(self.ops_schema, 'ops_schema'))}")
             cur.execute(
-                f'CREATE TABLE "{self.ops_schema}".schema_migrations ('
+                f"CREATE TABLE {history_relation} ("
                 f"  version text PRIMARY KEY, description text NOT NULL, checksum text NOT NULL,"
                 f"  applied_at timestamptz NOT NULL, duration_ms double precision NOT NULL,"
                 f"  app_version text NOT NULL)"
             )
-            cur.execute(f'CREATE TABLE "{self.ops_schema}".ft_legacy (id int)')
+            cur.execute(f"CREATE TABLE {db.qualified_relation(self.ops_schema, 'ft_legacy')} (id int)")
             cur.execute(
-                f'INSERT INTO "{self.ops_schema}".schema_migrations '
+                f"INSERT INTO {history_relation} "
                 f"(version, description, checksum, applied_at, duration_ms, app_version) "
                 f"VALUES (%s, %s, %s, %s, %s, %s)",
                 ("0001", "legacy row", legacy_checksum, legacy_applied_at, 12.5, "0.0.0-legacy"),
@@ -626,8 +640,8 @@ class TestMigrationExecutionModesIntegration(unittest.TestCase):
 
         with self.conn.cursor() as cur:
             cur.execute(
-                f'SELECT version, description, checksum, applied_at, duration_ms, app_version, '
-                f'execution, execution_count FROM "{self.ops_schema}".schema_migrations WHERE version = %s',
+                f"SELECT version, description, checksum, applied_at, duration_ms, app_version, "
+                f"execution, execution_count FROM {history_relation} WHERE version = %s",
                 ("0001",),
             )
             row = cur.fetchone()

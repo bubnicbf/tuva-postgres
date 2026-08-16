@@ -55,9 +55,10 @@ mkdir -p "$STUB_BIN_DIR" "$INVOKE_FROM_DIR"
 # (its own scripts/ + a small, representative db/tests/ fixture set), so
 # the script's own-location-relative paths resolve consistently and any
 # files it writes (tmp/test_results/*) live entirely under $TMP_DIR.
-mkdir -p "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/db/tests"
+mkdir -p "$SCRATCH_REPO/scripts/lib" "$SCRATCH_REPO/db/tests"
 cp "$REPO_ROOT/scripts/run_tests.sh" "$SCRATCH_REPO/scripts/run_tests.sh"
 cp "$REPO_ROOT/scripts/ingest_test_csv.py" "$SCRATCH_REPO/scripts/ingest_test_csv.py"
+cp "$REPO_ROOT/scripts/lib/postgres_identifiers.sh" "$SCRATCH_REPO/scripts/lib/postgres_identifiers.sh"
 
 # Setup file (harness, not a validation case).
 cat > "$SCRATCH_REPO/db/tests/zz_results.sql" <<'SQL'

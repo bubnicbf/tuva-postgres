@@ -97,11 +97,19 @@ from enum import Enum
 from pathlib import Path
 
 from . import __version__
-from .db import connect, substitute_psql_vars, try_advisory_lock, advisory_unlock, MIGRATION_LOCK_KEY
+from .db import (
+    connect,
+    qualified_relation,
+    quote_ident,
+    substitute_psql_vars,
+    try_advisory_lock,
+    advisory_unlock,
+    MIGRATION_LOCK_KEY,
+)
 from .errors import MigrationError, LockError
+from .identifiers import InvalidIdentifierError, validate_identifier
 from .manifest import MANAGED_TABLES
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _VERSION_RE = re.compile(r"^[0-9]{4,}$")
 
 
@@ -170,9 +178,15 @@ class MigrationStatus:
         return bool(self.one_time_mismatches or self.mode_mismatches)
 
 
-def _validate_identifier(name: str, value: str) -> None:
-    if not _IDENTIFIER_RE.match(value):
-        raise MigrationError(f"{name}={value!r} is not a safe SQL identifier")
+def _validate_identifier(name: str, value: str) -> str:
+    """Validate `value` against the shared identifier policy (see
+    identifiers.py), translating a failure into `MigrationError` -- the
+    domain error this module's callers already expect from every other
+    manifest/history validation problem."""
+    try:
+        return validate_identifier(value, name)
+    except InvalidIdentifierError as exc:
+        raise MigrationError(str(exc)) from exc
 
 
 MIGRATIONS_SQL_DIRNAME = "sql"
@@ -351,22 +365,27 @@ def ensure_history_table(conn, ops_schema: str) -> None:
       * The `NOT NULL`/`CHECK` enforcement is (re)applied every call, but
         is harmless against an already-conforming table (schema_migrations
         has, at most, one row per migration -- there is no realistic scale
-        concern here); the `CHECK` constraint is added inside a guarded
-        `DO $$ ... $$` block because PostgreSQL has no
-        `ADD CONSTRAINT IF NOT EXISTS`, so this function is safe to call
-        every time (every `apply_pending()` invocation does).
+        concern here); the `CHECK` constraint is added only if it doesn't
+        already exist -- checked via an ordinary parameterized catalog
+        query (never a schema name spliced into a `DO $$ ... $$` block as
+        raw text), then a separately composed `ALTER TABLE ... ADD
+        CONSTRAINT` -- so this function is safe to call every time (every
+        `apply_pending()` invocation does).
 
     This function is called only from `apply_pending()` -- never from the
     read-only `status()` path (see its docstring for why: status() must
     work against an un-upgraded, pre-execution-mode table without ever
     mutating it).
     """
-    _validate_identifier("OPS_SCHEMA", ops_schema)
+    ops_schema = _validate_identifier("OPS_SCHEMA", ops_schema)
+    schema_ident = quote_ident(ops_schema)
+    relation = qualified_relation(ops_schema, "schema_migrations", schema_label="OPS_SCHEMA")
+
     with conn.cursor() as cur:
-        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{ops_schema}"')
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_ident}")
         cur.execute(
             f"""
-            CREATE TABLE IF NOT EXISTS "{ops_schema}".schema_migrations (
+            CREATE TABLE IF NOT EXISTS {relation} (
               version      text PRIMARY KEY,
               description  text NOT NULL,
               checksum     text NOT NULL,
@@ -378,51 +397,49 @@ def ensure_history_table(conn, ops_schema: str) -> None:
         )
 
         # --- Additive, idempotent upgrade for execution-mode tracking ---
-        cur.execute(f'ALTER TABLE "{ops_schema}".schema_migrations ADD COLUMN IF NOT EXISTS execution text')
-        cur.execute(
-            f'ALTER TABLE "{ops_schema}".schema_migrations ADD COLUMN IF NOT EXISTS execution_count integer'
-        )
+        cur.execute(f"ALTER TABLE {relation} ADD COLUMN IF NOT EXISTS execution text")
+        cur.execute(f"ALTER TABLE {relation} ADD COLUMN IF NOT EXISTS execution_count integer")
         # Backfill only rows that predate execution-mode tracking. Never
         # touches version/checksum/applied_at/description/duration_ms/
-        # app_version.
+        # app_version. The backfilled value is an ordinary data value
+        # (ExecutionMode.ONE_TIME.value -- a fixed Python constant, never
+        # user input either way), bound as a normal parameter rather than
+        # spliced into the SQL text.
+        cur.execute(f"UPDATE {relation} SET execution = %s WHERE execution IS NULL", (ExecutionMode.ONE_TIME.value,))
+        cur.execute(f"UPDATE {relation} SET execution_count = %s WHERE execution_count IS NULL", (1,))
+        # DDL default/check-constraint bodies must be constant expressions
+        # -- PostgreSQL does not accept a bind parameter here the way a
+        # normal DML statement would, so these two values are embedded
+        # directly. Both are safe: `ExecutionMode` members are a fixed,
+        # hardcoded two-value Python enum (never derived from user input,
+        # a manifest, or any environment variable), not the dynamic
+        # `ops_schema` identifier this function exists to protect.
+        cur.execute(f"ALTER TABLE {relation} ALTER COLUMN execution SET DEFAULT '{ExecutionMode.ONE_TIME.value}'")
+        cur.execute(f"ALTER TABLE {relation} ALTER COLUMN execution SET NOT NULL")
+        cur.execute(f"ALTER TABLE {relation} ALTER COLUMN execution_count SET DEFAULT 1")
+        cur.execute(f"ALTER TABLE {relation} ALTER COLUMN execution_count SET NOT NULL")
+
+        # Add the CHECK constraint only if it doesn't already exist --
+        # PostgreSQL has no "ADD CONSTRAINT IF NOT EXISTS". The existence
+        # check is a plain parameterized catalog query (ops_schema is a
+        # bound value here, not SQL syntax); the ALTER TABLE that follows
+        # is the same validated, composed `relation` used throughout this
+        # function -- at no point is `ops_schema` spliced into a
+        # PL/pgSQL DO block as raw text.
         cur.execute(
-            f"UPDATE \"{ops_schema}\".schema_migrations SET execution = '{ExecutionMode.ONE_TIME.value}' "
-            f"WHERE execution IS NULL"
+            "SELECT 1 FROM pg_constraint c "
+            "JOIN pg_class r ON r.oid = c.conrelid "
+            "JOIN pg_namespace n ON n.oid = r.relnamespace "
+            "WHERE n.nspname = %s AND r.relname = %s AND c.conname = %s",
+            (ops_schema, "schema_migrations", "schema_migrations_execution_check"),
         )
-        cur.execute(
-            f'UPDATE "{ops_schema}".schema_migrations SET execution_count = 1 WHERE execution_count IS NULL'
-        )
-        cur.execute(
-            f"ALTER TABLE \"{ops_schema}\".schema_migrations "
-            f"ALTER COLUMN execution SET DEFAULT '{ExecutionMode.ONE_TIME.value}'"
-        )
-        cur.execute(f'ALTER TABLE "{ops_schema}".schema_migrations ALTER COLUMN execution SET NOT NULL')
-        cur.execute(f'ALTER TABLE "{ops_schema}".schema_migrations ALTER COLUMN execution_count SET DEFAULT 1')
-        cur.execute(f'ALTER TABLE "{ops_schema}".schema_migrations ALTER COLUMN execution_count SET NOT NULL')
-        # Validate stored execution values. Guarded so re-running this
-        # bootstrap never errors on an already-present constraint --
-        # PostgreSQL has no "ADD CONSTRAINT IF NOT EXISTS".
-        allowed_values = ", ".join(f"'{m.value}'" for m in ExecutionMode)
-        cur.execute(
-            f"""
-            DO $$
-            BEGIN
-              IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint c
-                JOIN pg_class r ON r.oid = c.conrelid
-                JOIN pg_namespace n ON n.oid = r.relnamespace
-                WHERE n.nspname = '{ops_schema}'
-                  AND r.relname = 'schema_migrations'
-                  AND c.conname = 'schema_migrations_execution_check'
-              ) THEN
-                ALTER TABLE "{ops_schema}".schema_migrations
-                  ADD CONSTRAINT schema_migrations_execution_check
-                  CHECK (execution IN ({allowed_values}));
-              END IF;
-            END
-            $$;
-            """
-        )
+        constraint_exists = cur.fetchone() is not None
+        if not constraint_exists:
+            allowed_values = ", ".join(f"'{m.value}'" for m in ExecutionMode)  # trusted enum constants, not user input
+            cur.execute(
+                f"ALTER TABLE {relation} ADD CONSTRAINT schema_migrations_execution_check "
+                f"CHECK (execution IN ({allowed_values}))"
+            )
     conn.commit()
 
 
@@ -458,13 +475,15 @@ def _read_applied(conn, ops_schema: str) -> dict[str, AppliedMigration]:
     that predates the backfill) are interpreted as `ExecutionMode.ONE_TIME`
     with `execution_count=1`, per this repository's compatibility rule."""
     applied: dict[str, AppliedMigration] = {}
+    ops_schema = _validate_identifier("OPS_SCHEMA", ops_schema)
+    relation = qualified_relation(ops_schema, "schema_migrations", schema_label="OPS_SCHEMA")
     has_execution_columns = _history_has_execution_columns(conn, ops_schema)
     with conn.cursor() as cur:
         if has_execution_columns:
             cur.execute(
-                f'SELECT version, description, checksum, applied_at, duration_ms, app_version, '
-                f'execution, execution_count '
-                f'FROM "{ops_schema}".schema_migrations ORDER BY version'
+                f"SELECT version, description, checksum, applied_at, duration_ms, app_version, "
+                f"execution, execution_count "
+                f"FROM {relation} ORDER BY version"
             )
             rows = [
                 (version, description, checksum, applied_at, duration_ms, app_version, execution, execution_count)
@@ -473,8 +492,8 @@ def _read_applied(conn, ops_schema: str) -> dict[str, AppliedMigration]:
             ]
         else:
             cur.execute(
-                f'SELECT version, description, checksum, applied_at, duration_ms, app_version '
-                f'FROM "{ops_schema}".schema_migrations ORDER BY version'
+                f"SELECT version, description, checksum, applied_at, duration_ms, app_version "
+                f"FROM {relation} ORDER BY version"
             )
             rows = [
                 (version, description, checksum, applied_at, duration_ms, app_version, None, None)
@@ -583,7 +602,18 @@ def status(
     this repository's real db/migrations/) so callers -- tests, in
     particular -- can point discovery at an isolated fixture set without
     touching the real, committed migrations.
+
+    Validates `config.ops_schema` against the shared identifier policy
+    before running any query -- defense in depth alongside `PipelineConfig
+    .load()`'s own validation, since `_history_table_exists()` only ever
+    binds `ops_schema` as an ordinary parameterized value (safe from
+    injection either way, but not itself a policy check), and a caller
+    could in principle construct a config object directly rather than
+    through `PipelineConfig.load()`. Raises before touching the database
+    (never mutates anything either way -- this function is read-only).
     """
+    _validate_identifier("OPS_SCHEMA", config.ops_schema)
+
     migrations_dir, repo_root = _default_migrations_and_repo_root(migrations_dir, repo_root)
     all_migrations = discover(migrations_dir, repo_root)
 
@@ -641,6 +671,7 @@ def _apply_one_time(conn, migration: MigrationDef, config) -> AppliedMigration:
     variables = _resolve_vars(migration, config)
     sql_text = _rendered_sql(migration, variables)
     checksum = compute_checksum(migration)
+    relation = qualified_relation(config.ops_schema, "schema_migrations", schema_label="OPS_SCHEMA")
     started = time.monotonic()
     applied_at = datetime.now(timezone.utc)
 
@@ -649,7 +680,7 @@ def _apply_one_time(conn, migration: MigrationDef, config) -> AppliedMigration:
             cur.execute(sql_text)
             duration_ms = (time.monotonic() - started) * 1000.0
             cur.execute(
-                f'INSERT INTO "{config.ops_schema}".schema_migrations '
+                f"INSERT INTO {relation} "
                 f"(version, description, checksum, applied_at, duration_ms, app_version, "
                 f"execution, execution_count) "
                 f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
@@ -694,6 +725,7 @@ def _apply_repeatable(conn, migration: MigrationDef, config, *, prior_execution_
     variables = _resolve_vars(migration, config)
     sql_text = _rendered_sql(migration, variables)
     checksum = compute_checksum(migration)
+    relation = qualified_relation(config.ops_schema, "schema_migrations", schema_label="OPS_SCHEMA")
     started = time.monotonic()
     applied_at = datetime.now(timezone.utc)
     new_execution_count = prior_execution_count + 1
@@ -703,7 +735,7 @@ def _apply_repeatable(conn, migration: MigrationDef, config, *, prior_execution_
             cur.execute(sql_text)
             duration_ms = (time.monotonic() - started) * 1000.0
             cur.execute(
-                f'INSERT INTO "{config.ops_schema}".schema_migrations '
+                f"INSERT INTO {relation} "
                 f"(version, description, checksum, applied_at, duration_ms, app_version, "
                 f"execution, execution_count) "
                 f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "

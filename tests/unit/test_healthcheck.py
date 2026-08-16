@@ -18,7 +18,11 @@ from tuva_ingest.healthcheck import run_healthcheck  # noqa: E402
 
 @dataclass
 class _FakeConfig:
-    pg_dsn: str = "postgresql://x@localhost/db"
+    # Renamed from `pg_dsn` -> `pg_dsn_value` to mirror config.py's real
+    # IngestConfig, where `pg_dsn` is now a SecretStr and callers that
+    # need the real connection string (like healthcheck.py) use the
+    # `.pg_dsn_value` unwrapping property instead.
+    pg_dsn_value: str = "postgresql://x@localhost/db"
     ops_schema: str = "ingest_ops"
     pipeline_max_success_age_hours: float = 30.0
 
@@ -137,7 +141,7 @@ class TestRunHealthcheck(unittest.TestCase):
 
     def test_render_never_includes_dsn(self):
         result = run_healthcheck(
-            _FakeConfig(pg_dsn="postgresql://user:secret-pass@localhost/db"),
+            _FakeConfig(pg_dsn_value="postgresql://user:secret-pass@localhost/db"),
             connect_fn=_connect_ok,
             migrations_mod=_FakeMigrationsModule(_FakeMigrationStatus()),
             state_mod=_FakeStateModule(None),

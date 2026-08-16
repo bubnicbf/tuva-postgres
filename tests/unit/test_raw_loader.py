@@ -10,6 +10,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22,6 +23,7 @@ from tuva_ingest.raw_loader import (  # noqa: E402
     _RAW_COLUMNS,
     _iter_csv_rows,
     _relation,
+    load_single_endpoint_snapshot,
     verify_file_checksum,
 )
 
@@ -100,6 +102,64 @@ class TestIterCsvRows(unittest.TestCase):
         path = self.dir / "header_only.csv"
         path.write_text("patient_id,payer\n", encoding="utf-8")
         self.assertEqual(list(_iter_csv_rows(path)), [])
+
+
+
+
+class _ExplodingConnection:
+    """A fake psycopg connection that raises if it is ever touched --
+    used to prove load_single_endpoint_snapshot's error paths (missing
+    file, missing checksum, checksum mismatch) fail before any database
+    interaction, never TRUNCATEing or COPYing anything."""
+
+    def cursor(self):
+        raise AssertionError("the connection must not be touched when validation fails before load_table")
+
+
+@dataclass
+class _FakeConfigForLoader:
+    raw_schema: str = "raw"
+
+
+class TestLoadSingleEndpointSnapshot(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.snapshot_dir = Path(self._tmp.name)
+        self.config = _FakeConfigForLoader()
+
+    def test_missing_csv_raises_before_touching_connection(self):
+        with self.assertRaises(RawLoadError) as ctx:
+            load_single_endpoint_snapshot(
+                _ExplodingConnection(), self.config, self.snapshot_dir, "snap-1", "eligibility", {}
+            )
+        self.assertIn("eligibility", str(ctx.exception))
+
+    def test_missing_checksum_raises_before_touching_connection(self):
+        (self.snapshot_dir / "eligibility.csv").write_text("patient_id\n1\n", encoding="utf-8")
+        with self.assertRaises(RawLoadError) as ctx:
+            load_single_endpoint_snapshot(
+                _ExplodingConnection(), self.config, self.snapshot_dir, "snap-1", "eligibility", {}
+            )
+        self.assertIn("no recorded checksum", str(ctx.exception))
+
+    def test_checksum_mismatch_raises_before_touching_connection(self):
+        (self.snapshot_dir / "eligibility.csv").write_text("patient_id\n1\n", encoding="utf-8")
+        checksums = {"eligibility": {"sha256": "f" * 64, "size_bytes": 5}}
+        with self.assertRaises(RawLoadError):
+            load_single_endpoint_snapshot(
+                _ExplodingConnection(), self.config, self.snapshot_dir, "snap-1", "eligibility", checksums
+            )
+
+    def test_never_references_tables_other_than_the_requested_one(self):
+        # The function signature takes a single `table` argument and
+        # only ever builds a relation from it (see raw_loader.py) -- this
+        # regression test locks in that `RAW_TABLES` (the full 3-table
+        # set) is never consulted by this function at all.
+        import inspect
+
+        source = inspect.getsource(load_single_endpoint_snapshot)
+        self.assertNotIn("RAW_TABLES", source)
 
 
 if __name__ == "__main__":

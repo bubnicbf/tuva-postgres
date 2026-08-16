@@ -199,5 +199,80 @@ class TestTableLoadRowCounts(unittest.TestCase):
         self.assertEqual(result, {"eligibility": 3, "medical_claim": 7})
 
 
+
+
+class TestUpsertRunningRun(unittest.TestCase):
+    def test_rejects_hostile_schema_before_touching_connection(self):
+        conn = _FakeConnection()
+        with self.assertRaises(InvalidIdentifierError):
+            state.upsert_running_run(
+                conn, "ops; DROP TABLE x", run_id="r1", source="tuva", snapshot_id="snap-1",
+                endpoint="eligibility", requested_since=None, environment="local",
+                app_version="0.1.0", host="test-host",
+            )
+        self.assertEqual(conn.log, [])
+        self.assertEqual(conn.commits, 0)
+
+    def test_commits_and_includes_on_conflict_do_update(self):
+        conn = _FakeConnection()
+        state.upsert_running_run(
+            conn, "ingest_ops", run_id="r1", source="tuva", snapshot_id="snap-1",
+            endpoint="eligibility", requested_since="2025-01-01", environment="local",
+            app_version="0.1.0", host="test-host",
+        )
+        self.assertEqual(conn.commits, 1)
+        sql, params = conn.log[0]
+        self.assertIn('"ingest_ops"."ingestion_runs"', sql)
+        self.assertIn("ON CONFLICT (run_id) DO UPDATE", sql)
+        self.assertIn("status = 'running'", sql)
+        self.assertEqual(params[0], "r1")
+        self.assertIn("eligibility", params)
+
+    def test_resets_finished_at_and_error_fields_on_conflict(self):
+        conn = _FakeConnection()
+        state.upsert_running_run(
+            conn, "ingest_ops", run_id="r1", source="tuva", snapshot_id="snap-1",
+            endpoint=None, requested_since=None, environment="local",
+            app_version="0.1.0", host="test-host",
+        )
+        sql, _params = conn.log[0]
+        self.assertIn("finished_at = NULL", sql)
+        self.assertIn("error_category = NULL", sql)
+        self.assertIn("error_message = NULL", sql)
+
+
+class TestUpsertTableLoadPending(unittest.TestCase):
+    def test_rejects_hostile_schema_before_touching_connection(self):
+        conn = _FakeConnection()
+        with self.assertRaises(InvalidIdentifierError):
+            state.upsert_table_load_pending(
+                conn, "ops; DROP TABLE x", "r1", table="eligibility",
+                expected_sha256="a" * 64, expected_size_bytes=10,
+            )
+        self.assertEqual(conn.log, [])
+        self.assertEqual(conn.commits, 0)
+
+    def test_commits_and_includes_on_conflict_do_update(self):
+        conn = _FakeConnection()
+        state.upsert_table_load_pending(
+            conn, "ingest_ops", "r1", table="eligibility", expected_sha256="a" * 64, expected_size_bytes=10
+        )
+        self.assertEqual(conn.commits, 1)
+        sql, params = conn.log[0]
+        self.assertIn('"ingest_ops"."table_loads"', sql)
+        self.assertIn("ON CONFLICT (run_id, table_name) DO UPDATE", sql)
+        self.assertEqual(params[:2], ("r1", "eligibility"))
+
+    def test_resets_row_count_and_checksum_fields_on_conflict(self):
+        conn = _FakeConnection()
+        state.upsert_table_load_pending(
+            conn, "ingest_ops", "r1", table="eligibility", expected_sha256="a" * 64, expected_size_bytes=10
+        )
+        sql, _params = conn.log[0]
+        self.assertIn("row_count = NULL", sql)
+        self.assertIn("actual_sha256 = NULL", sql)
+        self.assertIn("load_status = 'pending'", sql)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,6 +89,7 @@ if _SKIP_REASON:
 else:
     from tuva_ingest import migrations, raw_loader, state  # noqa: E402
     from tuva_ingest.db import connect  # noqa: E402
+    from tuva_ingest.raw_loader import load_single_endpoint_snapshot  # noqa: E402
 
 
 def _unique_suffix() -> str:
@@ -138,9 +139,9 @@ class _TestConfig:
 
 
 class TestMigrationsAgainstRealDatabase(_IsolatedSchemaTestCase):
-    def test_all_three_migrations_applied(self):
+    def test_all_four_migrations_applied(self):
         status = migrations.status(self.conn, self.config)
-        self.assertEqual([m.version for m in status.applied], ["001", "002", "003"])
+        self.assertEqual([m.version for m in status.applied], ["001", "002", "003", "004"])
         self.assertEqual(status.pending, ())
         self.assertFalse(status.has_integrity_failures)
 
@@ -518,6 +519,101 @@ class TestDbtLineageAgainstRealDatabase(_IsolatedSchemaTestCase):
 
         self.assertEqual(first_counts, second_counts)
         self.assertEqual(first_counts, {"eligibility": 3, "medical_claim": 3, "pharmacy_claim": 3})
+
+
+
+
+class TestEndpointScopedLoadAgainstRealDatabase(_IsolatedSchemaTestCase):
+    """Exercises raw_loader.load_single_endpoint_snapshot and
+    state.upsert_running_run/upsert_table_load_pending -- the real-
+    database counterparts to tests/unit/test_raw_loader.py's and
+    tests/unit/test_state.py's faked-connection tests -- against a real,
+    disposable PostgreSQL database, proving:
+
+      * loading one endpoint's table never touches the other two raw
+        tables (they stay empty/untouched);
+      * a failed load rolls back cleanly, leaving the target table
+        exactly as it was before the attempt;
+      * a repeated `load --run-id` for the same run_id/table is
+        idempotent at both the state layer (ON CONFLICT DO UPDATE, no
+        duplicate ingestion_runs/table_loads rows) and the data layer
+        (TRUNCATE + COPY, no duplicated rows).
+    """
+
+    def _row_count(self, table):
+        relation = f'"{self.raw_schema}"."{table}"'
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {relation}")
+            return cur.fetchone()[0]
+
+    def _table_row_count_in_ops(self, run_id):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f'SELECT count(*) FROM "{self.ops_schema}"."table_loads" WHERE run_id = %s',
+                (run_id,),
+            )
+            return cur.fetchone()[0]
+
+    def test_loading_one_endpoint_never_touches_other_raw_tables(self):
+        checksum = {"eligibility": {"sha256": raw_loader._file_sha256(FIXTURES_DIR / "eligibility.csv")}}
+        load_single_endpoint_snapshot(self.conn, self.config, FIXTURES_DIR, "snap-ep-1", "eligibility", checksum)
+        self.conn.commit()
+
+        self.assertEqual(self._row_count("eligibility"), 3)
+        self.assertEqual(self._row_count("medical_claim"), 0)
+        self.assertEqual(self._row_count("pharmacy_claim"), 0)
+
+    def test_failed_checksum_rolls_back_and_leaves_table_untouched(self):
+        good = {"eligibility": {"sha256": raw_loader._file_sha256(FIXTURES_DIR / "eligibility.csv")}}
+        load_single_endpoint_snapshot(self.conn, self.config, FIXTURES_DIR, "snap-ep-1", "eligibility", good)
+        self.conn.commit()
+        self.assertEqual(self._row_count("eligibility"), 3)
+
+        from tuva_ingest.errors import RawLoadError
+
+        bad = {"eligibility": {"sha256": "0" * 64}}
+        with self.assertRaises(RawLoadError):
+            load_single_endpoint_snapshot(self.conn, self.config, FIXTURES_DIR, "snap-ep-1", "eligibility", bad)
+        self.conn.rollback()
+
+        # The prior, committed load must still be intact -- a failed
+        # verification must never truncate the table before raising.
+        self.assertEqual(self._row_count("eligibility"), 3)
+
+    def test_upsert_running_run_and_table_load_pending_are_idempotent_for_same_run_id(self):
+        run_id = "snap-ep-idem-1"
+        checksum = {"eligibility": {"sha256": raw_loader._file_sha256(FIXTURES_DIR / "eligibility.csv")}}
+
+        for _ in range(2):
+            state.upsert_running_run(
+                self.conn, self.ops_schema, run_id=run_id, source="tuva", snapshot_id=run_id,
+                endpoint="eligibility", requested_since=None, environment="test",
+                app_version="0.1.0", host="test-host",
+            )
+            state.upsert_table_load_pending(
+                self.conn, self.ops_schema, run_id, table="eligibility",
+                expected_sha256=checksum["eligibility"]["sha256"], expected_size_bytes=None,
+            )
+            load_single_endpoint_snapshot(self.conn, self.config, FIXTURES_DIR, run_id, "eligibility", checksum)
+            state.mark_table_load_succeeded(
+                self.conn, self.ops_schema, run_id, "eligibility", row_count=3,
+                actual_sha256=checksum["eligibility"]["sha256"], actual_size_bytes=None,
+            )
+            state.mark_succeeded(self.conn, self.ops_schema, run_id, rows_loaded={"eligibility": 3}, tables_loaded=["eligibility"])
+            self.conn.commit()
+
+        # Repeating the whole load/state sequence for the same run_id
+        # must never accumulate a second ingestion_runs or table_loads
+        # row, and the data itself must not be duplicated.
+        with self.conn.cursor() as cur:
+            cur.execute(f'SELECT count(*) FROM "{self.ops_schema}"."ingestion_runs" WHERE run_id = %s', (run_id,))
+            self.assertEqual(cur.fetchone()[0], 1)
+        self.assertEqual(self._table_row_count_in_ops(run_id), 1)
+        self.assertEqual(self._row_count("eligibility"), 3)
+
+        latest = state.latest_run(self.conn, self.ops_schema)
+        self.assertEqual(latest[0], run_id)
+        self.assertEqual(latest[1], "succeeded")
 
 
 if __name__ == "__main__":

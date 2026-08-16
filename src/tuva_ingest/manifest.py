@@ -82,11 +82,11 @@ def parse_and_validate(
     contain -- exactly those, no more, no fewer. Defaults to
     `RAW_TABLES` (every managed table), which is what the legacy,
     full-pipeline `run`/`load-raw` flow still fetches in one manifest.
-    The new endpoint-scoped `extract --endpoint <name>` flow (see
-    `extract.extract_endpoint_snapshot`) passes a single-table tuple --
-    `(endpoints.table_for_endpoint(endpoint),)` -- so a manifest response
-    for one endpoint is never rejected for "missing" the other two
-    endpoints' artifacts.
+    (The current `extract`/`load`/`sync` commands no longer use this
+    manifest contract at all -- see `pagination.py`'s paginated JSON
+    envelope instead, validated by `pagination.validate_page_envelope`;
+    `expected_tables` remains here, tested, for any future caller that
+    needs a single-table-scoped legacy manifest fetch.)
     """
     errors: list[str] = []
     required_tables = expected_tables if expected_tables is not None else RAW_TABLES

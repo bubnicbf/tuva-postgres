@@ -205,11 +205,13 @@ class _FakeLoadConfig:
     pg_dsn_value: str = "postgresql://user:pass@localhost/db"
 
 
-class TestRunLoadResolution(unittest.TestCase):
-    """_run_load's resolution/validation logic (unresolvable run_id,
-    legacy full-manifest snapshot rejection) -- does not require a real
-    database since both failure paths raise before `db.connect` is ever
-    called."""
+class TestRunPaginatedLoadResolution(unittest.TestCase):
+    """_run_paginated_load's pre-database resolution/validation logic
+    (unresolvable run_id, corrupted/tampered published run) -- does not
+    require a real database since both failure paths raise before
+    `db.connect` is ever called (see cli._run_paginated_load: it calls
+    `store.is_published`/`verify_run_manifest` before opening a
+    connection)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -223,27 +225,98 @@ class TestRunLoadResolution(unittest.TestCase):
         self.logger.addHandler(logging.NullHandler())
         self.logger.propagate = False
 
+    def _publish_paginated_run(self, run_id="run-1", endpoint="eligibility", records=None):
+        from datetime import datetime, timezone
+
+        from tuva_ingest.pagination import PaginatedRunStore, validate_page_envelope
+
+        records = records if records is not None else [{"a": 1}, {"a": 2}]
+        store = PaginatedRunStore(self.raw_data_dir, "tuva")
+        staging = store.begin_staging(run_id)
+        payload = {
+            "records": records,
+            "metadata": {"record_count": len(records), "page_token": None, "next_page_token": None, "high_water_mark": "hwm-1"},
+        }
+        envelope = validate_page_envelope(payload, requested_page_token=None)
+        meta = store.write_page(
+            staging, run_id=run_id, endpoint=endpoint, page_number=1,
+            request_page_token=None, envelope=envelope, retrieved_at=datetime.now(timezone.utc),
+        )
+        return store, store.finalize(
+            staging, run_id, [meta], endpoint=endpoint, since=None,
+            total_record_count=len(records), candidate_high_water_mark="hwm-1",
+        )
+
     def test_unresolvable_run_id_raises_run_not_found(self):
         with self.assertRaises(RunNotFoundError):
-            cli._run_load("does-not-exist", config=self.config, logger=self.logger)
+            cli._run_paginated_load("does-not-exist", config=self.config, logger=self.logger)
 
-    def test_legacy_full_manifest_run_id_is_rejected(self):
-        from tuva_ingest.extract import RawSnapshotStore
+    def test_tampered_run_is_rejected_before_any_database_connection(self):
+        from tuva_ingest.errors import ReconciliationError
 
-        store = RawSnapshotStore(self.raw_data_dir, "tuva")
-        staging = store.begin_staging("snap-legacy-1")
-        for table in ("eligibility", "medical_claim", "pharmacy_claim"):
-            (staging / f"{table}.csv").write_text("col\nval\n", encoding="utf-8")
-        legacy_manifest = {
-            "version": 1, "source": "tuva", "snapshot_id": "snap-legacy-1",
-            "created_at": "2026-08-14T06:00:00Z", "artifacts": [],
-        }
-        checksums = {t: {"sha256": "a" * 64, "size_bytes": 8} for t in ("eligibility", "medical_claim", "pharmacy_claim")}
-        store.finalize(staging, "snap-legacy-1", legacy_manifest, checksums)
+        store, published = self._publish_paginated_run()
+        page_file = next(published.glob("page-*.jsonl.gz"))
+        page_file.write_bytes(b"corrupted-not-matching-checksum")
 
-        with self.assertRaises(RunNotFoundError) as ctx:
-            cli._run_load("snap-legacy-1", config=self.config, logger=self.logger)
-        self.assertIn("legacy", str(ctx.exception))
+        with self.assertRaises(ReconciliationError):
+            cli._run_paginated_load("run-1", config=self.config, logger=self.logger)
+
+
+class TestSyncStopsBeforeLoadOnExtractionFailure(unittest.TestCase):
+    """`sync` must stop immediately (never attempt `load`, never report
+    success) if extraction fails -- see cli._cmd_sync's own comment.
+    Every collaborator (config loading, the watermark lookup, secret
+    retrieval, the API client, extraction itself, and the load step) is
+    mocked so this test exercises only `_cmd_sync`'s own control flow,
+    never a real database/network/cloud call."""
+
+    def _fake_config(self):
+        @dataclass
+        class _Config:
+            raw_data_dir: Path = Path("/tmp/does-not-matter")
+            source_name: str = "tuva"
+            ops_schema: str = "ingest_ops"
+            pg_dsn_value: str = "postgresql://user:pass@localhost/db"
+            api_manifest_url: str = "https://example.invalid/v1/records"
+            api_max_pages: int = 100
+            api_page_size: int | None = None
+            api_max_page_bytes: int = 1024
+            api_max_retries: int = 3
+            api_max_retry_delay_seconds: float = 5.0
+            log_level: str = "INFO"
+
+            def httpx_timeout(self):
+                return None
+
+        return _Config()
+
+    def test_extraction_failure_prevents_load_from_ever_being_called(self):
+        from pydantic import SecretStr
+
+        from tuva_ingest.errors import PaginationError
+        from tuva_ingest.secrets import ApiCredential
+
+        args = cli.build_parser().parse_args(["sync", "--endpoint", "eligibility"])
+
+        with (
+            mock.patch.object(cli.IngestConfig, "load", return_value=self._fake_config()),
+            mock.patch("tuva_ingest.state.get_watermark", return_value=None),
+            mock.patch("tuva_ingest.db.connect", return_value=mock.Mock(close=mock.Mock())),
+            mock.patch(
+                "tuva_ingest.secrets.retrieve_api_credential",
+                return_value=ApiCredential(api_token=SecretStr("fake-token")),
+            ),
+            mock.patch("tuva_ingest.api_client.ApiClient", return_value=mock.Mock(close=mock.Mock())),
+            mock.patch(
+                "tuva_ingest.pagination.extract_paginated_run",
+                side_effect=PaginationError("simulated extraction failure"),
+            ),
+            mock.patch.object(cli, "_run_paginated_load") as fake_load,
+        ):
+            with self.assertRaises(PaginationError):
+                cli._cmd_sync(args)
+
+        fake_load.assert_not_called()
 
 
 if __name__ == "__main__":

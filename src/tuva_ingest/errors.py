@@ -77,3 +77,40 @@ class RunNotFoundError(ConnectorError):
     a published, successful extraction -- never a silent no-op."""
 
     category = "run_not_found"
+
+
+class SecretError(ConnectorError):
+    """Raised by `secrets.py` for any failure retrieving/validating the API
+    credential from the configured secret provider: an unknown provider, a
+    missing secret, malformed secret JSON, a missing `api_token` field, or
+    a provider-level (e.g. AWS SDK) error. Never includes the secret value
+    itself, or any partial credential content, in its message."""
+
+    category = "secret"
+
+
+class PaginationError(ConnectorError):
+    """Raised by `pagination.py` for any paginated page-request/response
+    contract violation: a malformed envelope, missing/invalid metadata, a
+    record-count mismatch, a token mismatch, a repeated token (pagination
+    cycle), or exceeding the configured maximum page count."""
+
+    category = "pagination"
+
+
+class ReconciliationError(ConnectorError):
+    """Raised when any of the three source/file/database count checks
+    (see `paginated_loader.py`) does not match. Always treated as a failed
+    run -- the transaction is rolled back and the watermark is never
+    committed."""
+
+    category = "reconciliation"
+
+
+class WatermarkError(ConnectorError):
+    """Raised when a candidate high-water mark would move an endpoint's
+    durable watermark backward, or when the watermark table cannot be
+    read/written safely."""
+
+    category = "watermark"
+

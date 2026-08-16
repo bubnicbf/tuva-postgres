@@ -43,15 +43,19 @@ migrate:
 migrate-status:
 	. .env && uv run tuva-ingest migrate --status
 
-# Fetches + validates the manifest and publishes a raw snapshot only (no
-# load-raw/dbt). Requires TUVA_API_MANIFEST_URL/TUVA_API_TOKEN/
-# RAW_DATA_DIR (see .env / scripts/setup_env.example).
+# Retrieves an API credential (TUVA_API_SECRET_PROVIDER, default env's
+# TUVA_API_TOKEN), then paginates through TUVA_API_MANIFEST_URL and
+# publishes an immutable, checksummed run under RAW_DATA_DIR only (no
+# load/dbt) -- see README.md's "`extract` / `load` / `sync`" section.
+# Requires TUVA_API_MANIFEST_URL/RAW_DATA_DIR (see .env /
+# scripts/setup_env.example).
 # ENDPOINT/SINCE are the only two --endpoint/--since values `extract`/
 # `sync` need; override on the command line, e.g.
 # `make extract ENDPOINT=pharmacy-claims SINCE=2025-01-01`. ENDPOINT
 # defaults to medical-claims only so `make extract`/`make sync` have a
 # sane one-command default -- always pass ENDPOINT explicitly for
-# anything beyond local smoke-testing.
+# anything beyond local smoke-testing. Omit SINCE to resolve the
+# endpoint's last committed high-water mark automatically.
 ENDPOINT ?= medical-claims
 SINCE ?=
 _SINCE_ARG = $(if $(SINCE),--since $(SINCE),)

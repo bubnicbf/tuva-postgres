@@ -295,3 +295,52 @@ class ApiClient:
 
     def close(self) -> None:
         self._client.close()
+
+    def get_json_page(self, url: str, *, params: dict | None = None, max_bytes: int) -> dict:
+        """`GET url` (with `params` -- endpoint/since/page_token/page_size
+        -- passed through httpx's own query-string encoding, never string
+        concatenation) for the paginated page-request contract (see
+        `pagination.py`). Distinct from `fetch_manifest_json` above
+        (kept byte-for-byte unchanged for the legacy manifest contract)
+        because this path additionally enforces a supported response
+        content type before parsing -- one of the paginated envelope's
+        own validation rules (see `pagination.validate_page_envelope`'s
+        module docstring) that the legacy manifest contract never
+        required. Streamed and size-bounded so an oversized page response
+        is aborted before it fills memory, exactly like
+        `fetch_manifest_json`. Raises `PaginationError` (imported lazily
+        to avoid a module-level import cycle) for any non-2xx status
+        (after the shared retry machinery in `_request_with_retries` has
+        already exhausted retryable ones), unsupported content type,
+        oversized body, or invalid JSON.
+        """
+        from .errors import PaginationError
+
+        response = self._request_with_retries("GET", url, params=params)
+        try:
+            if response.status_code in (401, 403):
+                raise PaginationError(f"page request was not authorized (HTTP {response.status_code})")
+            if response.status_code == 404:
+                raise PaginationError("page request URL returned 404 (not found)")
+            if response.status_code != 200:
+                raise PaginationError(f"page request failed (HTTP {response.status_code})")
+
+            content_type = response.headers.get("content-type", "")
+            media_type = content_type.split(";")[0].strip().lower()
+            if media_type != "application/json":
+                raise PaginationError(
+                    f"page response has unsupported content type {content_type!r} (expected application/json)"
+                )
+
+            body = bytearray()
+            for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    raise PaginationError(f"page response exceeds the {max_bytes}-byte safety limit")
+            try:
+                return json.loads(bytes(body))
+            except json.JSONDecodeError as exc:
+                raise PaginationError(f"page response is not valid JSON: {exc}") from None
+        finally:
+            response.close()
+

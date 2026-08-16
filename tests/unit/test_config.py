@@ -38,6 +38,12 @@ _ENV_KEYS = [
     "TUVA_API_WRITE_TIMEOUT_SECONDS",
     "TUVA_API_POOL_TIMEOUT_SECONDS",
     "TUVA_API_MAX_RETRY_DELAY_SECONDS",
+    "TUVA_API_SECRET_PROVIDER",
+    "TUVA_API_SECRET_ID",
+    "AWS_REGION",
+    "TUVA_API_PAGE_SIZE",
+    "TUVA_API_MAX_PAGES",
+    "TUVA_API_MAX_PAGE_BYTES",
 ]
 
 
@@ -286,6 +292,81 @@ class TestIngestConfigPydanticTypes(_EnvIsolatedTestCase):
         self._set(**_valid_env())
         config = IngestConfig.load()
         self.assertEqual(config.api_max_retry_delay_seconds, 30.0)
+
+
+class TestIngestConfigSecretProviderAndPagination(_EnvIsolatedTestCase):
+    """TUVA_API_SECRET_PROVIDER/TUVA_API_SECRET_ID/AWS_REGION (secrets.py)
+    and the paginated-extraction tuning fields (pagination.py)."""
+
+    def test_default_secret_provider_is_env(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertEqual(config.api_secret_provider, "env")
+        self.assertIsNone(config.api_secret_id)
+
+    def test_aws_provider_accepted_with_secret_id(self):
+        env = _valid_env()
+        env["TUVA_API_SECRET_PROVIDER"] = "aws"
+        env["TUVA_API_SECRET_ID"] = "prod/tuva/api-token"
+        env["AWS_REGION"] = "us-east-1"
+        self._set(**env)
+        config = IngestConfig.load()
+        self.assertEqual(config.api_secret_provider, "aws")
+        self.assertEqual(config.api_secret_id, "prod/tuva/api-token")
+        self.assertEqual(config.aws_region, "us-east-1")
+
+    def test_aws_provider_without_secret_id_rejected(self):
+        env = _valid_env()
+        env["TUVA_API_SECRET_PROVIDER"] = "aws"
+        self._set(**env)
+        with self.assertRaises(ConfigError) as ctx:
+            IngestConfig.load()
+        self.assertIn("TUVA_API_SECRET_ID", str(ctx.exception))
+
+    def test_unknown_secret_provider_rejected(self):
+        env = _valid_env()
+        env["TUVA_API_SECRET_PROVIDER"] = "vault"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_page_size_defaults_to_none(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertIsNone(config.api_page_size)
+
+    def test_page_size_must_be_positive(self):
+        env = _valid_env()
+        env["TUVA_API_PAGE_SIZE"] = "0"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_max_pages_defaults_to_10000(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertEqual(config.api_max_pages, 10_000)
+
+    def test_max_pages_must_be_positive(self):
+        env = _valid_env()
+        env["TUVA_API_MAX_PAGES"] = "-1"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_max_page_bytes_has_a_sensible_default(self):
+        self._set(**_valid_env())
+        config = IngestConfig.load()
+        self.assertEqual(config.api_max_page_bytes, 64 * 1024 * 1024)
+
+    def test_secret_id_never_redacted_in_safe_dict_it_is_non_secret_lookup_info(self):
+        env = _valid_env()
+        env["TUVA_API_SECRET_PROVIDER"] = "aws"
+        env["TUVA_API_SECRET_ID"] = "prod/tuva/api-token"
+        self._set(**env)
+        config = IngestConfig.load()
+        safe = config.safe_dict()
+        self.assertEqual(safe["api_secret_id"], "prod/tuva/api-token")
 
 
 _HOSTILE_IDENTIFIERS = [

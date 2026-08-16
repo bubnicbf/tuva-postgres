@@ -23,9 +23,9 @@ class TestDiscoverRealMigrations(unittest.TestCase):
     directory -- proves the three shipped files are well-formed, unique,
     and discoverable, not just that discover() works in the abstract."""
 
-    def test_discovers_four_migrations_in_order(self):
+    def test_discovers_five_migrations_in_order(self):
         found = migrations.discover(REPO_ROOT / "migrations")
-        self.assertEqual([m.version for m in found], ["001", "002", "003", "004"])
+        self.assertEqual([m.version for m in found], ["001", "002", "003", "004", "005"])
         self.assertEqual(
             [m.filename for m in found],
             [
@@ -33,6 +33,7 @@ class TestDiscoverRealMigrations(unittest.TestCase):
                 "002_ingestion_control.sql",
                 "003_roles_and_grants.sql",
                 "004_endpoint_scoped_ingestion.sql",
+                "005_paginated_extraction_state.sql",
             ],
         )
 
@@ -178,6 +179,54 @@ class TestMigration004EndpointScopedIngestion(unittest.TestCase):
         ):
             path = REPO_ROOT / "migrations" / filename
             self.assertTrue(path.is_file(), f"migration {version} must still exist unmodified")
+
+
+
+
+class TestMigration005PaginatedExtractionState(unittest.TestCase):
+    """migrations/005_paginated_extraction_state.sql adds the
+    source_watermarks table and the raw-table metadata columns/unique
+    indexes the paginated extraction contract (pagination.py,
+    paginated_loader.py, state.get_watermark/commit_watermark) relies
+    on -- a lightweight structural check against the real shipped file,
+    without requiring a live PostgreSQL connection."""
+
+    def test_file_is_discovered_with_a_stable_checksum(self):
+        found = migrations.discover(REPO_ROOT / "migrations")
+        migration_005 = next(m for m in found if m.version == "005")
+        self.assertEqual(migration_005.filename, "005_paginated_extraction_state.sql")
+        self.assertEqual(migration_005.checksum, migrations.compute_checksum(migration_005.path))
+
+    def test_adds_source_watermarks_table(self):
+        path = REPO_ROOT / "migrations" / "005_paginated_extraction_state.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("source_watermarks", sql)
+        self.assertIn("PRIMARY KEY (source, endpoint)", sql)
+
+    def test_adds_raw_table_metadata_columns_for_every_managed_table(self):
+        path = REPO_ROOT / "migrations" / "005_paginated_extraction_state.sql"
+        sql = path.read_text(encoding="utf-8")
+        for table in ("eligibility", "medical_claim", "pharmacy_claim"):
+            self.assertIn(f':"raw_schema".{table}', sql)
+        for column in ("endpoint", "page_number", "source_page_token", "retrieved_at", "file_sha256"):
+            self.assertIn(column, sql)
+
+    def test_adds_unique_idempotency_index_for_every_managed_table(self):
+        path = REPO_ROOT / "migrations" / "005_paginated_extraction_state.sql"
+        sql = path.read_text(encoding="utf-8")
+        for table in ("eligibility", "medical_claim", "pharmacy_claim"):
+            self.assertIn(f"{table}_snapshot_row_key", sql)
+        self.assertEqual(sql.upper().count("CREATE UNIQUE INDEX"), 3)
+
+    def test_is_forward_only_never_rewrites_prior_migrations(self):
+        for filename in (
+            "001_operational_schemas.sql",
+            "002_ingestion_control.sql",
+            "003_roles_and_grants.sql",
+            "004_endpoint_scoped_ingestion.sql",
+        ):
+            path = REPO_ROOT / "migrations" / filename
+            self.assertTrue(path.is_file(), f"migration {filename} must still exist unmodified")
 
 
 if __name__ == "__main__":

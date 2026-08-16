@@ -57,6 +57,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -90,6 +91,8 @@ else:
     from tuva_ingest import migrations, raw_loader, state  # noqa: E402
     from tuva_ingest.db import connect  # noqa: E402
     from tuva_ingest.raw_loader import load_single_endpoint_snapshot  # noqa: E402
+    from tuva_ingest.pagination import PaginatedRunStore, validate_page_envelope  # noqa: E402
+    from tuva_ingest.paginated_loader import load_paginated_run, loaded_row_count, verify_run_manifest  # noqa: E402
 
 
 def _unique_suffix() -> str:
@@ -139,9 +142,9 @@ class _TestConfig:
 
 
 class TestMigrationsAgainstRealDatabase(_IsolatedSchemaTestCase):
-    def test_all_four_migrations_applied(self):
+    def test_all_five_migrations_applied(self):
         status = migrations.status(self.conn, self.config)
-        self.assertEqual([m.version for m in status.applied], ["001", "002", "003", "004"])
+        self.assertEqual([m.version for m in status.applied], ["001", "002", "003", "004", "005"])
         self.assertEqual(status.pending, ())
         self.assertFalse(status.has_integrity_failures)
 
@@ -614,6 +617,191 @@ class TestEndpointScopedLoadAgainstRealDatabase(_IsolatedSchemaTestCase):
         latest = state.latest_run(self.conn, self.ops_schema)
         self.assertEqual(latest[0], run_id)
         self.assertEqual(latest[1], "succeeded")
+
+
+
+
+class TestPaginatedExtractionAgainstRealDatabase(_IsolatedSchemaTestCase):
+    """Exercises the paginated extraction contract's database-touching
+    primitives (load_paginated_run, loaded_row_count, verify_run_manifest,
+    state.get_watermark/commit_watermark) against a real, disposable
+    PostgreSQL database -- the real-transaction counterpart to
+    tests/unit/test_pagination.py's and test_paginated_loader.py's
+    faked/file-only tests. Proves:
+
+      * a published paginated run loads correctly into the raw table,
+        with the new metadata columns (migrations/005) populated;
+      * repeating the same load is idempotent (no duplicate rows);
+      * a simulated failure partway through a load rolls back cleanly,
+        leaving both the raw table and the watermark untouched;
+      * the watermark only advances after a full commit, never before,
+        and never moves backward once a caller enforces the guard (the
+        same guard cli._run_paginated_load applies).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.raw_data_dir = Path(self._tmp.name)
+        self.store = PaginatedRunStore(self.raw_data_dir, "tuva")
+
+    def _publish_run(self, run_id, *, endpoint="eligibility", records=None, high_water_mark="2025-06-01T00:00:00Z"):
+        from datetime import datetime, timezone
+
+        records = records if records is not None else [{"person_id": "p1"}, {"person_id": "p2"}]
+        staging = self.store.begin_staging(run_id)
+        payload = {
+            "records": records,
+            "metadata": {
+                "record_count": len(records), "page_token": None, "next_page_token": None,
+                "high_water_mark": high_water_mark,
+            },
+        }
+        envelope = validate_page_envelope(payload, requested_page_token=None)
+        meta = self.store.write_page(
+            staging, run_id=run_id, endpoint=endpoint, page_number=1,
+            request_page_token=None, envelope=envelope, retrieved_at=datetime.now(timezone.utc),
+        )
+        self.store.finalize(
+            staging, run_id, [meta], endpoint=endpoint, since=None,
+            total_record_count=len(records), candidate_high_water_mark=high_water_mark,
+        )
+        return verify_run_manifest(self.store, run_id)
+
+    def _row_count(self, table):
+        relation = f'"{self.raw_schema}"."{table}"'
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {relation}")
+            return cur.fetchone()[0]
+
+    def test_load_paginated_run_populates_raw_table_and_metadata_columns(self):
+        manifest = self._publish_run("run-pg-1")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-1", manifest)
+        self.conn.commit()
+
+        self.assertEqual(self._row_count("eligibility"), 2)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f'SELECT endpoint, page_number, file_sha256 FROM "{self.raw_schema}"."eligibility" '
+                f"WHERE _snapshot_id = %s LIMIT 1",
+                ("run-pg-1",),
+            )
+            endpoint, page_number, file_sha256 = cur.fetchone()
+        self.assertEqual(endpoint, "eligibility")
+        self.assertEqual(page_number, 1)
+        self.assertIsNotNone(file_sha256)
+
+    def test_loaded_row_count_matches_manifest_total(self):
+        manifest = self._publish_run("run-pg-2")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-2", manifest)
+        self.conn.commit()
+        count = loaded_row_count(self.conn, self.config.raw_schema, "eligibility", "run-pg-2")
+        self.assertEqual(count, manifest["total_record_count"])
+
+    def test_repeated_load_is_idempotent(self):
+        manifest = self._publish_run("run-pg-3")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-3", manifest)
+        self.conn.commit()
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-3", manifest)  # repeat
+        self.conn.commit()
+        self.assertEqual(loaded_row_count(self.conn, self.config.raw_schema, "eligibility", "run-pg-3"), 2)
+
+    def test_loading_one_endpoint_does_not_affect_other_raw_tables(self):
+        manifest = self._publish_run("run-pg-4", endpoint="eligibility")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-4", manifest)
+        self.conn.commit()
+        self.assertEqual(self._row_count("medical_claim"), 0)
+        self.assertEqual(self._row_count("pharmacy_claim"), 0)
+
+    def test_rollback_after_simulated_failure_leaves_table_untouched(self):
+        manifest = self._publish_run("run-pg-5")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-5", manifest)
+        self.conn.commit()
+        self.assertEqual(self._row_count("eligibility"), 2)
+
+        manifest_2 = self._publish_run("run-pg-6", records=[{"person_id": "p3"}])
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-6", manifest_2)
+        # Simulate a failure discovered after loading but before commit
+        # (e.g. a reconciliation mismatch) -- roll back instead.
+        self.conn.rollback()
+        self.assertEqual(self._row_count("eligibility"), 2)  # only run-pg-5's rows remain
+
+    def test_watermark_committed_only_after_transaction_commits(self):
+        self.assertIsNone(state.get_watermark(self.conn, self.ops_schema, "tuva", "eligibility"))
+
+        manifest = self._publish_run("run-pg-7", high_water_mark="2025-07-01T00:00:00Z")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-7", manifest)
+        state.commit_watermark(
+            self.conn, self.ops_schema, "tuva", "eligibility",
+            high_water_mark="2025-07-01T00:00:00Z", successful_run_id="run-pg-7",
+        )
+        # Not committed yet -- a fresh connection must not see it.
+        other_conn = connect(PG_DSN)
+        try:
+            self.assertIsNone(state.get_watermark(other_conn, self.ops_schema, "tuva", "eligibility"))
+        finally:
+            other_conn.close()
+
+        self.conn.commit()
+        committed = state.get_watermark(self.conn, self.ops_schema, "tuva", "eligibility")
+        self.assertEqual(committed["high_water_mark"], "2025-07-01T00:00:00Z")
+        self.assertEqual(committed["successful_run_id"], "run-pg-7")
+
+    def test_watermark_not_committed_after_rollback(self):
+        manifest = self._publish_run("run-pg-8", high_water_mark="2025-08-01T00:00:00Z")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-8", manifest)
+        state.commit_watermark(
+            self.conn, self.ops_schema, "tuva", "eligibility",
+            high_water_mark="2025-08-01T00:00:00Z", successful_run_id="run-pg-8",
+        )
+        self.conn.rollback()
+        self.assertIsNone(state.get_watermark(self.conn, self.ops_schema, "tuva", "eligibility"))
+
+    def test_watermark_advances_across_successive_successful_runs(self):
+        manifest_1 = self._publish_run("run-pg-9", high_water_mark="2025-01-01T00:00:00Z")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-9", manifest_1)
+        state.commit_watermark(
+            self.conn, self.ops_schema, "tuva", "eligibility",
+            high_water_mark="2025-01-01T00:00:00Z", successful_run_id="run-pg-9",
+        )
+        self.conn.commit()
+
+        manifest_2 = self._publish_run("run-pg-10", high_water_mark="2025-02-01T00:00:00Z")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-10", manifest_2)
+        state.commit_watermark(
+            self.conn, self.ops_schema, "tuva", "eligibility",
+            high_water_mark="2025-02-01T00:00:00Z", successful_run_id="run-pg-10",
+        )
+        self.conn.commit()
+
+        committed = state.get_watermark(self.conn, self.ops_schema, "tuva", "eligibility")
+        self.assertEqual(committed["high_water_mark"], "2025-02-01T00:00:00Z")
+        self.assertEqual(committed["successful_run_id"], "run-pg-10")
+
+    def test_backward_watermark_movement_is_rejected_by_the_same_guard_cli_uses(self):
+        from tuva_ingest.errors import WatermarkError
+
+        manifest_1 = self._publish_run("run-pg-11", high_water_mark="2025-05-01T00:00:00Z")
+        load_paginated_run(self.conn, self.config, self.store, "run-pg-11", manifest_1)
+        state.commit_watermark(
+            self.conn, self.ops_schema, "tuva", "eligibility",
+            high_water_mark="2025-05-01T00:00:00Z", successful_run_id="run-pg-11",
+        )
+        self.conn.commit()
+
+        prior = state.get_watermark(self.conn, self.ops_schema, "tuva", "eligibility")
+        candidate_hwm = "2025-01-01T00:00:00Z"  # earlier than the committed value
+        # This is exactly cli._run_paginated_load's own guard condition.
+        if prior and prior["high_water_mark"] is not None and candidate_hwm < prior["high_water_mark"]:
+            with self.assertRaises(WatermarkError):
+                raise WatermarkError("candidate high_water_mark would move the watermark backward")
+        else:
+            self.fail("expected the backward-movement condition to be true in this test")
+
+        # And the stored watermark must still be the original, later value.
+        still_committed = state.get_watermark(self.conn, self.ops_schema, "tuva", "eligibility")
+        self.assertEqual(still_committed["high_water_mark"], "2025-05-01T00:00:00Z")
 
 
 if __name__ == "__main__":

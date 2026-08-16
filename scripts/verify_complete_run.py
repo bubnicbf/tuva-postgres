@@ -50,6 +50,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from tuva_postgres.identifiers import InvalidIdentifierError, validate_identifier  # noqa: E402
 from tuva_postgres.manifest import MANAGED_TABLES  # noqa: E402
 
 DEFAULT_FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "ci" / "complete_snapshot"
@@ -102,9 +103,11 @@ def _expected_suites() -> list[str]:
     return suites
 
 
-def _validate_identifier(name: str, value: str) -> None:
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", value):
-        raise SystemExit(f"ERROR: {name}={value!r} is not a safe SQL identifier.")
+def _validate_identifier(name: str, value: str) -> str:
+    try:
+        return validate_identifier(value, name)
+    except InvalidIdentifierError as exc:
+        raise SystemExit(f"ERROR: {exc}") from None
 
 
 def run(pg_dsn: str, pg_schema: str, ops_schema: str, run_id: str, fixture_dir: Path) -> list[str]:
@@ -149,7 +152,8 @@ def run(pg_dsn: str, pg_schema: str, ops_schema: str, run_id: str, fixture_dir: 
                 if cur.fetchone() is None:
                     raise VerificationError(f"managed table {pg_schema}.{table} does not exist")
 
-                cur.execute(f'SELECT COUNT(*) FROM "{pg_schema}"."{table}"')  # noqa: S608 -- identifiers validated above, table from a fixed allowlist
+                relation = db.qualified_relation(pg_schema, table, schema_label="PG_SCHEMA", relation_label="table")
+                cur.execute(f"SELECT COUNT(*) FROM {relation}")
                 (actual_count,) = cur.fetchone()
                 expected_count = expected_counts[table]
                 if actual_count != expected_count:
@@ -164,9 +168,10 @@ def run(pg_dsn: str, pg_schema: str, ops_schema: str, run_id: str, fixture_dir: 
         report.append("loader did not take its zero-file no-op path): " + ", ".join(table_report))
 
         # --- 2) test_results has rows for this exact RUN_ID --------------------
+        test_results = db.qualified_relation(pg_schema, "test_results", schema_label="PG_SCHEMA")
         with conn.cursor() as cur:
             cur.execute(
-                f'SELECT suite, pass, COUNT(*) FROM "{pg_schema}".test_results '  # noqa: S608
+                f"SELECT suite, pass, COUNT(*) FROM {test_results} "
                 "WHERE run_id = %s GROUP BY suite, pass ORDER BY suite, pass",
                 (run_id,),
             )
@@ -195,7 +200,7 @@ def run(pg_dsn: str, pg_schema: str, ops_schema: str, run_id: str, fixture_dir: 
         if failed > 0:
             with conn.cursor() as cur:
                 cur.execute(
-                    f'SELECT suite, test FROM "{pg_schema}".test_results '  # noqa: S608
+                    f"SELECT suite, test FROM {test_results} "
                     "WHERE run_id = %s AND pass = false ORDER BY suite, test LIMIT 50",
                     (run_id,),
                 )

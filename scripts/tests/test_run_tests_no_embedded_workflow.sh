@@ -41,7 +41,7 @@ trap cleanup EXIT
 STUB_BIN_DIR="$TMP_DIR/bin"
 SCRATCH_REPO="$TMP_DIR/repo"
 PSQL_LOG="$TMP_DIR/psql_invocations.log"
-mkdir -p "$STUB_BIN_DIR" "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/db/tests"
+mkdir -p "$STUB_BIN_DIR" "$SCRATCH_REPO/scripts/lib" "$SCRATCH_REPO/db/tests"
 : > "$PSQL_LOG"
 
 # --- Minimal scratch fixtures --------------------------------------------
@@ -49,6 +49,7 @@ mkdir -p "$STUB_BIN_DIR" "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/db/tests"
 # repository's full SQL test suite for this check.
 cp "$REAL_RUN_TESTS" "$SCRATCH_REPO/scripts/run_tests.sh"
 cp "$REPO_ROOT/scripts/ingest_test_csv.py" "$SCRATCH_REPO/scripts/ingest_test_csv.py"
+cp "$REPO_ROOT/scripts/lib/postgres_identifiers.sh" "$SCRATCH_REPO/scripts/lib/postgres_identifiers.sh"
 
 cat > "$SCRATCH_REPO/db/tests/zz_results.sql" <<'SQL'
 -- Minimal stand-in for the real zz_results.sql results-table setup.

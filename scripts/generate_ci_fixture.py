@@ -64,7 +64,6 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import re
 import sys
 import tempfile
 from pathlib import Path
@@ -72,6 +71,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from tuva_postgres.identifiers import InvalidIdentifierError, validate_identifier  # noqa: E402
 from tuva_postgres.manifest import MANAGED_TABLES  # noqa: E402
 
 RESERVED_SCHEMA_NAMES = {
@@ -82,7 +82,6 @@ RESERVED_SCHEMA_NAMES = {
     "information_schema",
     "pg_catalog",
 }
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 DEFAULT_FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "ci" / "complete_snapshot"
 
@@ -334,8 +333,10 @@ def _require_schema_name(name: str | None, *, source: str) -> str:
             "name -- pass --pg-schema explicitly (or set PG_SCHEMA) and point it at a "
             "disposable schema in a disposable database."
         )
-    if not _IDENTIFIER_RE.match(name):
-        raise SystemExit(f"ERROR: --pg-schema={name!r} is not a safe SQL identifier.")
+    try:
+        validate_identifier(name, "--pg-schema")
+    except InvalidIdentifierError as exc:
+        raise SystemExit(f"ERROR: {exc}") from None
     if name.lower() in RESERVED_SCHEMA_NAMES:
         raise SystemExit(
             f"ERROR: --pg-schema={name!r} is a reserved/production-like schema name "

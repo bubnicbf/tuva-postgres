@@ -14,6 +14,9 @@ set -euo pipefail
 : "${PG_SCHEMA:?PG_SCHEMA not set}"
 : "${DATA_DIR:?DATA_DIR not set}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/postgres_identifiers.sh"
+
 # --- Managed table list (single source of truth) ----------------------------
 # Dependency-aware order, kept for clarity/defense-in-depth: practitioner
 # and location have no foreign keys; patient has none either; encounter
@@ -42,11 +45,10 @@ declare -a MANAGED_TABLES=(
 )
 
 # --- Identifier safety: validate PG_SCHEMA before it ever reaches SQL ------
-if ! [[ "$PG_SCHEMA" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-  echo "ERROR: PG_SCHEMA='${PG_SCHEMA}' is not a safe PostgreSQL identifier." >&2
-  echo "       Expected: starts with a letter or underscore, then letters/digits/underscores only." >&2
-  exit 1
-fi
+# Uses the shared shell validator (scripts/lib/postgres_identifiers.sh) --
+# the same ASCII policy src/tuva_postgres/identifiers.py enforces on the
+# Python side -- rather than a private copy of the regex.
+validate_postgres_identifier "$PG_SCHEMA" "PG_SCHEMA"
 
 # Single-quote a string for use as a \copy / SQL string literal, doubling
 # any embedded single quotes. \copy's filename argument follows normal SQL

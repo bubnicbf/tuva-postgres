@@ -47,6 +47,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FIXTURE_DIR="$REPO_ROOT/tests/fixtures/ci/complete_snapshot"
 
+source "$REPO_ROOT/scripts/lib/postgres_identifiers.sh"
+
 : "${PG_DSN:?PG_DSN not set. This test requires a real, DISPOSABLE test database -- set PG_DSN and re-run.}"
 
 cd "$REPO_ROOT"
@@ -58,10 +60,7 @@ TERM_SCHEMA="tuva_ci_run_term_${SUFFIX}"
 OPS_SCHEMA="tuva_ci_run_ops_${SUFFIX}"
 
 for name in "$CORE_SCHEMA" "$TERM_SCHEMA" "$OPS_SCHEMA"; do
-  if ! [[ "$name" =~ ^[a-z_][a-z0-9_]{2,62}$ ]]; then
-    echo "FAIL: generated schema name '$name' failed identifier validation; refusing to proceed." >&2
-    exit 1
-  fi
+  validate_postgres_identifier "$name" "generated schema name"
   case "$name" in
     public|tuva|tuva_term|tuva_ops|information_schema|pg_catalog)
       echo "FAIL: generated schema name '$name' collides with a reserved/production schema name." >&2

@@ -192,11 +192,12 @@ trap cleanup EXIT
 STUB_BIN_DIR="$TMP_DIR/bin"
 PSQL_LOG="$TMP_DIR/psql_invocations.log"
 SCRATCH_REPO="$TMP_DIR/repo"
-mkdir -p "$STUB_BIN_DIR" "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/db/tests"
+mkdir -p "$STUB_BIN_DIR" "$SCRATCH_REPO/scripts/lib" "$SCRATCH_REPO/db/tests"
 : > "$PSQL_LOG"
 
 cp "$REPO_ROOT/scripts/run_tests.sh" "$SCRATCH_REPO/scripts/run_tests.sh"
 cp "$REPO_ROOT/scripts/ingest_test_csv.py" "$SCRATCH_REPO/scripts/ingest_test_csv.py"
+cp "$REPO_ROOT/scripts/lib/postgres_identifiers.sh" "$SCRATCH_REPO/scripts/lib/postgres_identifiers.sh"
 cp "$REPO_ROOT"/db/tests/*.sql "$SCRATCH_REPO/db/tests/"
 
 cat > "$STUB_BIN_DIR/psql" <<'STUB'

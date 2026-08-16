@@ -13,13 +13,11 @@ be logged.
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import ConfigError
-
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+from .identifiers import InvalidIdentifierError, validate_identifier
 
 # The full set of fields a given CLI command needs populated. Commands that
 # don't touch the API (e.g. `migrate`, `healthcheck`) shouldn't fail
@@ -32,11 +30,15 @@ ALL_REQUIREMENTS = REQUIRE_API | REQUIRE_DB | REQUIRE_RAW_DATA
 
 
 def _validate_identifier(name: str, value: str, errors: list[str]) -> None:
-    if not _IDENTIFIER_RE.match(value):
-        errors.append(
-            f"{name}={value!r} is not a safe SQL identifier "
-            "(expected: starts with a letter/underscore, then letters/digits/underscores only)"
-        )
+    """Validate `value` against the shared identifier policy (see
+    identifiers.py), appending a message to `errors` instead of raising --
+    `PipelineConfig.load()` collects every configuration problem at once
+    rather than stopping at the first one, so a single bad env var doesn't
+    hide every other mistake in a broken `.env`."""
+    try:
+        validate_identifier(value, name)
+    except InvalidIdentifierError as exc:
+        errors.append(str(exc))
 
 
 def _env_float(name: str, default: float, errors: list[str]) -> float:

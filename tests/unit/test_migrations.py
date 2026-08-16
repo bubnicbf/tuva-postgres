@@ -17,14 +17,19 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from tuva_postgres.db import substitute_psql_vars  # noqa: E402
 from tuva_postgres.errors import MigrationError  # noqa: E402
+from tuva_postgres.identifiers import InvalidIdentifierError  # noqa: E402
 from tuva_postgres.migrations import (  # noqa: E402
     AppliedMigration,
     ExecutionMode,
+    MigrationDef,
     compute_checksum,
     discover,
+    ensure_history_table,
+    status,
     _history_has_execution_columns,
     _plan_status,
     _read_applied,
+    _resolve_vars,
 )
 
 # Pinned pre-refactor checksums for the real, committed migrations 0001 and
@@ -46,9 +51,31 @@ class TestSubstitutePsqlVars(unittest.TestCase):
         out = substitute_psql_vars("WHERE n.nspname = :'schema'", {"schema": "tuva"})
         self.assertEqual(out, "WHERE n.nspname = 'tuva'")
 
-    def test_embedded_quotes_are_escaped(self):
-        out = substitute_psql_vars(':"schema"', {"schema": 'weird"name'})
-        self.assertEqual(out, '"weird""name"')
+    def test_string_literal_form_embedded_quotes_are_escaped(self):
+        # String-literal-form values are ordinary data, not identifiers --
+        # they're never forced through identifier validation, only quote-
+        # escaped, exactly like any other SQL string literal.
+        out = substitute_psql_vars(":'msg'", {"msg": "it's a \"test\""})
+        self.assertEqual(out, "'it''s a \"test\"'")
+
+    def test_identifier_form_rejects_hostile_value_before_rendering(self):
+        # A value that would need escaping to survive inside a double-
+        # quoted identifier is not a valid identifier at all under this
+        # repository's policy -- it must be rejected before any SQL is
+        # rendered, never silently escaped and passed through.
+        with self.assertRaises(InvalidIdentifierError):
+            substitute_psql_vars(':"schema"', {"schema": 'weird"name'})
+
+    def test_identifier_form_rejects_injection_shaped_value(self):
+        with self.assertRaises(InvalidIdentifierError):
+            substitute_psql_vars(':"schema"', {"schema": "tuva\"; DROP TABLE patient; --"})
+
+    def test_identifier_form_validates_only_variables_actually_used_as_identifiers(self):
+        # `other` is only ever used in string-literal form in this SQL
+        # text, so it must never be forced through identifier validation
+        # even though its value would fail that policy.
+        out = substitute_psql_vars(":'other'", {"other": "has spaces and 'quotes'"})
+        self.assertEqual(out, "'has spaces and ''quotes'''")
 
     def test_does_not_touch_type_casts(self):
         # `::date` etc. must never be mistaken for a psql variable.
@@ -667,6 +694,171 @@ class TestHistoryTableCompatibility(unittest.TestCase):
     def test_read_applied_empty_history_returns_empty_mapping(self):
         conn = _FakeHistoryConn(has_execution_columns=True, rows=[])
         self.assertEqual(_read_applied(conn, "tuva_ops"), {})
+
+
+_HOSTILE_OPS_SCHEMAS = [
+    "",
+    "tuva_ops; DROP TABLE schema_migrations",
+    "tuva_ops--comment",
+    "tuva ops",
+    "tuva.ops",
+    'tuva"ops',
+    "tuva'ops",
+    "tuva\nops",
+    "1tuva",
+]
+
+
+class _NoTouchCursor:
+    """Raises if execute()/fetchone()/fetchall() are ever called -- used
+    to prove a hostile ops_schema is rejected before any SQL reaches the
+    database at all."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        raise AssertionError(f"cursor.execute() must not be called for an invalid ops_schema; got: {sql!r}")
+
+    def fetchone(self):
+        raise AssertionError("fetchone() must not be called for an invalid ops_schema")
+
+    def fetchall(self):
+        raise AssertionError("fetchall() must not be called for an invalid ops_schema")
+
+
+class _NoTouchConn:
+    def __init__(self):
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self):
+        return _NoTouchCursor()
+
+    def commit(self):
+        self.commits += 1
+        raise AssertionError("conn.commit() must not be called for an invalid ops_schema")
+
+    def rollback(self):
+        self.rollbacks += 1
+        raise AssertionError("conn.rollback() must not be called for an invalid ops_schema")
+
+
+class TestHostileOpsSchemaRejectedBeforeAnyDatabaseAccess(unittest.TestCase):
+    """Every database-touching entry point keyed on ops_schema --
+    ensure_history_table(), _read_applied(), and status() -- must validate
+    it through the shared identifier policy and raise before the first
+    cursor.execute()/commit(), never after. Uses _NoTouchConn, which
+    raises AssertionError the instant execute()/commit()/rollback() is
+    reached, so these tests fail loudly if validation is ever moved past
+    the first DB call."""
+
+    def test_ensure_history_table_rejects_hostile_schema_before_execute(self):
+        for hostile in _HOSTILE_OPS_SCHEMAS:
+            with self.subTest(ops_schema=hostile):
+                conn = _NoTouchConn()
+                with self.assertRaises(MigrationError):
+                    ensure_history_table(conn, hostile)
+                self.assertEqual(conn.commits, 0)
+
+    def test_read_applied_rejects_hostile_schema_before_execute(self):
+        for hostile in _HOSTILE_OPS_SCHEMAS:
+            with self.subTest(ops_schema=hostile):
+                conn = _NoTouchConn()
+                with self.assertRaises(MigrationError):
+                    _read_applied(conn, hostile)
+
+    def test_status_rejects_hostile_ops_schema_without_mutating(self):
+        class _FakeConfig:
+            def __init__(self, ops_schema):
+                self.ops_schema = ops_schema
+
+        for hostile in _HOSTILE_OPS_SCHEMAS:
+            with self.subTest(ops_schema=hostile):
+                conn = _NoTouchConn()
+                with self.assertRaises(MigrationError):
+                    status(conn, _FakeConfig(hostile))
+                self.assertEqual(conn.commits, 0)
+                self.assertEqual(conn.rollbacks, 0)
+
+    def test_status_valid_schema_reaches_history_check(self):
+        # Regression guard: a *valid* ops_schema must still be allowed
+        # through to the (fake, no-history-table) database layer rather
+        # than being rejected by the new validation step.
+        class _FakeConfig:
+            ops_schema = "tuva_ops"
+
+        class _EmptyHistoryCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params=None):
+                self._result = []
+
+            def fetchone(self):
+                return None
+
+            def fetchall(self):
+                return []
+
+        class _EmptyHistoryConn:
+            def cursor(self):
+                return _EmptyHistoryCursor()
+
+        real_migrations_dir = REPO_ROOT / "db" / "migrations"
+        result = status(_EmptyHistoryConn(), _FakeConfig(), migrations_dir=real_migrations_dir, repo_root=REPO_ROOT)
+        # No history table -> everything discovered is pending; the point
+        # here is just that this did NOT raise for a valid schema.
+        self.assertGreaterEqual(len(result.pending), 1)
+
+
+class TestResolveVarsUsesSharedPolicy(unittest.TestCase):
+    """_resolve_vars() (which feeds substitute_psql_vars() for rendering
+    a migration's SQL) must validate every manifest-declared identifier
+    variable through the same shared policy as everywhere else -- not a
+    private duplicate regex."""
+
+    class _FakeConfig:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k.lower(), v)
+
+    def _migration_with_var(self, placeholder: str, config_attr: str) -> MigrationDef:
+        return MigrationDef(
+            version="0001",
+            description="test",
+            execution=ExecutionMode.ONE_TIME,
+            files=(),
+            var_map={placeholder: config_attr},
+            manifest_path=Path("0001_test.json"),
+        )
+
+    def test_valid_identifier_var_resolves(self):
+        migration = self._migration_with_var("schema", "PG_SCHEMA")
+        config = self._FakeConfig(PG_SCHEMA="tuva")
+        resolved = _resolve_vars(migration, config)
+        self.assertEqual(resolved, {"schema": "tuva"})
+
+    def test_hostile_identifier_var_rejected(self):
+        migration = self._migration_with_var("schema", "PG_SCHEMA")
+        config = self._FakeConfig(PG_SCHEMA="tuva; DROP TABLE patient")
+        with self.assertRaises(MigrationError):
+            _resolve_vars(migration, config)
+
+    def test_error_names_migration_version_and_placeholder(self):
+        migration = self._migration_with_var("schema", "PG_SCHEMA")
+        config = self._FakeConfig(PG_SCHEMA="bad schema")
+        with self.assertRaises(MigrationError) as ctx:
+            _resolve_vars(migration, config)
+        message = str(ctx.exception)
+        self.assertIn("0001", message)
+        self.assertIn("schema", message)
 
 
 if __name__ == "__main__":

@@ -232,6 +232,41 @@ migration and SQL-test-runner *structure and behavior* (via stubbed
 `make migration-status` reports applied, pending, and checksum-mismatch
 states without applying anything.
 
+### SQL identifier safety
+
+`PG_SCHEMA`/`TERMINOLOGY_SCHEMA`/`OPS_SCHEMA` are dynamic PostgreSQL
+*identifiers* (schema names), not data -- they can never be bound as an
+ordinary `%s` query parameter the way a value can, because PostgreSQL
+identifier syntax and string-literal syntax are different things. This
+repository enforces one strict, ASCII-only policy for every dynamic
+identifier, everywhere: `src/tuva_postgres/identifiers.py` (Python) and
+`scripts/lib/postgres_identifiers.sh` (shell) both implement the same
+rule -- first character an ASCII letter or underscore, remaining
+characters ASCII letters/digits/underscores, full match only (no dots,
+quotes, whitespace, semicolons, comments, or non-ASCII characters).
+Valid: `tuva`, `tuva_ops`, `_temporary`, `TestSchema_1`. Rejected:
+empty string, `1schema`, `schema-name`, `schema.name`, `schema name`,
+`schema; DROP TABLE patient`, anything containing a quote, newline, tab,
+or null byte.
+
+Every identifier is validated **and** safely quoted before it is ever
+combined with SQL text, using `tuva_postgres.db.qualified_relation()`/
+`quote_ident()` (or `scripts/lib/postgres_identifiers.sh`'s
+`validate_postgres_identifier`/`quote_validated_postgres_identifier` in
+shell scripts) -- never accepted as an already-quoted string, and never
+accepted as a single `"schema.table"` value (schema and relation are
+always supplied and validated as two separate arguments). Ordinary data
+values (run IDs, URLs, timestamps, error messages, checksums, table names
+used *as data*, ...) are never touched by this policy -- they continue to
+travel as normal bound `%s` query parameters. Validation happens at two
+independent layers (config load time in `PipelineConfig.load()`, and
+again at the point SQL is actually composed in `db.py`/`ops.py`/
+`migrations.py`), and an invalid identifier is always rejected before any
+`cursor.execute()`/`psql` invocation, never after. `scripts/tests/
+test_no_raw_schema_interpolation.py` (part of `make test-shell`) is a
+static AST-based regression guard against this pattern being
+reintroduced.
+
 ## CI fixture and the complete-run smoke test
 
 `tests/fixtures/ci/complete_snapshot/` is a small, deterministic,

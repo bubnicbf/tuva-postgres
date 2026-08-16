@@ -33,15 +33,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOADER="$REPO_ROOT/scripts/load_to_postgres.sh"
 
+source "$REPO_ROOT/scripts/lib/postgres_identifiers.sh"
+
 : "${PG_DSN:?PG_DSN not set. This integration test requires a real, DISPOSABLE test database -- set PG_DSN and re-run.}"
 
 # --- 1)-4) Generate and validate a unique, disposable schema name ---------
 SCHEMA_NAME="tuva_load_test_$(date -u +%Y%m%dt%H%M%Sz)_$$_${RANDOM}"
 
-if ! [[ "$SCHEMA_NAME" =~ ^[a-z_][a-z0-9_]{2,62}$ ]]; then
-  echo "FAIL: generated schema name '$SCHEMA_NAME' failed identifier validation; refusing to proceed." >&2
-  exit 1
-fi
+validate_postgres_identifier "$SCHEMA_NAME" "generated schema name"
 case "$SCHEMA_NAME" in
   public|tuva|tuva_term|information_schema|pg_catalog)
     echo "FAIL: generated schema name '$SCHEMA_NAME' collides with a reserved/production schema name." >&2

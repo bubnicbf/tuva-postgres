@@ -36,6 +36,28 @@ exception message. Everything else (schemas, timeouts, log level, the
 manifest URL itself) is non-secret and lives in a ConfigMap
 (`deploy/kubernetes/configmap.yaml`).
 
+### Dynamic SQL identifier safety
+
+`PG_SCHEMA`/`TERMINOLOGY_SCHEMA`/`OPS_SCHEMA` name PostgreSQL schemas --
+they are SQL *identifiers*, never data, so they can't be bound as a query
+parameter the way a value can. Every dynamic identifier in this
+repository (Python and shell alike) is checked against one strict policy
+before it ever reaches SQL: ASCII letters/digits/underscores only, first
+character a letter or underscore, full match required. `tuva`,
+`tuva_ops`, `_temporary` are accepted; anything with a dot, quote,
+whitespace, semicolon, comment, or non-ASCII character is rejected
+outright (empty values too). An operator who sets `PG_SCHEMA=bad name` or
+similar sees a clear validation error at config-load time -- before
+`make migrate`/`make load`/`make test` ever opens a database connection.
+
+Schema and table/relation names are always validated and composed
+*separately* (`tuva_postgres.db.qualified_relation(schema, table)`) --
+never accepted as one pre-quoted or dotted `"schema.table"` string.
+Ordinary data (run IDs, URLs, timestamps, checksums, error messages, ...)
+is unaffected by any of this and continues to travel as normal bound
+query parameters. See the "SQL identifier safety" section of README.md
+for the full policy and the exact accepted/rejected examples.
+
 ## Initial migration (first deploy to a database)
 
 ```bash

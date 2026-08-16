@@ -48,6 +48,7 @@ fail_case() {
 
 # --- Build a minimal, valid fake repo the copied harness can run against
 mkdir -p "$FAKE_REPO/scripts/tests"
+mkdir -p "$FAKE_REPO/scripts/lib"
 mkdir -p "$FAKE_REPO/bin"
 mkdir -p "$FAKE_REPO/db/migrations/sql/0001_fake/core"
 mkdir -p "$FAKE_REPO/db/migrations/sql/0002_fake/core"
@@ -86,6 +87,7 @@ echo "-- fake operational migration, never executed against a real database" \
 # Copy the real, UNMODIFIED harness script -- this test exercises the
 # actual production control flow, not a paraphrase of it.
 cp "$REAL_HARNESS" "$FAKE_REPO/scripts/tests/test_schema_constraint_idempotency.sh"
+cp "$REPO_ROOT/scripts/lib/postgres_identifiers.sh" "$FAKE_REPO/scripts/lib/postgres_identifiers.sh"
 
 # apply_schema.sh is invoked by the harness via an explicit
 # "$REPO_ROOT/scripts/apply_schema.sh" path, so a stub placed at that

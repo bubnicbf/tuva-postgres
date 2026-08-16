@@ -75,10 +75,12 @@ test-shell:
 	bash scripts/tests/test_migration_execution_modes.sh
 	bash scripts/tests/test_schema_idempotency_harness_controls.sh
 	bash scripts/tests/test_sql_test_layout.sh
+	bash scripts/tests/test_schema_identifier_validation.sh
 	python3 scripts/tests/test_constraint_idempotency_guards.py
 	python3 scripts/tests/test_pre_commit_config.py
 	python3 scripts/tests/test_python_dependencies.py
 	python3 scripts/tests/test_ci_fixture.py
+	python3 scripts/tests/test_no_raw_schema_interpolation.py
 
 # Proves the real migration runner (scripts/apply_schema.sh) is idempotent:
 # applies every discovered migration once into uniquely-named temporary

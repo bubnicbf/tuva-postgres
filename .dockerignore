@@ -2,16 +2,19 @@
 .git/
 .github/
 
-# Secrets -- never baked into an image
+# Secrets -- never baked into an image (profiles.yml is generated in the
+# image from profiles.example.yml, see Dockerfile -- a local override
+# should never be copied in)
 .env
 *.env
+profiles.yml
 
-# Local data, temp, and generated artifacts
+# Local data, temp, and generated dbt artifacts
 data/
 tmp/
 logs/
-*.part
-report.pdf
+target/
+dbt_packages/
 
 # Python
 __pycache__/
@@ -19,13 +22,10 @@ __pycache__/
 .venv/
 *.egg-info/
 
-# Tests and docs are not needed at runtime (they still ship in the git
+# Tests are not needed at runtime (they still ship in the git
 # repo/CI checkout, just not in the image)
 tests/
 docs/
 
 # Editor/OS cruft
 .DS_Store
-
-# Kubernetes manifests are applied by the cluster, not baked into the image
-deploy/

@@ -37,13 +37,13 @@ repos:
         types: [python]
 
       - id: mypy
-        name: mypy (uv-managed; checks src/tuva_postgres, not passed filenames)
+        name: mypy (uv-managed; checks src/tuva_ingest, not passed filenames)
         # Deliberately ignores whatever filenames pre-commit would pass
         # (pass_filenames: false + always_run: true) -- mypy needs the
         # whole configured production source set (see [tool.mypy]'s
         # `files` in pyproject.toml) for its cross-module analysis to be
         # meaningful, not an arbitrary subset of changed files.
-        entry: uv run mypy src/tuva_postgres
+        entry: uv run mypy src/tuva_ingest
         language: system
         pass_filenames: false
         always_run: true

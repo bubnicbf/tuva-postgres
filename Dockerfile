@@ -1,19 +1,23 @@
 # syntax=docker/dockerfile:1
 #
-# Production image for the tuva-postgres ingestion pipeline
-# (src/tuva_postgres). Two stages:
-#   1. `builder` resolves the locked runtime dependency set (uv.lock) into
-#      a self-contained virtualenv -- nothing from this stage except that
+# Application image for the tuva-ingest connector (src/tuva_ingest) plus
+# the dbt project that maps raw tables into the Tuva Input Layer
+# (dbt_project.yml, models/, packages.yml -- pinned to
+# tuva-health/the_tuva_project 0.18.0). Two stages:
+#   1. `builder` resolves the locked dependency set (uv.lock) -- which
+#      already includes dbt-core/dbt-postgres, see pyproject.toml -- into
+#      a self-contained virtualenv. Nothing from this stage except that
 #      venv makes it into the final image.
-#   2. runtime installs only the `psql` client (needed by
-#      scripts/load_to_postgres.sh and scripts/run_tests.sh, which the
-#      orchestrator still shells out to -- see src/tuva_postgres/
-#      orchestrator.py), copies the locked venv and the application code,
-#      and runs as a non-root user.
+#   2. `runtime` copies the locked venv, the connector source, and the
+#      dbt project, and runs as a non-root user. `dbt deps` is NOT run
+#      at build time (it needs network access to fetch the pinned Tuva
+#      package and is a deliberate, explicit step -- see compose.yml's
+#      `dbt-deps` service / README.md) so a rebuilt image always uses
+#      whatever package version compose/CI resolves against packages.yml.
 #
-# Build:   docker build -t tuva-postgres:local .
-# Run:     docker run --rm --env-file .env tuva-postgres:local run
-# Health:  docker run --rm --env-file .env tuva-postgres:local healthcheck
+# Build:   docker build -t tuva-ingest:local .
+# Extract: docker run --rm --env-file .env tuva-ingest:local extract
+# Health:  docker run --rm --env-file .env tuva-ingest:local healthcheck
 
 ARG PYTHON_VERSION=3.12.7
 
@@ -43,15 +47,17 @@ RUN uv sync --locked --no-dev
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
-LABEL org.opencontainers.image.title="tuva-postgres" \
-      org.opencontainers.image.description="Tuva healthcare data ingestion pipeline: fetch, migrate, load, test" \
+LABEL org.opencontainers.image.title="tuva-ingest" \
+      org.opencontainers.image.description="Raw-to-Input-Layer ingestion connector for the Tuva Project dbt package (0.18.0)" \
       org.opencontainers.image.source="https://example.invalid/tuva-postgres" \
       org.opencontainers.image.licenses="MIT"
 
-# psql client only (no full postgresql-server); required by
-# scripts/load_to_postgres.sh and scripts/run_tests.sh.
+# git is required by `dbt deps` to resolve the pinned Tuva package
+# (packages.yml); postgresql-client (psql) is kept for operator
+# debugging only -- the connector itself talks to PostgreSQL exclusively
+# through psycopg (src/tuva_ingest/db.py), never by shelling out to psql.
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y postgresql-client \
+    && apt-get install --no-install-recommends -y git postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 tuva \
@@ -61,31 +67,38 @@ WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --chown=tuva:tuva src ./src
-COPY --chown=tuva:tuva db ./db
-COPY --chown=tuva:tuva scripts ./scripts
+COPY --chown=tuva:tuva migrations ./migrations
+COPY --chown=tuva:tuva models ./models
+COPY --chown=tuva:tuva macros ./macros
+COPY --chown=tuva:tuva dbt_project.yml packages.yml profiles.example.yml ./
+# profiles.example.yml is entirely env-var-driven with safe local
+# placeholder defaults (no real credentials -- see the file's own
+# header comment), so it doubles as the shipped profiles.yml: a
+# container operator overriding PGHOST/PGUSER/PGPASSWORD/etc. (or
+# DBT_PROFILES_DIR to mount a custom profiles.yml) gets a real profile
+# without this image ever baking in a secret.
+RUN cp profiles.example.yml profiles.yml
 COPY --chown=tuva:tuva pyproject.toml uv.lock ./
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     RAW_DATA_DIR=/app/data/raw \
-    METRICS_FILE=/app/data/metrics/tuva_postgres.prom
+    DBT_PROJECT_DIR=/app \
+    DBT_PROFILES_DIR=/app
 
-# The only two locations the app is expected to write to at runtime
-# (raw snapshots, the Prometheus textfile) -- everything else under /app
+# The only locations the app is expected to write to at runtime (raw
+# snapshots, dbt's own logs/target dirs) -- everything else under /app
 # can be mounted read-only in production.
-RUN mkdir -p /app/data/raw /app/data/metrics /app/tmp \
-    && chown -R tuva:tuva /app/data /app/tmp
+RUN mkdir -p /app/data/raw /app/tmp /app/logs /app/target /app/dbt_packages \
+    && chown -R tuva:tuva /app/data /app/tmp /app/logs /app/target /app/dbt_packages
 
 USER tuva
 
 HEALTHCHECK --interval=5m --timeout=30s --start-period=30s --retries=3 \
-    CMD ["tuva-postgres", "healthcheck"]
+    CMD ["tuva-ingest", "healthcheck"]
 
-# Exec form: PID 1 is `tuva-postgres` itself, so SIGTERM from `docker stop`
-# / a Kubernetes CronJob's terminationGracePeriod is delivered directly to
-# the process the orchestrator's signal guard handles (see
-# src/tuva_postgres/orchestrator.py's _SignalGuard) -- no shell in between
-# to swallow it.
-ENTRYPOINT ["tuva-postgres"]
+# Exec form: PID 1 is `tuva-ingest` itself, so SIGTERM from `docker stop`
+# is delivered directly to the CLI process, not swallowed by a shell.
+ENTRYPOINT ["tuva-ingest"]
 CMD ["run"]

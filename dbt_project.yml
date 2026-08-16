@@ -1,0 +1,80 @@
+# dbt project for the tuva_ingest connector: maps raw claims data (loaded
+# by src/tuva_ingest/raw_loader.py into the configured raw schema) into
+# the Tuva Input Layer, which the pinned tuva-health/the_tuva_project
+# package (see packages.yml, release 0.18.0) then builds into Tuva's
+# core data model, terminology sets, and data marts.
+#
+# Lineage: raw.{eligibility,medical_claim,pharmacy_claim} (source, see
+# models/sources.yml) -> models/staging/*.sql (type/name normalization)
+# -> models/final/{eligibility,medical_claim,pharmacy_claim}.sql (the
+# Input Layer contract Tuva's package ref()s by name) -> the Tuva
+# package's own models (dbt_packages/the_tuva_project/, never
+# duplicated or vendored into this repository).
+name: "tuva_ingest_connector"
+version: "1.0.0"
+config-version: 2
+
+profile: "tuva_ingest"
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests/dbt"]
+macro-paths: ["macros"]
+analysis-paths: ["analyses"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Required by Tuva 0.18.0 (see README.md's "Getting Started with Real
+# Data" walkthrough at https://thetuvaproject.com/getting-started):
+# aligns dbt's ref() resolution with dbt 1.11 behavior so the Tuva
+# package can ref() this project's Input Layer models (models/final/)
+# without a "could not find model, but there is an unmatched model with
+# the same name" warning.
+flags:
+  require_ref_searches_node_package_before_root: true
+
+vars:
+  # Read by models/sources.yml and models/staging/*.sql -- the schema
+  # src/tuva_ingest/raw_loader.py loads eligibility/medical_claim/
+  # pharmacy_claim into. Always pass --vars (or rely on the CLI's `tuva-
+  # ingest dbt`/`tuva-ingest run`, which does this for you) rather than
+  # hard-coding a deployment-specific schema name here.
+  raw_schema: raw
+  # Read by the custom generate_schema_name macro (see
+  # macros/generate_schema_name.sql) for models/final/* -- the schema the
+  # Tuva Input Layer models are materialized into, and therefore the
+  # schema the Tuva package's own sources.yml-equivalent ref() calls
+  # resolve against.
+  input_layer_schema: input_layer
+
+  # Tuva 0.18.0 sub-part enablement (see README.md "dbt Variables" /
+  # https://thetuvaproject.com/getting-started). This connector is
+  # claims-first: eligibility, medical_claim, and pharmacy_claim are the
+  # three Input Layer tables it maps (see models/final/). Clinical and
+  # provider-attribution Input Layer tables are not mapped by this
+  # project, so those sub-parts stay disabled until they are.
+  claims_enabled: true
+  clinical_enabled: false
+  provider_attribution_enabled: false
+
+models:
+  tuva_ingest_connector:
+    staging:
+      +schema: staging
+      +materialized: view
+      +docs:
+        node_color: "#8BC34A"
+    final:
+      +schema: "{{ var('input_layer_schema') }}"
+      +materialized: table
+      +docs:
+        node_color: "#2196F3"
+  # The pinned Tuva package's own models are enabled/disabled entirely
+  # through its own `claims_enabled`/`clinical_enabled`/
+  # `provider_attribution_enabled` vars above -- this project never
+  # overrides materializations or schemas for the_tuva_project's models,
+  # and never duplicates any of its model files locally (see README.md
+  # "This repository does not own Tuva's DDL").

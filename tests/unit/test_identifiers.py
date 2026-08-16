@@ -1,4 +1,4 @@
-"""Unit tests for tuva_postgres.identifiers -- the single, authoritative
+"""Unit tests for tuva_ingest.identifiers -- the single, authoritative
 validation policy for dynamic PostgreSQL identifiers (schema and relation
 names) used anywhere in this repository.
 
@@ -18,7 +18,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from tuva_postgres.identifiers import (  # noqa: E402
+from tuva_ingest.identifiers import (  # noqa: E402
     IDENTIFIER_PATTERN,
     InvalidIdentifierError,
     validate_identifier,

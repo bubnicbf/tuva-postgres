@@ -1,0 +1,11 @@
+member_key,payer,plan,coverage_type,span_start_dt,span_end_dt
+mk-001,Acme Health Plan,Gold PPO,medical,2025-01-01,2025-03-31
+mk-001,Acme Health Plan,Gold PPO,medical,2025-02-15,2025-05-31
+mk-002,Acme Health Plan,Silver HMO,medical,2025-01-01,2025-03-31
+mk-002,Acme Health Plan,Silver HMO,medical,2025-04-01,2025-06-30
+mk-003,Beta Medicare Advantage,MA Plan B,medical,2025-01-01,2025-01-31
+mk-003,Beta Medicare Advantage,MA Plan B,medical,2025-04-01,2025-04-30
+mk-004,Acme Health Plan,Gold PPO,medical,2025-01-01,2025-06-30
+mk-004,Acme Health Plan,Gold PPO,medical,2025-01-01,2025-06-30
+mk-005,Acme Health Plan,Gold PPO,medical,2025-05-01,2025-04-01
+mk-006,Acme Health Plan,Gold PPO,medical,2025-06-01,

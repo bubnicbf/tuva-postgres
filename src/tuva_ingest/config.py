@@ -68,6 +68,13 @@ ALL_REQUIREMENTS = REQUIRE_API | REQUIRE_DB | REQUIRE_RAW_DATA
 # PG_DSN (watermark lookups plus the load/reconcile/commit transaction).
 REQUIRE_PAGINATED = frozenset({"api_manifest_url", "raw_data_dir", "pg_dsn"})
 
+# The object-storage-backed extract/load/sync workflow (see
+# object_extract.py/object_raw_loader.py, cli.py's `--storage
+# object-storage`) never requires RAW_DATA_DIR (it publishes to object
+# storage, not a local directory) -- see REQUIRE_PAGINATED above for the
+# filesystem-backed equivalent this parallels.
+REQUIRE_OBJECT_STORAGE = frozenset({"api_manifest_url", "pg_dsn"})
+
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 # Single source of truth mapping each pydantic field name to the exact
@@ -109,6 +116,15 @@ _ENV_ALIASES: dict[str, str] = {
     "api_page_size": "TUVA_API_PAGE_SIZE",
     "api_max_pages": "TUVA_API_MAX_PAGES",
     "api_max_page_bytes": "TUVA_API_MAX_PAGE_BYTES",
+    "staging_schema": "STAGING_SCHEMA",
+    "analytics_core_schema": "ANALYTICS_CORE_SCHEMA",
+    "analytics_marts_schema": "ANALYTICS_MARTS_SCHEMA",
+    "object_storage_provider": "OBJECT_STORAGE_PROVIDER",
+    "object_storage_bucket": "OBJECT_STORAGE_BUCKET",
+    "object_storage_prefix": "OBJECT_STORAGE_PREFIX",
+    "object_storage_region": "OBJECT_STORAGE_REGION",
+    "object_storage_endpoint_url": "OBJECT_STORAGE_ENDPOINT_URL",
+    "object_storage_local_root": "OBJECT_STORAGE_LOCAL_ROOT",
 }
 
 
@@ -197,15 +213,40 @@ class IngestConfig(BaseSettings):
     raw_data_dir: Path = Field(default=Path("data/raw"), validation_alias=_ENV_ALIASES["raw_data_dir"])
 
     pg_dsn: SecretStr | None = Field(default=None, validation_alias=_ENV_ALIASES["pg_dsn"])
-    raw_schema: str = Field(default="raw", validation_alias=_ENV_ALIASES["raw_schema"])
-    ops_schema: str = Field(default="ingest_ops", validation_alias=_ENV_ALIASES["ops_schema"])
+    # Six-schema lineage (see docs/SOURCE_CONTRACT.md "Schema lineage" and
+    # README.md "Architecture"): ops (pipeline state/audit) -> raw_incoming
+    # (this connector's own landing tables) -> staging_incoming (dbt
+    # staging models) -> input_layer (this project's Input Layer contract)
+    # -> analytics_core / analytics_marts (the pinned Tuva package's own
+    # core/mart outputs -- see macros/generate_schema_name.sql). Defaults
+    # changed from the pre-object-storage values (`raw`/`ingest_ops`) to
+    # these names as part of this same change -- an EXISTING deployment
+    # that never explicitly set RAW_SCHEMA/OPS_SCHEMA must set them
+    # explicitly to its current value (`raw`/`ingest_ops`) to keep reading
+    # its existing data; see docs/RUNBOOK.md "Upgrade notes" and
+    # migrations/006_object_storage_raw_contract.sql's own comment on this.
+    # An override of either variable continues to work exactly as before
+    # (backward-compatible) -- only the *default* changed.
+    raw_schema: str = Field(default="raw_incoming", validation_alias=_ENV_ALIASES["raw_schema"])
+    ops_schema: str = Field(default="ops", validation_alias=_ENV_ALIASES["ops_schema"])
 
     # dbt-facing configuration. This package never connects to these
     # schemas/targets directly -- it only ever passes them through to
     # `dbt` as `--target`/`--vars` (see cli.py's dbt subcommand) so a
     # single .env is the one source of truth for both the Python
     # connector and the dbt project.
+    staging_schema: str = Field(default="staging_incoming", validation_alias=_ENV_ALIASES["staging_schema"])
     input_layer_schema: str = Field(default="input_layer", validation_alias=_ENV_ALIASES["input_layer_schema"])
+    # Routes the pinned Tuva package's own core/mart model output (never
+    # this connector's own models -- see macros/generate_schema_name.sql)
+    # into these two schemas instead of whatever the_tuva_project's own
+    # dbt_project.yml would otherwise name them.
+    analytics_core_schema: str = Field(
+        default="analytics_core", validation_alias=_ENV_ALIASES["analytics_core_schema"]
+    )
+    analytics_marts_schema: str = Field(
+        default="analytics_marts", validation_alias=_ENV_ALIASES["analytics_marts_schema"]
+    )
     dbt_target: str = Field(default="dev", validation_alias=_ENV_ALIASES["dbt_target"])
     dbt_profiles_dir: Path = Field(default=Path("."), validation_alias=_ENV_ALIASES["dbt_profiles_dir"])
     dbt_project_dir: Path = Field(default=Path("."), validation_alias=_ENV_ALIASES["dbt_project_dir"])
@@ -255,6 +296,47 @@ class IngestConfig(BaseSettings):
         default=64 * 1024 * 1024, gt=0, validation_alias=_ENV_ALIASES["api_max_page_bytes"]
     )
 
+    # --- object storage (see object_storage/, object_extract.py, object_raw_loader.py) ---
+    # The durable, immutable, replayable source of truth for extracted
+    # source pages (see docs/SOURCE_CONTRACT.md "Object storage").
+    # "local" (default) uses object_storage.local.LocalFilesystemBackend
+    # -- real file I/O, but not a production object store -- so the
+    # object-storage code path is exercisable in local development and
+    # CI without any cloud credentials or a running MinIO container.
+    # "s3" uses object_storage.s3.S3Backend against real AWS S3 or any
+    # S3-compatible endpoint (set OBJECT_STORAGE_ENDPOINT_URL for MinIO).
+    # Deliberately never a static access-key/secret-key setting here --
+    # see object_storage/s3.py's module docstring: authentication is
+    # always boto3's ambient credential chain (an IAM role, an assumed
+    # role, AWS_PROFILE, or a local developer profile).
+    object_storage_provider: str = Field(default="local", validation_alias=_ENV_ALIASES["object_storage_provider"])
+    object_storage_bucket: str | None = Field(default=None, validation_alias=_ENV_ALIASES["object_storage_bucket"])
+    # The key prefix documented in docs/SOURCE_CONTRACT.md's object-key
+    # convention (`<prefix>/vendor=.../endpoint=.../load_date=.../
+    # run_id=.../page=......jsonl.gz`) -- configurable while keeping
+    # "raw" as the default, per that same contract.
+    object_storage_prefix: str = Field(
+        default="raw", validation_alias=_ENV_ALIASES["object_storage_prefix"]
+    )
+    object_storage_region: str | None = Field(
+        default=None, validation_alias=_ENV_ALIASES["object_storage_region"]
+    )
+    # Only meaningful for OBJECT_STORAGE_PROVIDER=s3 -- a custom
+    # S3-compatible endpoint (e.g. http://localhost:9000 for the local
+    # MinIO container in compose.yml). Left unset (None) to use real AWS
+    # S3's own regional endpoints.
+    object_storage_endpoint_url: str | None = Field(
+        default=None, validation_alias=_ENV_ALIASES["object_storage_endpoint_url"]
+    )
+    # Only meaningful for OBJECT_STORAGE_PROVIDER=local -- the local
+    # filesystem root object_storage.local.LocalFilesystemBackend writes
+    # under. Kept separate from RAW_DATA_DIR (the legacy/local-paginated
+    # contract's own directory layout, see pagination.py) so the two
+    # storage layouts can never collide on disk.
+    object_storage_local_root: Path = Field(
+        default=Path("data/object_storage"), validation_alias=_ENV_ALIASES["object_storage_local_root"]
+    )
+
     # --- field-level validators (always run, regardless of `required`) ---
 
     @field_validator("raw_schema")
@@ -271,6 +353,41 @@ class IngestConfig(BaseSettings):
     @classmethod
     def _check_input_layer_schema(cls, value: str) -> str:
         return _identifier_field_validator("INPUT_LAYER_SCHEMA")(value)
+
+    @field_validator("staging_schema")
+    @classmethod
+    def _check_staging_schema(cls, value: str) -> str:
+        return _identifier_field_validator("STAGING_SCHEMA")(value)
+
+    @field_validator("analytics_core_schema")
+    @classmethod
+    def _check_analytics_core_schema(cls, value: str) -> str:
+        return _identifier_field_validator("ANALYTICS_CORE_SCHEMA")(value)
+
+    @field_validator("analytics_marts_schema")
+    @classmethod
+    def _check_analytics_marts_schema(cls, value: str) -> str:
+        return _identifier_field_validator("ANALYTICS_MARTS_SCHEMA")(value)
+
+    @field_validator("object_storage_provider")
+    @classmethod
+    def _check_object_storage_provider(cls, value: str) -> str:
+        from .object_storage.factory import SUPPORTED_PROVIDERS
+
+        if value not in SUPPORTED_PROVIDERS:
+            raise ValueError(f"must be one of {sorted(SUPPORTED_PROVIDERS)}")
+        return value
+
+    @field_validator("object_storage_prefix")
+    @classmethod
+    def _check_object_storage_prefix(cls, value: str) -> str:
+        from .object_storage.keys import validate_prefix
+        from .errors import ObjectKeyError
+
+        try:
+            return validate_prefix(value)
+        except ObjectKeyError as exc:
+            raise ValueError(str(exc)) from exc
 
     @field_validator("ingest_role")
     @classmethod
@@ -364,6 +481,30 @@ class IngestConfig(BaseSettings):
             errors.append(
                 "TUVA_API_SECRET_PROVIDER=aws requires TUVA_API_SECRET_ID to be set (the AWS Secrets "
                 "Manager secret name or ARN to retrieve -- see secrets.py)"
+            )
+
+        # Six-schema lineage: every schema this connector or dbt writes
+        # into must be pairwise distinct, or two logically different
+        # layers (e.g. raw landing data and Tuva's own core outputs)
+        # could silently share one physical schema.
+        six_schemas = {
+            "OPS_SCHEMA": self.ops_schema,
+            "RAW_SCHEMA": self.raw_schema,
+            "STAGING_SCHEMA": self.staging_schema,
+            "INPUT_LAYER_SCHEMA": self.input_layer_schema,
+            "ANALYTICS_CORE_SCHEMA": self.analytics_core_schema,
+            "ANALYTICS_MARTS_SCHEMA": self.analytics_marts_schema,
+        }
+        seen: dict[str, str] = {}
+        for env_name, value in six_schemas.items():
+            if value in seen:
+                errors.append(f"{env_name} and {seen[value]} must not both be {value!r} (six distinct schemas are required)")
+            else:
+                seen[value] = env_name
+
+        if self.object_storage_provider == "s3" and not self.object_storage_bucket:
+            errors.append(
+                "OBJECT_STORAGE_PROVIDER=s3 requires OBJECT_STORAGE_BUCKET to be set"
             )
 
         if errors:
@@ -461,7 +602,16 @@ class IngestConfig(BaseSettings):
             "pg_dsn": "***REDACTED***" if self.pg_dsn else None,
             "raw_schema": self.raw_schema,
             "ops_schema": self.ops_schema,
+            "staging_schema": self.staging_schema,
             "input_layer_schema": self.input_layer_schema,
+            "analytics_core_schema": self.analytics_core_schema,
+            "analytics_marts_schema": self.analytics_marts_schema,
+            "object_storage_provider": self.object_storage_provider,
+            "object_storage_bucket": self.object_storage_bucket,
+            "object_storage_prefix": self.object_storage_prefix,
+            "object_storage_region": self.object_storage_region,
+            "object_storage_endpoint_url": self.object_storage_endpoint_url,
+            "object_storage_local_root": str(self.object_storage_local_root),
             "dbt_target": self.dbt_target,
             "dbt_profiles_dir": str(self.dbt_profiles_dir),
             "dbt_project_dir": str(self.dbt_project_dir),

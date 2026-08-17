@@ -74,7 +74,7 @@ from .config import ALL_REQUIREMENTS, REQUIRE_DB, REQUIRE_OBJECT_STORAGE, REQUIR
 from .errors import (
     CliUsageError,
     ConnectorError,
-    CursorError,
+    QuarantineError,
     RawLoadError,
     ReconciliationError,
     RunNotFoundError,
@@ -127,6 +127,12 @@ def _validate_since(value: str | None) -> str | None:
 
 
 def _build_api_client(config: IngestConfig, logger, *, token: str | None, run_id: str | None = None):
+    """Build an `ApiClient` for the *legacy* full-manifest contract
+    (`run`/`load-raw`, via `extract.extract_snapshot`) -- always a static
+    bearer token (`config.api_token_value`), never OAuth. Kept
+    byte-for-byte compatible with every existing call site; see
+    `_build_paginated_api_client` below for the paginated `extract`/
+    `sync` commands' OAuth-aware equivalent."""
     from .api_client import ApiClient
 
     return ApiClient(
@@ -134,6 +140,61 @@ def _build_api_client(config: IngestConfig, logger, *, token: str | None, run_id
         timeout=config.httpx_timeout(),
         max_retries=config.api_max_retries,
         max_retry_delay_seconds=config.api_max_retry_delay_seconds,
+        max_retry_duration_seconds=config.api_max_retry_duration_seconds,
+        logger=logger,
+        run_id=run_id,
+    )
+
+
+def _build_paginated_api_client(config: IngestConfig, logger, *, run_id: str | None = None):
+    """Build the `ApiClient` used by the paginated `extract`/`sync`
+    commands. When `TUVA_OAUTH_TOKEN_URL` is configured, this connector
+    is in OAuth mode: an `oauth.OAuthTokenManager` is constructed and
+    handed to `ApiClient` (which consults it for a fresh access token
+    before every request -- see api_client.py's module docstring),
+    instead of the static-secret path (`secrets.retrieve_api_credential`)
+    every other configuration still uses. Exactly one of the two auth
+    modes is active for a given deployment -- selected entirely by
+    whether `TUVA_OAUTH_TOKEN_URL` is set (see config.py's cross-field
+    validation, which requires TUVA_OAUTH_CLIENT_ID/_CLIENT_SECRET
+    whenever it is)."""
+    from .api_client import ApiClient
+
+    if config.oauth_token_url:
+        from .oauth import OAuthTokenManager
+
+        oauth_manager = OAuthTokenManager(
+            token_url=config.oauth_token_url,
+            client_id=config.oauth_client_id or "",
+            client_secret=config.oauth_client_secret_value or "",
+            scopes=config.oauth_scopes,
+            refresh_skew_seconds=config.oauth_refresh_skew_seconds,
+            timeout=config.httpx_timeout(),
+            max_retries=config.api_max_retries,
+            max_retry_duration_seconds=config.api_max_retry_duration_seconds,
+            max_delay_seconds=config.api_max_retry_delay_seconds,
+            logger=logger,
+            run_id=run_id,
+        )
+        return ApiClient(
+            oauth_manager=oauth_manager,
+            timeout=config.httpx_timeout(),
+            max_retries=config.api_max_retries,
+            max_retry_delay_seconds=config.api_max_retry_delay_seconds,
+            max_retry_duration_seconds=config.api_max_retry_duration_seconds,
+            logger=logger,
+            run_id=run_id,
+        )
+
+    from .secrets import retrieve_api_credential
+
+    credential = retrieve_api_credential(config, logger=logger, run_id=run_id)
+    return ApiClient(
+        token=credential.api_token_value,
+        timeout=config.httpx_timeout(),
+        max_retries=config.api_max_retries,
+        max_retry_delay_seconds=config.api_max_retry_delay_seconds,
+        max_retry_duration_seconds=config.api_max_retry_duration_seconds,
         logger=logger,
         run_id=run_id,
     )
@@ -166,7 +227,6 @@ def _cmd_extract(args: argparse.Namespace) -> int:
         return _cmd_extract_object_storage(args)
 
     from .pagination import extract_paginated_run
-    from .secrets import retrieve_api_credential
 
     endpoint = _validate_endpoint(args.endpoint)
     since_override = _validate_since(args.since)
@@ -175,9 +235,8 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     logger = configure_logging(config.log_level)
 
     since = _resolve_since(config, endpoint=endpoint, since_override=since_override)
-    credential = retrieve_api_credential(config, logger=logger)
 
-    client = _build_api_client(config, logger, token=credential.api_token_value)
+    client = _build_paginated_api_client(config, logger)
     try:
         result = extract_paginated_run(config, client, logger, endpoint=endpoint, since=since)
     finally:
@@ -455,22 +514,30 @@ def _run_paginated_load(run_id: str, *, config: IngestConfig, logger) -> dict:
                     "commit (see docs/SOURCE_CONTRACT.md 'Watermark backward-movement guard')"
                 )
 
-            load_paginated_run(conn, config, store, run_id, manifest)
+            load_counts = load_paginated_run(conn, config, store, run_id, manifest, logger=logger)
             actual_loaded = loaded_row_count(conn, config.raw_schema, table, run_id)
             log_event(
                 logger, "raw_load_completed", run_id=run_id, endpoint=endpoint, table=table,
-                row_count=actual_loaded,
+                row_count=actual_loaded, quarantined_count=load_counts.quarantined_count,
             )
-            if actual_loaded != total_record_count:
+            # Three-way reconciliation: every source record this run
+            # received is accounted for as either a valid, loaded raw row
+            # or a quarantined row -- never both, never neither. A
+            # mismatch here (e.g. a bug that silently dropped a record)
+            # fails the whole run, exactly like the pre-existing
+            # page/file/manifest checks in `verify_run_manifest` above.
+            if actual_loaded + load_counts.quarantined_count != total_record_count:
                 raise ReconciliationError(
-                    f"run {run_id!r}: loaded row count ({actual_loaded}) does not equal the manifest's "
-                    f"total_record_count ({total_record_count})"
+                    f"run {run_id!r}: loaded row count ({actual_loaded}) plus quarantined record count "
+                    f"({load_counts.quarantined_count}) does not equal the manifest's total_record_count "
+                    f"({total_record_count})"
                 )
             log_event(
                 logger, "reconciliation_completed", run_id=run_id, endpoint=endpoint,
-                record_count=total_record_count,
+                record_count=total_record_count, raw_loaded_count=actual_loaded,
+                quarantined_count=load_counts.quarantined_count,
             )
-        except (RawLoadError, ReconciliationError, WatermarkError) as exc:
+        except (RawLoadError, ReconciliationError, WatermarkError, QuarantineError) as exc:
             conn.rollback()
             category = getattr(exc, "category", "raw_load")
             state.mark_failed(conn, config.ops_schema, run_id, stage="load", error_category=category, error_message=str(exc))
@@ -502,6 +569,8 @@ def _run_paginated_load(run_id: str, *, config: IngestConfig, logger) -> dict:
             "since": since,
             "status": "succeeded",
             "row_count": actual_loaded,
+            "quarantined_count": load_counts.quarantined_count,
+            "quarantined_by_reason": load_counts.quarantined_by_reason,
             "path": str(store.run_dir(run_id)),
             "high_water_mark": candidate_hwm,
         }
@@ -522,7 +591,6 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         return _cmd_sync_object_storage(args)
 
     from .pagination import extract_paginated_run
-    from .secrets import retrieve_api_credential
 
     endpoint = _validate_endpoint(args.endpoint)
     since_override = _validate_since(args.since)
@@ -531,14 +599,13 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     logger = configure_logging(config.log_level)
 
     since = _resolve_since(config, endpoint=endpoint, since_override=since_override)
-    credential = retrieve_api_credential(config, logger=logger)
 
     # Extraction failure must stop the pipeline immediately -- any
     # exception here propagates straight out of _cmd_sync (never
     # caught/swallowed), so main() reports it as a sanitized, nonzero-exit
     # error and `_run_paginated_load` below is never reached, and no
     # watermark is ever committed.
-    client = _build_api_client(config, logger, token=credential.api_token_value)
+    client = _build_paginated_api_client(config, logger)
     try:
         extracted = extract_paginated_run(config, client, logger, endpoint=endpoint, since=since)
     finally:
@@ -556,6 +623,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             "since": since,
             "status": "succeeded",
             "row_count": load_result.get("row_count"),
+            "quarantined_count": load_result.get("quarantined_count"),
             "path": str(extracted.path),
             "high_water_mark": load_result.get("high_water_mark"),
         }

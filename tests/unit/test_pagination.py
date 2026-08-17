@@ -352,6 +352,7 @@ class _FakeConfig:
     api_max_pages: int = 100
     api_page_size: int | None = None
     api_max_page_bytes: int = 64 * 1024 * 1024
+    api_max_records_per_run: int = 1_000_000
 
 
 class _FakePaginationClient:
@@ -497,6 +498,82 @@ class TestExtractPaginatedRun(unittest.TestCase):
         page_files = list(result.path.glob("page-*.jsonl.gz"))
         self.assertEqual(len(page_files), 1)
         self.assertTrue((result.path / "_SUCCESS").is_file())
+
+    def test_server_returning_current_token_as_next_token_is_a_cycle(self):
+        # "next_page_token equal to the just-requested token" is the
+        # narrowest, most direct form of a self-referencing pagination
+        # cycle -- distinct from (and checked before) the broader
+        # "repeats any previously seen token" check.
+        client = _FakePaginationClient([
+            _page([{"a": 1}], page_token=None, next_page_token="tok-2"),
+            _page([{"a": 2}], page_token="tok-2", next_page_token="tok-2"),
+        ])
+        with self.assertRaises(PaginationError) as ctx:
+            extract_paginated_run(self._config(), client, _NULL_LOGGER, endpoint="eligibility")
+        self.assertIn("cycle", str(ctx.exception))
+
+
+class TestMaxRecordsPerRunLimit(unittest.TestCase):
+    """TUVA_API_MAX_RECORDS_PER_RUN is an absolute safety ceiling,
+    distinct from TUVA_API_MAX_PAGES -- checked after each page's
+    envelope is validated but before that page is written/published."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.raw_data_dir = Path(self._tmp.name)
+
+    def _config(self, **kwargs):
+        return _FakeConfig(
+            api_manifest_url="https://example.invalid/v1/records",
+            raw_data_dir=self.raw_data_dir,
+            source_name="tuva",
+            **kwargs,
+        )
+
+    def test_exact_boundary_record_count_succeeds(self):
+        # Exactly the configured maximum, and pagination ends there --
+        # must succeed (the boundary itself is not a violation).
+        client = _FakePaginationClient([
+            _page([{"a": 1}, {"a": 2}], next_page_token=None),
+        ])
+        result = extract_paginated_run(
+            self._config(api_max_records_per_run=2), client, _NULL_LOGGER, endpoint="eligibility"
+        )
+        self.assertEqual(result.total_record_count, 2)
+        self.assertTrue((result.path / "_SUCCESS").is_file())
+
+    def test_exceeding_record_limit_fails_before_publishing(self):
+        client = _FakePaginationClient([
+            _page([{"a": 1}, {"a": 2}], next_page_token="tok-2"),
+            _page([{"a": 3}], page_token="tok-2", next_page_token=None),
+        ])
+        with self.assertRaises(PaginationError) as ctx:
+            extract_paginated_run(
+                self._config(api_max_records_per_run=2), client, _NULL_LOGGER, endpoint="eligibility"
+            )
+        self.assertIn("record", str(ctx.exception).lower())
+        store = PaginatedRunStore(self.raw_data_dir, "tuva")
+        staging_root = store._staging_root()
+        if staging_root.exists():
+            self.assertEqual(list(staging_root.iterdir()), [])
+
+    def test_record_limit_counts_records_regardless_of_later_quarantine_eligibility(self):
+        # The pagination-time limit has no visibility into which records
+        # will later be quarantined at load time -- it counts every
+        # source record the page reported, full stop.
+        client = _FakePaginationClient([
+            _page([{"person_id": None}, {"person_id": "abc"}, {"person_id": "def"}], next_page_token=None),
+        ])
+        with self.assertRaises(PaginationError):
+            extract_paginated_run(
+                self._config(api_max_records_per_run=2), client, _NULL_LOGGER, endpoint="eligibility"
+            )
+
+    def test_default_max_records_per_run_does_not_interfere_with_small_runs(self):
+        client = _FakePaginationClient([_page([{"a": 1}], next_page_token=None)])
+        result = extract_paginated_run(self._config(), client, _NULL_LOGGER, endpoint="eligibility")
+        self.assertEqual(result.total_record_count, 1)
 
 
 if __name__ == "__main__":

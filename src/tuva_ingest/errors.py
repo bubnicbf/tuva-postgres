@@ -115,69 +115,22 @@ class WatermarkError(ConnectorError):
     category = "watermark"
 
 
+class OAuthError(ConnectorError):
+    """Raised by `oauth.py` for any OAuth token-lifecycle failure: a
+    malformed or incomplete token-endpoint response, an unsupported
+    token_type, a permanent grant failure (invalid_client/invalid_grant/
+    ...), or a transient failure that exhausted the shared bounded retry
+    budget. Never includes a token, client secret, or the raw
+    token-endpoint response body in its message."""
 
-class ObjectStorageError(ConnectorError):
-    """Base class for object-storage backend/publication/verification
-    failures (see `object_storage/`). Never includes credentials -- every
-    backend authenticates via ambient identity only (see
-    `object_storage/s3.py`) and never logs/raises a credential value."""
-
-    category = "object_storage"
-
-
-class ObjectKeyError(ObjectStorageError):
-    """Raised by `object_storage/keys.py` for any unsafe or malformed
-    object-key path component (vendor, endpoint, prefix, run_id,
-    page_number)."""
-
-    category = "object_key"
+    category = "oauth"
 
 
-class ImmutableObjectError(ObjectStorageError):
-    """Raised when a write would overwrite an already-published object
-    (a page, the manifest, or the success marker) with *different*
-    content. A completed, immutable object is never silently overwritten
-    -- see `object_storage/base.StorageBackend.put`."""
+class QuarantineError(ConnectorError):
+    """Raised when a structurally invalid record cannot be safely written
+    to the quarantine table (e.g. a database error while inserting a
+    quarantine row) -- always treated as a failed run, rolling back the
+    whole load transaction so a partially-quarantined run is never left
+    committed."""
 
-    category = "immutable_object"
-
-
-class RunNotPublishedError(ObjectStorageError):
-    """Raised when a run is loaded/replayed without a valid, durable
-    success marker and manifest -- see `object_storage/verify.py`. A run
-    missing either is never treated as loadable, regardless of how many
-    of its pages happen to be present."""
-
-    category = "run_not_published"
-
-
-class ObjectVerificationError(ObjectStorageError):
-    """Raised by `object_storage/verify.py` when a published run fails
-    independent re-verification at load time: a missing object, a
-    checksum mismatch, a gzip integrity failure, a JSONL record-count
-    mismatch, or a manifest reconciliation failure."""
-
-    category = "object_verification"
-
-
-class RawContractError(ConnectorError):
-    """Raised for a failure in the centralized endpoint raw-metadata
-    contract (`endpoint_contract.py`) that is not a per-record
-    rejection (see `RejectedRecord`/reason codes for those) -- e.g. an
-    unsupported endpoint name passed to the contract registry itself."""
-
-    category = "raw_contract"
-
-
-class CursorError(ConnectorError):
-    """Raised when a candidate cursor would move `ops_schema.ingestion_cursor`
-    backward for a (vendor/source, endpoint) pair, or when the cursor row
-    cannot be locked/validated safely (see `state.py`'s
-    `lock_cursor_for_update`/`commit_cursor`). Distinct from the legacy
-    `WatermarkError` (`ops_schema.source_watermarks`, used only by the
-    local-filesystem paginated workflow in `pagination.py`/
-    `paginated_loader.py`) -- the object-storage-backed workflow's sole
-    cursor source is `ingestion_cursor` (see docs/SOURCE_CONTRACT.md
-    "Cursor safety")."""
-
-    category = "cursor"
+    category = "quarantine"

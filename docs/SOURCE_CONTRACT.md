@@ -54,10 +54,11 @@ confirmation are marked **Repository-derived assumption**.
 
 ## 2. Authentication
 
-- Mechanism: **Verified.** Static bearer token, `Authorization: Bearer {TUVA_API_TOKEN}`, sent on every manifest fetch and every artifact download (`ApiClient._headers()`, `api_client.py`).
+- Mechanism: **Verified, two supported modes.** (1) Static bearer token, `Authorization: Bearer {TUVA_API_TOKEN}` (or the secret-provider-resolved equivalent) -- the default, and the only mode the legacy `run`/`load-raw` commands use. (2) OAuth 2.0 client-credentials grant, selected by setting `TUVA_OAUTH_TOKEN_URL` (`src/tuva_ingest/oauth.py`'s `OAuthTokenManager`) -- available to the paginated `extract`/`sync` commands only, entirely additive/optional. Either way, exactly one resolved access token is sent as `Authorization: Bearer {token}` on every request (`ApiClient._headers()`, `api_client.py`).
 - Required headers: **Verified.** `Authorization`, `User-Agent: tuva-ingest/{__version__}`, `Accept: application/json, text/csv;q=0.9, */*;q=0.1` (`api_client.py`).
-- Scopes, token endpoint, signing rules: **Unverified.** No OAuth flow, token endpoint, or request signing exists in the code -- the token is a pre-issued opaque bearer credential supplied via environment variable. **Decision/gap:** a vendor that requires OAuth client-credentials with expiring tokens is not yet supported; `ApiClient` has no refresh capability today.
-- Token lifetime: **Unverified.**
+- Scopes, token endpoint, signing rules: **Repository-derived assumption** for the OAuth mode. No vendor-documented grant type exists anywhere in this repository -- OAuth 2.0 client-credentials (`TUVA_OAUTH_TOKEN_URL`/`TUVA_OAUTH_CLIENT_ID`/`TUVA_OAUTH_CLIENT_SECRET`/`TUVA_OAUTH_SCOPES`) was chosen as the most common/conservative default for a machine-to-machine integration; `refresh_token` rotation is supported opportunistically if the token endpoint returns one, but is not assumed required. A vendor requiring a different grant type (authorization-code, JWT-bearer, mTLS, request signing) is **not yet supported** and would require `oauth.py` to be revised. No request-signing scheme (e.g. HMAC) exists in the code for either auth mode.
+- Token lifetime: **Verified for the connector's own handling, Unverified for a real vendor's actual values.** `OAuthTokenManager` reads `expires_in` from the token response and tracks a monotonic expiry deadline, refreshing proactively once `TUVA_OAUTH_REFRESH_SKEW_SECONDS` (default 60) of lifetime remains; it never returns an already-expired token. What lifetime/rotation cadence a real vendor's token endpoint actually issues is unconfirmed.
+- On an unexpected `401` from the source API (OAuth mode only): **Decision.** `ApiClient` forces exactly one token refresh and replays the request exactly once (`_request_with_retries`) -- authentication recovery, not a general retry, and never looped. A `401` on the replay fails immediately.
 - Secret management: **Verified.** For the paginated `extract`/`load`/`sync` commands, the credential is retrieved at runtime from a configured secret provider (`src/tuva_ingest/secrets.py`), never read from a plaintext `.env` value directly except through the `"env"` provider (the default, kept for full backward compatibility -- it reads `TUVA_API_TOKEN`, same as before). The `"aws"` provider retrieves the credential from AWS Secrets Manager via `boto3`, authenticating with ambient identity only (an IAM role, an assumed role, `AWS_PROFILE`, or a local developer profile) -- this connector never accepts or configures a static AWS access key. The secret is retrieved exactly once per process/run, never once per page, and never written to disk. `TUVA_API_SECRET_PROVIDER`/`TUVA_API_SECRET_ID`/`AWS_REGION` are non-secret lookup information only (`scripts/setup_env.example`). The legacy `run`/`load-raw` commands still read `TUVA_API_TOKEN` directly via `config.api_token_value` (unchanged). `.env` is git-ignored (`.gitignore`); `IngestConfig.safe_dict()`/`__repr__` redact `api_token`/`pg_dsn` as `"***REDACTED***"`; `secrets.ApiCredential.api_token` is a `pydantic.SecretStr`, never a bare `str`, so it can never leak through an accidental `print()`/log call either. `docs/RUNBOOK.md` "Security notes" documents rotation via `.env`/secret store with no code change required.
 - Secrets and PHI must never be committed to this repository. Examples below are redacted placeholders only, consistent with `scripts/setup_env.example`'s empty-string convention -- no real token, DSN, or patient data appears in this document.
 
@@ -124,7 +125,7 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
 
 - Request parameters: **Verified.** `endpoint`, `since` (the prior committed watermark, or an explicit `--since` override), `page_token`, and `page_size` (`TUVA_API_PAGE_SIZE`, optional) are always sent as real httpx query parameters (`ApiClient.get_json_page`), never concatenated into the URL (`pagination.extract_paginated_run`).
 - Response fields: **Verified**, validated before anything is written to disk (`pagination.validate_page_envelope`): `records` must be a JSON array of JSON objects; `metadata.record_count` must be a non-negative integer equal to the actual number of records; a returned `metadata.page_token` (when present) must match the requested token; `metadata.next_page_token` is null/absent only on the final page and, when present, must be a non-empty string; `metadata.high_water_mark` is required and must be a non-empty string.
-- Termination condition: **Verified.** `metadata.next_page_token` being null or absent. A hard safety ceiling (`TUVA_API_MAX_PAGES`, default 10,000) additionally aborts pagination that never terminates, and every requested/returned token is tracked for the run's lifetime so a repeated token (a pagination cycle) fails loudly (`PaginationError`) rather than looping forever (`pagination.py`).
+- Termination condition: **Verified.** `metadata.next_page_token` being null or absent. Two independent hard safety ceilings additionally bound any run that never terminates cleanly: `TUVA_API_MAX_PAGES` (default 10,000 pages) and `TUVA_API_MAX_RECORDS_PER_RUN` (default 2,000,000 records, counting every source record including ones later quarantined -- checked after envelope validation but before publishing each page). Every requested/returned page token is tracked for the run's lifetime, so a repeated request token, a repeated `next_page_token`, or the server echoing the current token back as the next one are all treated as a pagination cycle and fail immediately (`PaginationError`) rather than looping forever (`pagination.py`); hitting exactly a limit succeeds, one page or record past it fails the run with nothing partial published and the watermark left untouched.
 - Ordering guarantees: **Unverified.** The paginated contract's within-page record order, and whether pages themselves are guaranteed non-overlapping/gap-free by any real, eventually-connected vendor, are not established anywhere in this repository -- this connector requests pages strictly in the order the source's own `next_page_token` chain dictates and never reorders or re-sorts records itself.
 - Token expiry / safe restart: **Unverified** for a real vendor (whether a `page_token`/`next_page_token` value expires, and after how long). This connector holds no long-lived pagination state across process restarts -- a killed/restarted `extract` simply starts a fresh run from page 1 using the current watermark; a `load`/`sync` failure never leaves an inconsistent watermark (Section 14 below; `state.get_watermark`/`commit_watermark`).
 - Duplicate/missing records across boundaries: **Decision.** Loading is idempotent per run (`_snapshot_id`, `_source_row_number` unique index -- `migrations/005_paginated_extraction_state.sql`), so repeating a load never duplicates rows within one run; whether a real vendor's own pagination can itself produce duplicate or missing records across two different runs' page boundaries (e.g. under concurrent writes on the source side) is **Unverified**, restated in Readiness.
@@ -133,12 +134,12 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
 ## 5. Rate limits and retry behavior
 
 - Published or observed vendor limits: **Unverified.** No specific vendor is connected; nothing in this repository documents an actual published rate limit.
-- Client-side retry policy (**Verified**, `api_client.py`):
-  - Retryable statuses: exactly `{429, 500, 502, 503, 504}` (`RETRYABLE_STATUS`). Every other 4xx (401, 403, 404, etc.) fails immediately and is never retried.
-  - `Retry-After`: parsed as a plain float number of seconds only (`_parse_retry_after`); the HTTP-date form is explicitly not implemented and falls back to exponential backoff (a known, documented gap, not an oversight).
-  - Backoff: exponential, `min(2**attempt, 30)` seconds base, plus uniform jitter up to 25% of the base (`_backoff_seconds`).
-  - Maximum retries: `TUVA_API_MAX_RETRIES`, default `5` (`config.py`, `scripts/setup_env.example`), applied per HTTP request (one manifest fetch or one artifact download), not per whole extraction run.
-  - Non-retryable errors: 401/403 raise `DownloadError` immediately with a "not authorized" message that never includes the token; 404 raises immediately as "not found"; any other non-2xx, non-retryable status raises immediately.
+- Client-side retry policy (**Verified**, `src/tuva_ingest/retry.py`'s `BoundedRetryExecutor` -- one shared policy used identically by `api_client.py`'s source-API requests and `oauth.py`'s token-endpoint requests):
+  - Retryable: `429`, `502`, `503`, `504`, and httpx connection/timeout errors (`RETRYABLE_STATUS`). **Decision, changed from an earlier draft of this policy:** `500` is deliberately *not* retryable by default -- only the server statuses this connector's own contract explicitly treats as transient. Every other 4xx (`400`, `401` outside the single-shot OAuth recovery above, `403`, `404`, `409`, `422`, etc.), and any application-level failure (envelope validation, cycle detection, checksum mismatch), fails immediately and is never retried.
+  - `Retry-After`: both the numeric-seconds and HTTP-date forms are supported (`parse_retry_after`); an HTTP-date is resolved relative to current wall-clock time (a past date yields zero delay); a negative, malformed, non-finite, or unreasonably large value (`MAX_REASONABLE_RETRY_AFTER_SECONDS`) is rejected and falls back to exponential backoff rather than being honored as-is.
+  - Backoff: full-jitter exponential (`random() * min(TUVA_API_MAX_RETRY_DELAY_SECONDS, base * 2**attempt)`), fully injectable (clock/random/sleep) for deterministic unit tests.
+  - Bounds: **two independent limits**, either of which stops retrying -- `TUVA_API_MAX_RETRIES` (attempt count, default `5`) and `TUVA_API_MAX_RETRY_DURATION_SECONDS` (total elapsed time via a monotonic clock, default `120`). If honoring the next delay (backoff or `Retry-After`) would exceed the remaining duration budget, the request fails immediately rather than oversleeping past the deadline. Applied per logical request (one page request, one manifest fetch, one artifact download, or one token-endpoint call), not per whole extraction run.
+  - Non-retryable errors: `401`/`403` raise immediately with a message that never includes the token; `404` raises immediately as "not found"; any other non-2xx, non-retryable status raises immediately. A failed response is always closed/released before any retry sleep.
 - Response headers consulted: **Verified** -- only `Retry-After`. No `X-RateLimit-*`/`RateLimit-*` headers are read anywhere in the client.
 - **Decision:** this policy is generic and defensive by design, not tuned to a specific vendor's published limits. Whether it provides sufficient headroom for a real vendor is **Unverified** until one is connected and load-tested.
 
@@ -219,353 +220,17 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
 - Comparison tolerances, frequency, alert thresholds, investigation procedure: **Unverified.** None are defined in this repository for either contract; counts are recorded/reconciled per run but nothing currently compares them run-over-run or alerts on an unexpected swing.
 - **Blocking note:** without vendor-provided *business* totals (as opposed to this connector's own structural/technical reconciliation above), whether "did we receive every claim the payer sent this period" holds cannot be confirmed by this connector alone -- only structural/technical completeness (checksums, per-page/per-run/per-database record counts) is currently verifiable.
 
+## 15. Structural record validation and quarantine
 
-## 15. Object storage
-
-This section documents the object-storage-backed ingestion path added
-alongside the wire/pagination contract above (Sections 1-14, unchanged).
-It extends the same endpoint-scoped `extract`/`load`/`sync` workflow
-(`--storage object-storage`, see `cli.py`) rather than replacing it or
-standing up an unrelated parallel pipeline -- the `--endpoint` vocabulary
-(`endpoints.py`), page request/response envelope
-(`pagination.validate_page_envelope`), and `ApiClient` are all reused
-unchanged.
-
-### Object storage as the durable source of truth
-
-Every published run's pages, manifest, and success marker are immutable
-objects in object storage (`OBJECT_STORAGE_PROVIDER=local` for
-development, using `object_storage.local.LocalFilesystemBackend`;
-`OBJECT_STORAGE_PROVIDER=s3` in production, using
-`object_storage.s3.S3Backend` against real AWS S3 or any S3-compatible
-endpoint such as MinIO). This is the durable, replayable source of
-truth -- PostgreSQL's raw tables (Section "Raw metadata definitions"
-below) are a convenience layer derived FROM object storage by
-`object_raw_loader.py`, never the other way around. A raw table can
-always be dropped and fully rebuilt by re-running `load`/`sync` against
-every previously published run_id; object storage cannot be
-reconstructed from PostgreSQL (raw payloads that fail loading are
-represented in PostgreSQL only as a `rejected_record` pointer back to
-the object, never a full copy -- see "Rejected-record investigation").
-
-### Object-key convention
-
-    <prefix>/vendor=<vendor>/endpoint=<endpoint>/load_date=<YYYY-MM-DD>/run_id=<uuid>/page=<NNNNNN>.jsonl.gz
-
-Example:
-
-    raw/vendor=acme/endpoint=medical_claim/load_date=2026-08-14/run_id=550e8400-e29b-41d4-a716-446655440000/page=000001.jsonl.gz
-
-- `prefix` -- configurable (`OBJECT_STORAGE_PREFIX`, default `"raw"`).
-- `vendor` -- `SOURCE_NAME` (`config.py`), validated as a safe object-key
-  path segment (`object_storage/keys.py`).
-- `endpoint` -- the STABLE, normalized snake_case partition name
-  (`medical_claim`, `pharmacy_claim`, `eligibility`), never the
-  hyphenated `--endpoint` CLI form, via `endpoints.table_for_endpoint`
-  (the same single authoritative mapping every other part of this
-  connector already uses -- never re-derived).
-- `load_date` -- the UTC calendar date extraction started on
-  (`object_storage.keys.utc_load_date`, always computed from a
-  timezone-aware UTC instant).
-- `run_id` -- a true, randomly generated UUID4 (`object_storage.keys.new_run_id`)
-  -- never a timestamp- or endpoint-derived value (those are already
-  separate key components; embedding them again in `run_id` would make
-  it a leaky composite key instead of an opaque identifier).
-- `page` -- a six-digit, 1-based page number (`page=000001` ... `page=999999`).
-
-Each page is stored as gzip-compressed JSONL, one exact source record
-per line, values/structure unchanged from what the source sent (only
-each record's own top-level key order is normalized for storage
-determinism -- see `object_storage.publish.gzip_jsonl`).
-
-### Publication and success-marker semantics
-
-Publication order is fixed and never relies on filesystem rename
-semantics for atomicity (`object_storage.publish.RunPublisher`):
-
-1. Every page object is written first (in any order -- pages are
-   independent immutable objects).
-2. The run manifest is written next -- object keys, page numbers,
-   compressed byte sizes, SHA-256 checksums, record counts, cursor
-   metadata (`requested_cursor`/`candidate_cursor`), and extraction
-   timestamps for every page.
-3. The success marker (`_SUCCESS`) is published LAST, only once every
-   page and the manifest are already durable. Its content is the
-   manifest's own SHA-256, so `verify.py` can cheaply confirm the
-   marker actually corresponds to the manifest it references.
-
-**A run without a valid success marker and manifest is never loadable**
-(`object_storage.verify.load_and_verify_manifest` raises
-`RunNotPublishedError`) -- regardless of how many of its pages happen to
-be present.
-
-**Immutability:** writing the exact same bytes to an already-published
-key is a safe no-op (retry-safe); writing DIFFERENT bytes to an
-already-published key raises `ImmutableObjectError`
-(`object_storage.base.StorageBackend.put`'s contract, upheld identically
-by every backend). `object_storage.s3.S3Backend` additionally attempts a
-conditional (`IfNoneMatch: "*"`) `PutObject` so two concurrent publishers
-racing to write the same key can never have the second writer silently
-clobber the first -- see that module's docstring for its documented,
-inherent race-window limitation on S3-compatible services that do not
-support conditional writes.
-
-### Replay instructions
-
-Loading/replaying a run ALWAYS reads from object storage, never from a
-local directory alone (`object_raw_loader.load_verified_run` calls
-`object_storage.verify.load_and_verify_manifest`, which re-verifies
-existence, checksum, gzip integrity, and JSONL record count for every
-page before anything is loaded). To replay a specific run:
-
-    tuva-ingest load --storage object-storage --run-id <run_id>
-
-This is safe to repeat for the same `run_id` (inserts zero new rows on
-retry -- see "The stable uniqueness rule" below) and safe to run for a
-DIFFERENT `run_id` that happens to contain the same logical source rows
-(also zero new rows, by the same uniqueness rule) -- see
-`tests/integration/test_object_storage_pipeline_integration.py`'s
-`TestCopyAndMerge`.
-
-### Raw metadata definitions
-
-Every row `object_raw_loader.py` writes carries exactly these seven
-columns (added by `migrations/006_object_storage_raw_contract.sql`,
-nullable so they coexist with the legacy loader's own four columns on
-the same physical tables):
-
-| Column | Type | Meaning |
-| --- | --- | --- |
-| `_ingestion_run_id` | `uuid` | The run that loaded this row. |
-| `_ingested_at` | `timestamptz` | When this row was loaded. |
-| `_source_endpoint` | `text` | The normalized snake_case endpoint. |
-| `_source_record_id` | `text` | See "Source-record-id contract" below. |
-| `_source_updated_at` | `timestamptz` | See "Source-updated-at contract" below. |
-| `_payload_hash` | `text` | Lowercase SHA-256, see "Payload hash" below. |
-| `_raw_payload` | `jsonb` | The minimally interpreted complete source object. |
-
-**Legacy compatibility:** the pre-existing `raw_row` column (populated
-only by the legacy CSV loader, `raw_loader.py`) is left completely
-unchanged -- it is a SEPARATE column, never renamed or shared, so the
-two loaders can never independently populate (and silently drift) the
-same column. dbt staging models bridge the two explicitly via
-`coalesce(_raw_payload, raw_row)` (see "Legacy workflow compatibility"
-below) -- this is the one, explicit place the two payload columns are
-ever reconciled.
-
-### Source-record-id contract
-
-Centralized in `endpoint_contract.py` (`ENDPOINT_ID_FIELDS`), never
-re-derived per call site:
-
-| Endpoint | Source field(s) |
-| --- | --- |
-| `eligibility` | `person_id` |
-| `medical_claim` | `claim_id` + `claim_line_number` |
-| `pharmacy_claim` | `claim_id` + `claim_line_number` |
-
-A composite id is encoded via `endpoint_contract.encode_composite_id` --
-a length-prefixed encoding (`"<byte-length>:<value>..."` per part),
-never naive delimiter concatenation, so a value that happens to contain
-what would otherwise look like a delimiter can never collide with a
-different logical id (`("ab", "c")` and `("a", "bc")` always encode
-differently -- see `tests/unit/test_endpoint_contract.py`).
-
-A record missing (or with a blank/non-scalar) required id field is
-rejected with reason code `missing_source_id` -- never silently
-defaulted or dropped without a trace.
-
-### Source-updated-at contract
-
-`_source_updated_at` is parsed from the endpoint's explicit source
-update-timestamp field -- `updated_at` for every currently-registered
-endpoint (`endpoint_contract.ENDPOINT_TIMESTAMP_FIELD`; a future
-endpoint whose verified contract establishes a different field name
-would add an entry here). **Ingestion time is never substituted** when
-this field is missing or does not parse as ISO-8601 -- both cases are
-always rejected (`missing_source_timestamp` / `invalid_source_timestamp`
-reason codes), never defaulted.
-
-### Payload hash
-
-`_payload_hash` is the lowercase hex SHA-256 of
-`endpoint_contract.canonical_json_bytes`: the complete source record
-serialized with sorted keys and compact separators (`json.dumps(...,
-sort_keys=True, separators=(",", ":"))`), UTF-8 encoded. The same
-logical JSON object hashes identically regardless of input key order,
-at every nesting level (`tests/unit/test_endpoint_contract.py`).
-
-### The stable uniqueness rule
-
-A partial unique index on every raw table enforces:
-
-    (_source_endpoint, _source_record_id, _source_updated_at, _payload_hash)
-    WHERE _source_record_id IS NOT NULL
-
-Named `<table>_source_stable_uk` (`migrations/006_object_storage_raw_contract.sql`).
-Scoped to `_source_record_id IS NOT NULL` so it never applies to (and can
-never conflict with) legacy-loaded rows, which always leave
-`_source_record_id` NULL.
-
-**Why the payload hash is included:** this key deliberately permits a
-corrected record with the SAME source id and update timestamp when its
-payload hash differs (the source corrected a field without bumping its
-own `updated_at`) -- both versions are retained as separate rows, never
-silently overwritten -- while still suppressing an EXACT replay of the
-same logical row (identical id, timestamp, AND hash) as a duplicate. A
-changed `_source_updated_at` for the same id is likewise always retained
-as a new version, never merged/overwritten.
-
-### COPY-to-temp and transactional merge
-
-`object_raw_loader.load_verified_run`, page by page (a run is never
-loaded fully into memory):
-
-1. Classifies each record (`endpoint_contract.derive_source_record_id`/
-   `derive_source_updated_at` -- never raises for a data-quality
-   problem; one bad record never aborts the rest of a page/run).
-2. Bulk-loads accepted rows into a transaction-local `TEMP TABLE` via
-   `psycopg`'s `COPY FROM STDIN`.
-3. Merges from the temp table into the permanent raw table via
-   `INSERT ... SELECT ... ON CONFLICT (...) WHERE _source_record_id IS
-   NOT NULL DO NOTHING` against the uniqueness rule above.
-4. Reconciles, per page: `source records == accepted + rejected` and
-   `accepted == inserted + exact duplicates` (`ReconciliationError` on
-   any mismatch).
-5. Writes `ingestion_page`, `rejected_record`, and `schema_observation`
-   rows for that page -- all inside the SAME transaction, never
-   committed individually.
-
-Only after every page succeeds does the loader lock and validate the
-cursor (see below) and mark the run `committed`. **One single
-`conn.commit()`** (owned by the caller, `cli._run_object_load` --
-`object_raw_loader.py`/`state.py`'s "canonical object-storage-backed
-operational model" functions never call `commit()`/`rollback()`
-themselves) makes the raw merge, every operational write, and the
-cursor advance all become visible together -- or, on any failure, the
-caller's `conn.rollback()` discards all of them together, followed by a
-SEPARATE, freshly-committed `state.mark_run_failed` write that preserves
-the sanitized failure reason without ever re-entering the rolled-back
-transaction.
-
-### Cursor transaction and concurrency behavior
-
-`ops.ingestion_cursor` (keyed by `(vendor, endpoint)`) is the SOLE
-canonical cursor source for the object-storage-backed workflow -- never
-`ops.source_watermarks` (which remains, unchanged, the cursor store for
-the legacy local-filesystem paginated workflow; see "Legacy workflow
-compatibility"). Guarantees:
-
-- Extraction never advances the cursor (`object_extract.py` only writes
-  `ingestion_run.candidate_cursor`, never `ingestion_cursor`).
-- Object publication alone (reaching a durable `_SUCCESS` marker) never
-  advances the cursor either.
-- A verified PostgreSQL commit is the ONLY event that advances the
-  cursor (`state.commit_cursor`, called once, as close to the end of the
-  transaction as possible, immediately before `state.mark_run_committed`).
-- `state.lock_cursor_for_update` takes `SELECT ... FOR UPDATE` on the
-  row (creating it first at NULL/0 if this is the endpoint's first-ever
-  load) so a second concurrent run for the same `(vendor, endpoint)`
-  blocks until the first transaction commits or rolls back -- it can
-  never silently race past it.
-- Backward cursor movement is refused (`CursorError`) if the candidate
-  cursor is lexicographically less than the already-committed cursor.
-- `lock_version` (optimistic-concurrency metadata) is checked by
-  `commit_cursor`'s `UPDATE ... WHERE lock_version = %s`; because the row
-  lock above is already held for the whole transaction, a mismatch here
-  can only happen from a caller bug, not a legitimate race -- it raises
-  `CursorError` rather than silently overwriting a newer cursor.
-
-### Six-schema lineage
-
-| Schema (default name) | Owner | Purpose |
-| --- | --- | --- |
-| `ops` | This connector | Pipeline state and audit records (`ingestion_run`/`ingestion_page`/`ingestion_cursor`/`rejected_record`/`schema_observation`, plus the legacy `ingestion_runs`/`table_loads`/`source_watermarks`). |
-| `raw_incoming` | This connector | Minimally interpreted source data (both loaders' raw tables). |
-| `staging_incoming` | dbt (this project's own models) | Cast, normalize, and deduplicate (`models/staging/*.sql`). |
-| `input_layer` | dbt (this project's own models) | The Tuva Input Layer contract (`models/final/*.sql`). |
-| `analytics_core` | dbt (the pinned Tuva package) | Tuva's own core data model + terminology output. |
-| `analytics_marts` | dbt (the pinned Tuva package) | Tuva's own mart outputs. |
-
-All six are independently configurable
-(`RAW_SCHEMA`/`OPS_SCHEMA`/`STAGING_SCHEMA`/`INPUT_LAYER_SCHEMA`/
-`ANALYTICS_CORE_SCHEMA`/`ANALYTICS_MARTS_SCHEMA`, validated via the
-existing shared identifier policy, `identifiers.py`) and must be
-pairwise distinct (`config.py`'s cross-field validator). **The default
-values for `RAW_SCHEMA`/`OPS_SCHEMA` changed** (from `raw`/`ingest_ops`
-to `raw_incoming`/`ops`) as part of this change -- see
-`docs/RUNBOOK.md` "Upgrade notes" for what an existing deployment must
-do. `analytics_core`/`analytics_marts` routing for the pinned Tuva
-package's own models is implemented in
-`macros/generate_schema_name.sql` -- see that macro's own docstring for
-its exact heuristic and its documented "best-effort, unverified without
-`dbt deps`" limitation (this sandboxed environment could not run `dbt
-deps` to confirm the real package's exact schema-name literals; verify
-with `dbt list` once you have network access).
-
-### Schema observation behavior and limitations
-
-`schema_observation.py` walks each decoded JSON record recursively and
-records only field PATHS and JSON TYPE NAMES -- never values (no PHI is
-ever stored in `schema_observation`). Behavior:
-
-- Nested objects produce dotted paths (`address.city`).
-- Arrays produce the array path itself (type `"array"`) plus each
-  element's own path with a trailing `"[]"` segment -- an array's
-  elements contribute their field paths ONCE, never once per index, so
-  observations are independent of array length.
-- `null` is recorded as its own distinct type (`"null"`), never merged
-  away or skipped -- a field that is sometimes null and sometimes a
-  string legitimately accumulates BOTH types at that path; that IS the
-  drift signal this table exists to surface.
-- A field observed with more than one type across records/runs simply
-  accumulates more than one type at that path -- this module never
-  "picks a winner"; a human reviewing `schema_observation` does, if
-  ever needed.
-- The fingerprint (`schema_observation.fingerprint`) is a SHA-256 over
-  the sorted `(path, type)` representation -- independent of dict/set
-  iteration order, sensitive to any real shape change (proven in
-  `tests/unit/test_schema_observation.py`).
-- **Limitation:** this is per-run/per-page shape drift detection only --
-  it does not detect a value-level anomaly (e.g. a string field that
-  starts containing dates), and it does not alert; `schema_observation`
-  must be queried/compared manually or by a downstream tool.
-
-### Rejected-record investigation
-
-A rejected record's `ops.rejected_record` row NEVER carries the raw
-payload or any source field value -- only a reason code, a sanitized
-(PHI-free) detail string, the derived `source_record_id` when safely
-available, `payload_hash`, and `raw_object_key` (a durable pointer back
-to the exact, immutable page object in object storage). To investigate:
-
-1. `SELECT reason_code, detail, raw_object_key, rejected_at FROM
-   ops.rejected_record WHERE run_id = '<run_id>' ORDER BY page_number,
-   record_position;`
-2. Fetch `raw_object_key` from object storage directly (e.g.
-   `object_storage_backend.get(raw_object_key)`, or the equivalent `aws
-   s3 cp`/`mc cat` command against the configured bucket) and decompress
-   (gzip) to locate the exact record at `record_position` within that
-   page's JSONL.
-
-`ops.rejected_record` is PHI-bearing (a `raw_object_key` is a pointer to
-PHI): `transform_role` (dbt) has NO grant on it whatsoever
-(`migrations/006_object_storage_raw_contract.sql`), and PUBLIC is
-explicitly revoked.
-
-### Legacy workflow compatibility
-
-| Workflow | Status | Notes |
-| --- | --- | --- |
-| `load-raw`/`run` (legacy full-manifest CSV) | **Fully compatible, unchanged.** | `raw_loader.py` untouched; `raw_row`/`_snapshot_id`/etc. columns untouched; `ingestion_runs`/`table_loads` untouched. |
-| `extract`/`load`/`sync --storage filesystem` (local-filesystem paginated) | **Fully compatible, unchanged.** | `pagination.py`/`paginated_loader.py` untouched; `ops.source_watermarks` remains its sole cursor source. |
-| `extract`/`load`/`sync --storage object-storage` (this change) | **New, additive.** | Opt-in via `--storage object-storage`; default remains `filesystem`. |
-| dbt staging models | **Compatible via explicit coalesce.** | `coalesce(_raw_payload, raw_row)` -- see "Raw metadata definitions" above; both loaders' rows normalize identically. |
-| `RAW_SCHEMA`/`OPS_SCHEMA` overrides | **Compatible.** | An explicit override continues to work exactly as before; only the DEFAULT value changed -- see `docs/RUNBOOK.md` "Upgrade notes". |
+- Mechanism: **Verified**, `src/tuva_ingest/validators.py`, applied at **load** time (extraction remains an unmodified, byte-for-byte mirror of what the source sent -- see Section 4). Every record is checked against a narrow, structural-only contract derived directly from Section 3's documented record grain: `eligibility` requires a non-blank string `person_id`; `medical_claim`/`pharmacy_claim` require a non-blank string `claim_id` and a scalar `claim_line_number`; any populated known date field must be recognizably date-shaped. **Decision:** this connector never invents a clinical/business rule here, and a null/absent *optional* field is never grounds for quarantine.
+- Reason codes: **Decision**, a fixed allowlist (`record_not_object`, `missing_required_field`, `invalid_required_type`, `invalid_identifier`, `invalid_date_format`, `schema_validation_failed`), enforced both in application code and by a database `CHECK` constraint (`migrations/006_record_quarantine.sql`).
+- Storage and access: **Verified.** A structurally invalid record is written to `ingest_ops.quarantined_records` (PHI-bearing) and is never also loaded into its endpoint's raw table. Access is more restrictive than the raw schema: `PUBLIC` and `TRANSFORM_ROLE` have no access at all; `INGEST_ROLE` is granted `INSERT` only, never `SELECT`/`UPDATE`/`DELETE`. No operational "quarantine review" role exists in this repository's role model yet -- see `docs/RUNBOOK.md` "Quarantined records".
+- Reconciliation interaction: **Verified**, extends Section 14's three-way check to a required identity: `source_record_count == raw_loaded_count + quarantined_count`. `quarantined_count` is computed from the connector's own deterministic, idempotent classification pass over the immutable page files on every call -- never a `SELECT` against the quarantine table, consistent with its INSERT-only grant.
+- What this does *not* cover: **Unverified/out of scope.** Clinical or business-rule validity (a syntactically valid but clinically implausible diagnosis code, an out-of-range paid amount, a claim referencing a member not present in eligibility) is not checked here -- that remains a downstream (dbt staging/DQ) concern, unchanged by this section.
 
 ## Readiness
 
-Extraction **may proceed** for the generic, already-implemented mechanisms themselves -- both the paginated JSON envelope/watermark/reconciliation contract (Sections 1-4, 6, 14; `secrets.py`, `pagination.py`, `paginated_loader.py`, `state.get_watermark`/`commit_watermark`) and the legacy manifest/snapshot mechanism (`api_client.py`, `manifest.py`, `extract.py`, `raw_loader.py`), plus the retry policy (Section 5), the composite dedup-key strategy (Section 11), and the conservative PHI handling (Section 13), are already built and tested (`tests/unit/`, `tests/integration/`).
+Extraction **may proceed** for the generic, already-implemented mechanisms themselves -- both the paginated JSON envelope/watermark/reconciliation contract (Sections 1-4, 6, 14; `secrets.py`, `pagination.py`, `paginated_loader.py`, `state.get_watermark`/`commit_watermark`) and the legacy manifest/snapshot mechanism (`api_client.py`, `manifest.py`, `extract.py`, `raw_loader.py`), plus the retry/timeout policy including OAuth's single-shot 401 recovery (Section 2, 5), the structural validation/quarantine safeguard (Section 15), the composite dedup-key strategy (Section 11), and the conservative PHI handling (Section 13), are already built and tested (`tests/unit/`, `tests/integration/`).
 
 Extraction against a **real, specific external vendor is blocked** until all of the following are resolved for that vendor:
 
@@ -584,4 +249,4 @@ This repository has no `CODEOWNERS` file or other documented team-ownership conv
 
 ## Last verified
 
-2026-08-17, against the state of this repository after adding the object-storage-backed ingestion path (`src/tuva_ingest/object_storage/`, `object_extract.py`, `object_raw_loader.py`, `endpoint_contract.py`, `schema_observation.py`, `migrations/006_object_storage_raw_contract.sql`). Re-verify this document (and update this date) whenever `src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state,secrets,pagination,paginated_loader,object_storage/,object_extract,object_raw_loader,endpoint_contract,schema_observation}.py`, `docs/API_MANIFEST.md`, or the connected upstream source changes.
+2026-08-16, against the state of this repository after adding the shared bounded-retry policy, OAuth client-credentials support, structural record quarantine, and hardened pagination safety limits (`src/tuva_ingest/{retry,oauth,validators,quarantine}.py`, `migrations/006_record_quarantine.sql`) on top of the paginated extraction/secret-manager/watermark mechanism (`src/tuva_ingest/{secrets,pagination,paginated_loader}.py`, `migrations/005_paginated_extraction_state.sql`). Re-verify this document (and update this date) whenever `src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state,secrets,pagination,paginated_loader,retry,oauth,validators,quarantine}.py`, `docs/API_MANIFEST.md`, or the connected upstream source changes.

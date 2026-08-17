@@ -9,14 +9,23 @@
 # targets and README.md's "Local development" section for the full
 # walkthrough):
 #
-#   make local-db-ready     # start postgres, wait for health
-#   make local-migrate      # apply operational migrations (001-004)
+#   make local-db-ready     # start postgres + minio, wait for health
+#   make local-migrate      # apply operational migrations (001-006)
 #   make local-dbt-deps     # fetch the pinned Tuva 0.18.0 package
 #   make local-extract      # pull a snapshot via the ingestion API client
 #   make local-load-raw     # load the snapshot into the raw schema
 #   make local-dbt-build    # build+test staging -> Input Layer -> Tuva
 #   make local-db-down      # stop containers, KEEP the data volume
 #   make local-db-reset     # DESTRUCTIVE: drop the local data volume too
+#
+# `minio` is a disposable, local-only S3-compatible object store so the
+# object-storage-backed extract/load path (OBJECT_STORAGE_PROVIDER=s3,
+# OBJECT_STORAGE_ENDPOINT_URL=http://minio:9000 -- see
+# src/tuva_ingest/object_storage/s3.py) can be exercised end to end
+# without any real cloud credentials. It is entirely optional: every
+# `local-db-*`/`local-*` target above still works with
+# OBJECT_STORAGE_PROVIDER=local (the default -- see config.py), which
+# never touches minio at all.
 #
 # Equivalent raw `docker compose` commands, if you'd rather not go
 # through make:
@@ -33,6 +42,9 @@
 # vendor-agnostic and this repo does not assume a specific upstream
 # host. Neither `docker compose up` (bare) nor any `local-db-*` target
 # ever requires TUVA_API_MANIFEST_URL/TUVA_API_TOKEN.
+#
+#   docker compose up -d minio                        # start the local S3-compatible store
+#   docker compose run --rm minio-mc mb local/tuva-raw # create the local dev bucket (idempotent)
 
 x-tuva-build: &tuva-build
   context: .
@@ -44,10 +56,31 @@ x-tuva-build: &tuva-build
 # (see the POSTGRES_* block below), never production configuration.
 x-tuva-db-env: &tuva-db-env
   PG_DSN: postgresql://tuva_local:local-only-example-password-change-me@postgres:5432/tuva
-  RAW_SCHEMA: raw
-  OPS_SCHEMA: ingest_ops
+  RAW_SCHEMA: raw_incoming
+  OPS_SCHEMA: ops
+  STAGING_SCHEMA: staging_incoming
   INPUT_LAYER_SCHEMA: input_layer
+  ANALYTICS_CORE_SCHEMA: analytics_core
+  ANALYTICS_MARTS_SCHEMA: analytics_marts
   SOURCE_NAME: tuva
+
+# Local-only S3-compatible object storage settings -- OPT-IN, only used
+# by services that explicitly set OBJECT_STORAGE_PROVIDER=s3 (none do by
+# default; see the `ingest` service below, which defaults to
+# OBJECT_STORAGE_PROVIDER=local and never touches minio). No static
+# AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY here on purpose --
+# object_storage/s3.py authenticates via boto3's ambient credential
+# chain, so MINIO_ROOT_USER/MINIO_ROOT_PASSWORD below are supplied to
+# boto3 as ordinary AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY environment
+# variables (boto3's own ambient-credential mechanism, not a
+# connector-specific setting) only for this disposable local stack.
+x-tuva-minio-env: &tuva-minio-env
+  OBJECT_STORAGE_PROVIDER: s3
+  OBJECT_STORAGE_BUCKET: tuva-raw-local
+  OBJECT_STORAGE_ENDPOINT_URL: http://minio:9000
+  OBJECT_STORAGE_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: tuva-local-minio
+  AWS_SECRET_ACCESS_KEY: local-only-example-minio-secret-change-me
 
 x-tuva-dbt-env: &tuva-dbt-env
   PGHOST: postgres
@@ -92,9 +125,48 @@ services:
     # `always`, and this is explicitly not a production restart policy).
     restart: on-failure
 
-  # One-shot migration runner: applies migrations/001_operational_schemas.sql,
-  # 002_ingestion_control.sql, 003_roles_and_grants.sql, and
-  # 004_endpoint_scoped_ingestion.sql (see
+  # Disposable, local-only S3-compatible object store (see
+  # x-tuva-minio-env above and src/tuva_ingest/object_storage/s3.py).
+  # Entirely optional -- `docker compose up` (bare) does not depend on
+  # this service; start it explicitly (`docker compose up -d minio`)
+  # only when exercising OBJECT_STORAGE_PROVIDER=s3 locally.
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    environment:
+      MINIO_ROOT_USER: tuva-local-minio
+      MINIO_ROOT_PASSWORD: local-only-example-minio-secret-change-me
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      # Loopback-only, same convention as postgres above. 9000: S3 API.
+      # 9001: web console (local development convenience only).
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: on-failure
+
+  # One-shot: creates the local dev bucket (idempotent -- `mb --ignore-existing`).
+  # `docker compose run --rm minio-mc mb local/tuva-raw-local`
+  minio-mc:
+    image: minio/mc:RELEASE.2024-01-13T11-05-29Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 tuva-local-minio local-only-example-minio-secret-change-me &&
+        mc mb --ignore-existing local/tuva-raw-local
+    restart: "no"
+
+  # One-shot migration runner: applies migrations/001_operational_schemas.sql
+  # through 006_object_storage_raw_contract.sql (see
   # src/tuva_ingest/migrations.py) against the local database, then
   # exits. Never creates or touches Tuva-managed core/terminology/output
   # schemas -- only the raw and operational-control namespaces (see
@@ -142,7 +214,7 @@ services:
       [
         "build",
         "--vars",
-        "{raw_schema: raw, input_layer_schema: input_layer, claims_enabled: true}",
+        "{raw_schema: raw_incoming, staging_schema: staging_incoming, input_layer_schema: input_layer, analytics_core_schema: analytics_core, analytics_marts_schema: analytics_marts, claims_enabled: true}",
       ]
     restart: "no"
 
@@ -183,3 +255,4 @@ volumes:
   pgdata:
   raw-data:
   dbt-packages:
+  minio-data:

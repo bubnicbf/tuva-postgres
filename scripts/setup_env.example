@@ -10,11 +10,38 @@
 
 # --- PostgreSQL -------------------------------------------------------
 export PG_DSN="postgresql://tuva_local:local-only-example-password-change-me@127.0.0.1:5432/tuva"
-export RAW_SCHEMA="raw"
-export OPS_SCHEMA="ingest_ops"
+# Six-schema lineage (see docs/SOURCE_CONTRACT.md "Schema lineage"):
+# ops -> raw_incoming -> staging_incoming -> input_layer -> analytics_core/
+# analytics_marts. NOTE: these defaults changed from raw/ingest_ops as
+# part of adding object storage -- an EXISTING deployment that never set
+# RAW_SCHEMA/OPS_SCHEMA explicitly must set them to its CURRENT values
+# (raw/ingest_ops) here to keep reading its existing data; see
+# docs/RUNBOOK.md "Upgrade notes".
+export RAW_SCHEMA="raw_incoming"
+export OPS_SCHEMA="ops"
+export STAGING_SCHEMA="staging_incoming"
 export INPUT_LAYER_SCHEMA="input_layer"
+export ANALYTICS_CORE_SCHEMA="analytics_core"
+export ANALYTICS_MARTS_SCHEMA="analytics_marts"
 export INGEST_ROLE="tuva_ingest_role"
 export TRANSFORM_ROLE="tuva_transform_role"
+
+# --- Object storage (src/tuva_ingest/object_storage/) ------------------
+# The durable, immutable, replayable source of truth for extracted
+# source pages -- see docs/SOURCE_CONTRACT.md "Object storage".
+# "local" (default): a real-file-I/O local backend for development/CI,
+#   never a production object store. "s3": AWS S3 or any S3-compatible
+#   endpoint (set OBJECT_STORAGE_ENDPOINT_URL for MinIO -- see
+#   compose.yml's `minio` service). No static access-key/secret-key
+#   setting here on purpose -- authentication is always boto3's ambient
+#   credential chain (an IAM role, AWS_PROFILE, or a local developer
+#   profile); see object_storage/s3.py.
+export OBJECT_STORAGE_PROVIDER="local"
+export OBJECT_STORAGE_BUCKET=""
+export OBJECT_STORAGE_PREFIX="raw"
+export OBJECT_STORAGE_REGION=""
+export OBJECT_STORAGE_ENDPOINT_URL=""
+export OBJECT_STORAGE_LOCAL_ROOT="data/object_storage"
 
 # --- Ingestion API (leave unset for migrate/healthcheck-only workflows) --
 # TUVA_API_MANIFEST_URL is the page-request URL for `extract`/`sync`

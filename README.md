@@ -23,31 +23,50 @@ tables are created and owned entirely by the pinned dbt package.
   extract.py, api_client.py   raw_loader.py                                      models/final/
 ```
 
-1. **Extract** (`tuva-ingest extract`) -- fetches and validates a
-   versioned JSON manifest (see `docs/API_MANIFEST.md`) describing one
-   snapshot's per-table CSV artifacts, downloads each one
-   (checksum-verified, retried, bearer-authenticated), and publishes
-   the snapshot atomically under `RAW_DATA_DIR`. A partial download can
-   never appear complete to a later step.
-2. **Load raw** (`tuva-ingest load-raw`) -- loads the published
-   snapshot into the configured raw schema (`RAW_SCHEMA`, default
-   `raw`) only. Every row is stored as a single `raw_row jsonb` column
-   plus fixed metadata columns (`_snapshot_id`, `_source_row_number`,
-   `_loaded_at`) -- no type coercion, renaming, or business logic
-   happens here, so the raw layer is a faithful, replayable copy of
-   exactly what the source sent.
-3. **dbt** (`tuva-ingest dbt -- <args>`) -- `models/staging/*.sql`
+1. **Extract** (`tuva-ingest extract --endpoint <name> [--since <date>]`)
+   -- fetches and validates a versioned JSON manifest scoped to exactly
+   one endpoint (see `docs/API_MANIFEST.md`; for the full operational
+   source contract -- auth, pagination, rate limits, incremental/
+   mutability semantics, PHI, reconciliation -- see
+   `docs/SOURCE_CONTRACT.md`), downloads that one artifact
+   (checksum-verified, bounded-retried via `httpx` + `tenacity`,
+   bearer-authenticated), and publishes the snapshot atomically under
+   `RAW_DATA_DIR`. A partial download can never appear complete to a
+   later step. Prints a JSON result including a stable `run_id` (see
+   "Run IDs" below).
+2. **Load** (`tuva-ingest load --run-id <value>`) -- resolves the exact
+   extraction `extract` published, verifies its success marker and
+   checksums, and transactionally loads only that one endpoint's raw
+   table (`RAW_SCHEMA`, default `raw`) -- never truncating or touching
+   any other raw table. Every row is stored as a single `raw_row jsonb`
+   column plus fixed metadata columns (`_snapshot_id`,
+   `_source_row_number`, `_loaded_at`) -- no type coercion, renaming, or
+   business logic happens here, so the raw layer is a faithful,
+   replayable copy of exactly what the source sent. Safe to repeat for
+   the same `run_id` (idempotent).
+3. **Sync** (`tuva-ingest sync --endpoint <name> [--since <date>]`) --
+   `extract` then `load`, for one endpoint, in a single command. Stops
+   immediately (nonzero exit, `load` never attempted) if `extract`
+   fails.
+4. **dbt** (`tuva-ingest dbt -- <args>`) -- `models/staging/*.sql`
    types and normalizes the raw JSONB into typed columns;
    `models/final/{eligibility,medical_claim,pharmacy_claim}.sql`
    expose the Tuva Input Layer contract those staging models feed. dbt
    never writes back into the raw schema.
-4. **Tuva package** -- pinned to exactly `0.18.0`
+5. **Tuva package** -- pinned to exactly `0.18.0`
    (`packages.yml`), `ref()`s this project's Input Layer models by
    name and builds its own core/terminology/mart models on top of
    them, in its own schema(s). This repository never vendors or
    duplicates any of that package's model files.
 
 Source data is never loaded directly into any Tuva-managed schema.
+
+**Legacy full-pipeline commands** (`tuva-ingest run`, and
+`tuva-ingest load-raw`, which `run` calls internally) still fetch and
+load all three raw tables from a single manifest in one call each --
+kept, documented, and tested for backward compatibility (see "Backward
+compatibility" below). The `extract`/`load`/`sync` commands above are the
+current, endpoint-scoped way to operate this connector.
 
 ## Prerequisites
 
@@ -58,47 +77,75 @@ Source data is never loaded directly into any Tuva-managed schema.
 - Network access to dbt Hub (for `dbt deps`, which fetches the pinned
   Tuva package) when you actually run dbt
 
+## Dependency choices
+
+| Concern | Library |
+| --- | --- |
+| HTTP client (manifest fetch, streaming artifact downloads) | [`httpx`](https://www.python-httpx.org/) -- a reusable, explicitly-timed-out, synchronous `httpx.Client` |
+| Bounded retries | [`tenacity`](https://tenacity.readthedocs.io/) -- explicit `stop_after_attempt`/custom bounded-backoff `wait`, never an unbounded loop |
+| Configuration | [`pydantic-settings`](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) -- environment-driven, typed, validated, with `SecretStr` for credentials |
+| PostgreSQL driver | [`psycopg`](https://www.psycopg.org/psycopg3/) 3, parameterized queries + `psycopg.sql`/validated identifier helpers for dynamic SQL |
+| Structured logging | stdlib `logging` + `json` (see `src/tuva_ingest/logging_utils.py`) -- no extra dependency |
+| dbt orchestration | `dbt-core`/`dbt-postgres`, shelled out to via `tuva-ingest dbt -- <args>` |
+| Testing | `pytest`, `httpx.MockTransport` (no live server, no real network) |
+
+`requests` (and its `types-requests` type-stub dependency) have been
+fully removed -- `httpx` is now the only HTTP client dependency.
+
 ## Quick start
 
 ```bash
 git clone <this repo> && cd tuva-postgres
 make init                      # uv sync --locked; installs pre-commit; copies .env template
 # edit .env: at minimum PG_DSN, and TUVA_API_MANIFEST_URL/TUVA_API_TOKEN
-# if you plan to run `extract`/`run` against a real manifest endpoint
+# if you plan to run `extract`/`sync` against a real manifest endpoint
 
 make local-db-ready            # starts a local disposable Postgres (docker compose) and migrates it
-make migrate-status            # read-only: confirm 001-003 are applied
+make migrate-status            # read-only: confirm 001-004 are applied
 
-make extract                   # fetch + publish a raw snapshot (requires TUVA_API_MANIFEST_URL/TOKEN)
-make load-raw                  # load the published snapshot into RAW_SCHEMA
+# Endpoint-scoped extract -> load (the current, recommended workflow):
+uv run tuva-ingest extract --endpoint medical-claims --since 2025-01-01
+# -> prints {"event": "extract", "run_id": "...", "endpoint": "medical-claims", ...}
+uv run tuva-ingest load --run-id 019...            # the run_id extract printed
+# ...or do both in one command:
+uv run tuva-ingest sync --endpoint medical-claims --since 2025-01-01
+
 make dbt-deps                  # fetch the pinned Tuva 0.18.0 package
 make dbt-build                 # staging -> Input Layer -> Tuva's own models, plus dbt tests
 
 make health                    # DB connectivity + migration state + last-successful-run freshness
 ```
 
-Or run the whole pipeline in one command once `.env` is populated:
+Or run the whole legacy full-manifest pipeline in one command once `.env`
+is populated (see "Backward compatibility" below):
 
 ```bash
-make run   # migrate -> extract -> load-raw -> dbt deps -> dbt build
+make run   # migrate -> extract (all 3 tables) -> load-raw -> dbt deps -> dbt build
 ```
 
 ## Configuration
 
 Every setting is an environment variable, loaded and validated by
-`src/tuva_ingest/config.py`'s `IngestConfig.load()` -- see
-`scripts/setup_env.example` for the full list with safe local
-defaults. `make init` copies it to `.env` (git-ignored) for you.
+`src/tuva_ingest/config.py`'s `IngestConfig` -- a `pydantic-settings`
+`BaseSettings` subclass, constructed via `IngestConfig.load(required=...)`
+(never the bare pydantic constructor) -- see `scripts/setup_env.example`
+for the full list with safe local defaults. `make init` copies it to
+`.env` (git-ignored) for you; `IngestConfig` reads real process
+environment variables first, then that `.env` file if present, then each
+field's own default (standard `pydantic-settings` precedence).
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `PG_DSN` | PostgreSQL connection string | *(required)* |
+| `PG_DSN` | PostgreSQL connection string (`SecretStr`) | *(required for DB commands)* |
 | `RAW_SCHEMA` | Raw landing schema (never Tuva-managed) | `raw` |
 | `OPS_SCHEMA` | Operational/control schema (run/table-load history) | `ingest_ops` |
 | `INPUT_LAYER_SCHEMA` | Schema dbt materializes `models/final/*.sql` into | `input_layer` |
 | `INGEST_ROLE` / `TRANSFORM_ROLE` | Least-privilege role names (see `migrations/003_roles_and_grants.sql`) | `tuva_ingest_role` / `tuva_transform_role` |
-| `TUVA_API_MANIFEST_URL` / `TUVA_API_TOKEN` | Manifest endpoint + bearer token (see `docs/API_MANIFEST.md`) | *(required for `extract`/`run`)* |
-| `TUVA_API_TIMEOUT_SECONDS` / `TUVA_API_MAX_RETRIES` | HTTP client bounds | `30` / `5` |
+| `TUVA_API_MANIFEST_URL` / `TUVA_API_TOKEN` | Manifest endpoint + bearer token (`SecretStr`; see `docs/API_MANIFEST.md`) | *(required for `extract`/`sync`/`run`)* |
+| `TUVA_API_TIMEOUT_SECONDS` | Fallback httpx timeout (all phases) | `30` |
+| `TUVA_API_CONNECT_TIMEOUT_SECONDS` / `TUVA_API_READ_TIMEOUT_SECONDS` / `TUVA_API_WRITE_TIMEOUT_SECONDS` / `TUVA_API_POOL_TIMEOUT_SECONDS` | Per-phase httpx timeout overrides (optional; each falls back to `TUVA_API_TIMEOUT_SECONDS`) | unset |
+| `TUVA_API_MAX_RETRIES` | Max additional attempts after the first (bounded; never unbounded) | `5` |
+| `TUVA_API_MAX_RETRY_DELAY_SECONDS` | Hard ceiling on any single retry sleep, including a `Retry-After` value | `30` |
 | `TUVA_API_ALLOW_INSECURE_HTTP` | Allow `http://` manifest/artifact URLs (local mock servers only) | `0` |
 | `RAW_DATA_DIR` | Local extraction/snapshot directory | `data/raw` |
 | `SOURCE_NAME` | Top-level directory name under `RAW_DATA_DIR` | `tuva` |
@@ -106,11 +153,130 @@ defaults. `make init` copies it to `.env` (git-ignored) for you.
 | `PIPELINE_ENVIRONMENT` / `PIPELINE_MAX_SUCCESS_AGE_HOURS` | Healthcheck freshness window | `local` / `30` |
 | `LOG_LEVEL` | Structured JSON log level | `INFO` |
 
-`IngestConfig.load()` fails fast with every problem listed at once
-(never just the first), validates every dynamic schema/role name
-against a single shared identifier policy (`src/tuva_ingest/identifiers.py`)
-before any SQL is composed, and never includes `PG_DSN`/`TUVA_API_TOKEN`
-in `repr()`, logs, or `safe_dict()` output.
+`IngestConfig.load(required=...)` fails fast with every problem listed at
+once (never just the first) -- combining pydantic's own type/range/
+identifier validation (every dynamic schema/role name is validated
+against a single shared identifier policy,
+`src/tuva_ingest/identifiers.py`, via a pydantic field validator, before
+any SQL is composed) with command-scoped required-field checks (e.g. a
+command that only needs PostgreSQL, like `migrate`/`healthcheck`, never
+requires `TUVA_API_TOKEN`). `PG_DSN` and `TUVA_API_TOKEN` are
+`pydantic.SecretStr` -- never a plain `str` -- so `repr()`, `str()`,
+pydantic's own validation-error rendering, and `IngestConfig.safe_dict()`
+can never accidentally include the real value; call `.pg_dsn_value` /
+`.api_token_value` explicitly at the one point an actual connection/
+request needs the real value.
+
+## `extract` / `load` / `sync`: endpoints, run IDs, retries, JSON output
+
+### Endpoint names
+
+| `--endpoint` | Raw table | Tuva Input Layer model |
+| --- | --- | --- |
+| `medical-claims` | `medical_claim` | `models/final/medical_claim.sql` |
+| `pharmacy-claims` | `pharmacy_claim` | `models/final/pharmacy_claim.sql` |
+| `eligibility` | `eligibility` | `models/final/eligibility.sql` |
+
+(`src/tuva_ingest/endpoints.py` is the single source of truth for this
+mapping.) `--endpoint` is required for `extract`/`sync` and restricted to
+these three values -- an unknown endpoint, or a malformed `--since`
+(anything other than `YYYY-MM-DD`), is rejected locally before any HTTP
+request is made.
+
+### Run IDs
+
+A successful `extract` reuses the manifest's own immutable `snapshot_id`
+as the run id -- printed as `run_id` in its JSON result. Because the
+on-disk snapshot layout (`RAW_DATA_DIR/<source>/<snapshot_id>/`) is
+already keyed by that same value, `tuva-ingest load --run-id <value>`
+can always resolve it directly from disk after the `extract` process has
+exited, with no separate database lookup or run-id-to-snapshot mapping
+to keep in sync. `load` verifies the run's `_SUCCESS` marker and
+per-table checksums before loading, and is safe/deterministic to call
+again for the same `run_id` (see "Failure recovery and idempotency"
+below).
+
+### Retry and timeout behavior
+
+`src/tuva_ingest/api_client.py`'s `ApiClient` (a reusable `httpx.Client`)
+retries only genuinely transient failures, via `tenacity`:
+
+* httpx connection/timeout errors (`httpx.NetworkError`, `httpx.TimeoutException`)
+* HTTP `429`
+* HTTP `500`, `502`, `503`, `504`
+
+Ordinary client errors (`400`, `401`, `403`, `404`), validation failures,
+and checksum failures are **never** retried. Retries are bounded by
+`TUVA_API_MAX_RETRIES` (never unbounded) with exponential backoff and
+jitter, honoring a valid `Retry-After` header -- but every sleep,
+whichever source produced it, is capped at
+`TUVA_API_MAX_RETRY_DELAY_SECONDS`. Connect/read/write/pool timeouts are
+each independently configurable (`TUVA_API_CONNECT_TIMEOUT_SECONDS` etc.,
+falling back to `TUVA_API_TIMEOUT_SECONDS`). Redirects are never followed
+(`follow_redirects=False`) -- a manifest/artifact URL redirecting to an
+unexpected host must never silently receive this client's bearer token.
+
+### JSON output and logging
+
+`extract`/`load`/`sync` each print exactly one JSON object to stdout on
+success:
+
+```bash
+$ uv run tuva-ingest extract --endpoint medical-claims --since 2025-01-01
+{"endpoint": "medical-claims", "event": "extract", "path": "data/raw/tuva/019...", "run_id": "019...", "since": "2025-01-01", "status": "succeeded", "table": "medical_claim"}
+
+$ uv run tuva-ingest load --run-id 019...
+{"endpoint": "medical-claims", "event": "load", "path": "data/raw/tuva/019...", "row_count": 4213, "run_id": "019...", "since": "2025-01-01", "status": "succeeded", "table": "medical_claim"}
+```
+
+Human-readable diagnostics (progress, retries) go to structured JSON log
+lines (also on stdout, one line per event -- see below) or to stderr for
+fatal errors; a caller scripting against `tuva-ingest` should parse only
+the final stdout line as the command's result. Every failure -- a
+validation error, an HTTP failure, a checksum mismatch, a database
+error -- is a nonzero exit code with a single sanitized stderr line
+(`ERROR [<category>]: <message>`); `sync` never prints a success result
+after a partial failure (`extract` failing stops it before `load` is ever
+attempted).
+
+Every log line is one JSON object (`src/tuva_ingest/logging_utils.py`),
+UTC ISO-8601 timestamped, with `event`/`level`/`app_version` always
+present and `run_id`/`endpoint`/`stage`/`duration_ms`/`table`/
+`error_category`/`error_message` where applicable:
+
+```json
+{"app_version": "0.1.0", "endpoint": "medical-claims", "event": "artifact_download_completed", "duration_ms": 842.1, "level": "INFO", "run_id": "019...", "table": "medical_claim", "timestamp": "2026-08-16T14:03:02.114000Z"}
+```
+
+`TUVA_API_TOKEN`/`PG_DSN`/`Authorization` header values are never present
+in any log line, JSON result, or exception message (see "Security"
+below).
+
+## Backward compatibility
+
+`extract`/`load`/`sync` are the current, endpoint-scoped commands. Every
+previously existing command still works, unchanged, and is tested for
+compatibility (`tests/unit/test_cli.py`'s `TestBuildParser`,
+`tests/integration/test_pipeline_integration.py`):
+
+| Command | Status | Behavior |
+| --- | --- | --- |
+| `tuva-ingest migrate` | unchanged | apply/inspect operational migrations |
+| `tuva-ingest dbt -- <args>` | unchanged | shell out to `dbt` with this connector's vars/target |
+| `tuva-ingest healthcheck` | unchanged | DB connectivity + migration state + run freshness |
+| `tuva-ingest run` | legacy, retained | full pipeline: fetch a manifest for all three tables in one request -> load all three -> `dbt deps` -> `dbt build` |
+| `tuva-ingest load-raw [--snapshot-id ...]` | legacy, retained | load a full (all-three-table) snapshot into the raw schema; defaults to the `current` published snapshot |
+| `tuva-ingest extract` (no `--endpoint`) | **removed** -- `--endpoint` is now required | use `tuva-ingest run` for the equivalent full-manifest extraction, or `extract --endpoint <name>` for one endpoint |
+
+`load --run-id` and `load-raw` are deliberately separate commands, not
+one command with inferred behavior: `load --run-id` only ever resolves
+an endpoint-scoped `extract` run (one table); `load-raw` only ever
+resolves a full, all-three-table manifest snapshot (from `extract`
+without `--endpoint`, which no longer exists as a CLI form, or from a
+`run` in progress). Pointing `load --run-id` at a legacy snapshot -- or
+`load-raw` at an endpoint-scoped one -- fails loudly
+(`RunNotFoundError`) rather than silently loading the wrong shape of
+data.
 
 ## Local PostgreSQL (Docker Compose)
 
@@ -130,16 +296,21 @@ make local-db-reset     # DESTRUCTIVE: also drops the data volume
 ## Migrations
 
 `migrations/001_operational_schemas.sql`, `002_ingestion_control.sql`,
-and `003_roles_and_grants.sql` are the only DDL this repository owns:
-the raw and operational-control schemas, run/table-load bookkeeping
-tables, and least-privilege role grants. They are checksum-tracked
+`003_roles_and_grants.sql`, and `004_endpoint_scoped_ingestion.sql` are
+the only DDL this repository owns: the raw and operational-control
+schemas, run/table-load bookkeeping tables, least-privilege role grants,
+and (004) the `endpoint`/`requested_since` columns on `ingestion_runs`
+plus the unique index on `table_loads (run_id, table_name)` that makes
+`tuva-ingest load --run-id ...` safe to repeat. They are checksum-tracked
 (`src/tuva_ingest/migrations.py`), applied at most once each, and
 rerunning `tuva-ingest migrate` against an already-migrated database is
 always a true no-op. Dynamic identifiers (schema/role names) use
 psql-style `:"name"` substitution, validated against the same shared
 identifier policy every other dynamic-SQL call site uses -- see
 `migrations.py`'s module docstring for why static SQL alone can't
-express this.
+express this. Migrations are immutable once applied -- 004 only adds
+nullable columns and a new index; it never rewrites 001-003, and any
+future change is a new, forward-only, numbered migration file.
 
 ## dbt project
 
@@ -199,9 +370,15 @@ make ci-full            # quality + dbt parse/deps + the full integration suite
 make pipeline           # the complete, stop-on-first-failure validation order below
 ```
 
-`tests/unit/` fakes or mocks every I/O boundary (an in-process
-`http.server` for the API client, fake psycopg connections for
-SQL-composition tests) so it never touches a real database or network.
+`tests/unit/` fakes or mocks every I/O boundary (`httpx.MockTransport`
+for the API client -- no real socket, live server, or external API --
+fake psycopg connections for SQL-composition tests) so it never touches
+a real database or network. `tests/unit/test_config.py` covers
+`pydantic-settings` type/range/identifier validation and secret
+redaction; `tests/unit/test_endpoints.py` covers the `--endpoint` <->
+raw table mapping; `tests/unit/test_logging_utils.py` proves every
+emitted structured log line is valid JSON and that secrets never appear
+in it.
 `tests/unit/test_input_layer_contract.py` is also database-free and
 network-free, but specifically enforces the Input Layer contract at the
 file level by parsing `packages.yml`/`dbt_project.yml`/the model SQL/
@@ -327,35 +504,57 @@ where table_name in ('eligibility', 'medical_claim', 'pharmacy_claim');
 
 ## Failure recovery and idempotency
 
-- **Extraction**: a snapshot is only "published" once every artifact
-  is downloaded and verified and a `_SUCCESS` marker is written.
-  Re-extracting the exact same manifest is a safe no-op; re-extracting
-  a `snapshot_id` with *different* content is a loud failure, never a
-  silent overwrite.
-- **Raw loading**: each raw table is `TRUNCATE`d and reloaded from a
-  specific `snapshot_id` inside one transaction spanning all three
-  tables plus run bookkeeping -- retrying never duplicates rows, and a
-  failure partway through never leaves a partially-loaded snapshot
-  visible.
+- **Extraction**: a snapshot is only "published" once its artifact(s)
+  are downloaded and verified and a `_SUCCESS` marker is written.
+  Re-extracting the exact same manifest (same `--endpoint`/`--since`,
+  same `snapshot_id`) is a safe no-op; re-extracting a `snapshot_id`
+  with *different* content is a loud failure, never a silent overwrite.
+- **Endpoint-scoped loading** (`tuva-ingest load --run-id ...`): the
+  one named table is `TRUNCATE`d and reloaded inside one transaction
+  spanning that table plus run/table-load bookkeeping -- no other raw
+  table is ever truncated, queried, or written. Repeating
+  `load --run-id <same value>` is safe and deterministic:
+  `state.upsert_running_run`/`state.upsert_table_load_pending` reset
+  the existing `ingestion_runs`/`table_loads` rows for that `run_id`
+  back to `running`/`pending` (`ON CONFLICT ... DO UPDATE`, backed by
+  migrations/004's unique index) rather than erroring on a duplicate
+  primary key, and the TRUNCATE+COPY itself is naturally idempotent
+  (retrying never duplicates rows).
+- **Legacy full-manifest loading** (`tuva-ingest load-raw`): all three
+  raw tables are `TRUNCATE`d and reloaded from a specific `snapshot_id`
+  inside one transaction spanning all three tables plus run
+  bookkeeping -- retrying never duplicates rows, and a failure partway
+  through never leaves a partially-loaded snapshot visible.
 - **Migrations**: checksum-tracked and applied at most once;
   `apply_pending` takes a PostgreSQL advisory lock so concurrent runs
   never race.
 - **Run state**: `ingest_ops.ingestion_runs`/`table_loads` (see
-  `migrations/002_ingestion_control.sql`) record every run's stage,
-  status, row counts, and errors. A run can only leave `running`
-  exactly once (see `src/tuva_ingest/state.py`).
+  `migrations/002_ingestion_control.sql`, extended by
+  `migrations/004_endpoint_scoped_ingestion.sql`) record every run's
+  stage, status, endpoint, row counts, and errors. A run can only leave
+  `running` exactly once per attempt (see `src/tuva_ingest/state.py`).
 
 ## Security
 
 - Never commit `.env` or `profiles.yml` (both git-ignored).
-- `PG_DSN` and `TUVA_API_TOKEN` are never logged, printed, or included
-  in any error message (`src/tuva_ingest/logging_utils.py`'s
-  `sanitize_error`/`sanitize_text`).
+- `PG_DSN` and `TUVA_API_TOKEN` are `pydantic.SecretStr` in
+  `IngestConfig` -- never a plain `str` -- so `repr()`/`str()`/pydantic
+  validation-error output can never accidentally include the real
+  value; both are also never logged, printed, or included in any error
+  message via `src/tuva_ingest/logging_utils.py`'s
+  `sanitize_error`/`sanitize_text` (defense in depth on top of the
+  `SecretStr` type itself).
+- HTTPS is required by default for `TUVA_API_MANIFEST_URL`;
+  `TUVA_API_ALLOW_INSECURE_HTTP=1` is the one explicit, documented
+  escape hatch for local tests against a mock server.
+- Redirects are never followed by the httpx client
+  (`follow_redirects=False`) -- a manifest/artifact URL cannot silently
+  redirect this client's bearer token to an unexpected host.
 - Every dynamic schema/table/role identifier is validated against
   `src/tuva_ingest/identifiers.py`'s shared policy before it is ever
-  composed into SQL text; data values are always bound through
-  parameterized queries or psycopg's `COPY` protocol, never
-  interpolated.
+  composed into SQL text; data values (including `run_id`, `endpoint`,
+  and `since`) are always bound through parameterized queries or
+  psycopg's `COPY` protocol, never interpolated.
 - This connector never handles PHI in its own test fixtures
   (`tests/fixtures/*.csv` are synthetic).
 
@@ -420,8 +619,11 @@ where table_name in ('eligibility', 'medical_claim', 'pharmacy_claim');
 ## Repository layout
 
 ```
-src/tuva_ingest/     the connector: config, api_client, extract, raw_loader, state, migrations, cli
-migrations/           001-003: raw + operational schemas, run/table-load control, role grants
+src/tuva_ingest/     the connector: config (pydantic-settings), api_client (httpx+tenacity),
+                     endpoints (--endpoint <-> raw table mapping), extract, raw_loader, state,
+                     migrations, cli
+migrations/           001-004: raw + operational schemas, run/table-load control, role grants,
+                     endpoint-scoped ingestion metadata
 dbt_project.yml, packages.yml, profiles.example.yml, macros/, models/   the dbt project
 tests/unit/            database-free tests (including test_input_layer_contract.py's
                         file-level Input Layer contract checks)

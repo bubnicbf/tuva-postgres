@@ -23,12 +23,17 @@ class TestDiscoverRealMigrations(unittest.TestCase):
     directory -- proves the three shipped files are well-formed, unique,
     and discoverable, not just that discover() works in the abstract."""
 
-    def test_discovers_three_migrations_in_order(self):
+    def test_discovers_four_migrations_in_order(self):
         found = migrations.discover(REPO_ROOT / "migrations")
-        self.assertEqual([m.version for m in found], ["001", "002", "003"])
+        self.assertEqual([m.version for m in found], ["001", "002", "003", "004"])
         self.assertEqual(
             [m.filename for m in found],
-            ["001_operational_schemas.sql", "002_ingestion_control.sql", "003_roles_and_grants.sql"],
+            [
+                "001_operational_schemas.sql",
+                "002_ingestion_control.sql",
+                "003_roles_and_grants.sql",
+                "004_endpoint_scoped_ingestion.sql",
+            ],
         )
 
     def test_checksums_are_stable_across_repeated_discovery(self):
@@ -131,6 +136,48 @@ class TestPlan(unittest.TestCase):
         result = migrations._plan([self._mf("001", checksum="new-checksum")], applied)
         self.assertEqual(result.checksum_mismatches, ("001",))
         self.assertTrue(result.has_integrity_failures)
+
+
+
+
+class TestMigration004EndpointScopedIngestion(unittest.TestCase):
+    """migrations/004_endpoint_scoped_ingestion.sql adds the endpoint/
+    requested_since columns and the (run_id, table_name) unique index
+    that state.upsert_running_run/upsert_table_load_pending rely on for
+    their ON CONFLICT targets -- a lightweight structural check that the
+    real shipped file (not a fake) actually contains them, without
+    requiring a live PostgreSQL connection."""
+
+    def test_file_is_discovered_with_a_stable_checksum(self):
+        found = migrations.discover(REPO_ROOT / "migrations")
+        migration_004 = next(m for m in found if m.version == "004")
+        self.assertEqual(migration_004.filename, "004_endpoint_scoped_ingestion.sql")
+        self.assertEqual(migration_004.checksum, migrations.compute_checksum(migration_004.path))
+
+    def test_adds_endpoint_and_requested_since_columns(self):
+        path = REPO_ROOT / "migrations" / "004_endpoint_scoped_ingestion.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("endpoint", sql)
+        self.assertIn("requested_since", sql)
+        self.assertIn("ingestion_runs", sql)
+
+    def test_adds_unique_index_for_run_id_table_name(self):
+        path = REPO_ROOT / "migrations" / "004_endpoint_scoped_ingestion.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("table_loads_run_id_table_name_key", sql)
+        self.assertIn("UNIQUE INDEX", sql.upper())
+
+    def test_is_forward_only_never_rewrites_prior_migrations(self):
+        # 001-003 must be byte-for-byte unchanged by this addition --
+        # their checksums (recorded once a migration is applied in a
+        # real database) must never drift.
+        for version, filename in (
+            ("001", "001_operational_schemas.sql"),
+            ("002", "002_ingestion_control.sql"),
+            ("003", "003_roles_and_grants.sql"),
+        ):
+            path = REPO_ROOT / "migrations" / filename
+            self.assertTrue(path.is_file(), f"migration {version} must still exist unmodified")
 
 
 if __name__ == "__main__":

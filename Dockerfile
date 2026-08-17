@@ -16,7 +16,7 @@
 #      whatever package version compose/CI resolves against packages.yml.
 #
 # Build:   docker build -t tuva-ingest:local .
-# Extract: docker run --rm --env-file .env tuva-ingest:local extract
+# Extract: docker run --rm --env-file .env tuva-ingest:local extract --endpoint medical-claims
 # Health:  docker run --rm --env-file .env tuva-ingest:local healthcheck
 
 ARG PYTHON_VERSION=3.12.7

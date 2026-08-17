@@ -2,11 +2,27 @@
 [project.scripts]).
 
 Subcommands:
-  extract      fetch + validate the manifest and publish a raw snapshot
-  load-raw     load a published raw snapshot into the raw schema (default: current)
+  extract      fetch + validate a manifest for exactly one --endpoint
+               (optionally scoped by --since) and publish a raw snapshot
+               for it (see docs/API_MANIFEST.md, endpoints.py)
+  load         load a previously extracted run (--run-id, required) --
+               the exact snapshot `extract` published -- into that one
+               endpoint's raw table only; never touches any other raw
+               table. Safe/idempotent to repeat for the same --run-id.
+  sync         extract, then load, the same run, for one --endpoint;
+               stops immediately (nonzero exit, no load attempted) if
+               extraction fails
+  load-raw     load-raw *legacy* full-manifest snapshot (all three raw
+               tables in one manifest -- the pre-existing `extract`/
+               `run` flow with no --endpoint) into the raw schema
+               (default: current). Kept as a documented, tested,
+               backward-compatible command -- not superseded by `load`,
+               which only ever resolves an endpoint-scoped `extract`
+               run.
   migrate      apply pending operational migrations, or print status with --status
   dbt          run `dbt` against this project with the connector's vars/target wired in
-  run          full pipeline: extract -> load-raw -> dbt deps -> dbt build
+  run          full legacy pipeline: extract (full manifest, all three
+               tables) -> load-raw -> dbt deps -> dbt build
                --select tag:input_layer -> dbt build --select tag:dq_structural
                (each stage gates the next; see README.md "Validation order")
   healthcheck  verify DB connectivity, migration state, and run freshness
@@ -19,19 +35,30 @@ Exit codes: 0 on success, 1 for any handled `ConnectorError` (a clean,
 sanitized, single-line error to stderr -- see logging_utils.sanitize_error),
 and whatever a shelled-out `dbt`/`psql` subprocess itself returned for the
 `dbt`/`load-raw` commands.
+
+JSON output: `extract`/`load`/`sync` each print exactly one JSON object
+to stdout on success (fields include at least `event`, `run_id`,
+`endpoint`, `since`, `status`, and -- where applicable -- `row_count`/
+`path`); every human-readable diagnostic (progress, retries, errors)
+goes to stderr or the structured JSON log stream (also stdout, but one
+line per structured log event, never mixed into the single-line command
+result) -- see logging_utils.py. A caller scripting against `tuva-ingest`
+should parse only the final stdout line as the command's result.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 import uuid
+from datetime import date
 from pathlib import Path
 
 from . import __version__
-from .config import REQUIRE_API, REQUIRE_DB, REQUIRE_RAW_DATA, IngestConfig
-from .errors import ConnectorError
+from .config import ALL_REQUIREMENTS, REQUIRE_API, REQUIRE_DB, REQUIRE_RAW_DATA, IngestConfig
+from .errors import CliUsageError, ConnectorError, RawLoadError, RunNotFoundError
 from .logging_utils import configure_logging, log_event, sanitize_error
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -43,34 +70,217 @@ def _run_host_identity() -> str:
     return migrations.run_host_identity()
 
 
-def _cmd_extract(_args: argparse.Namespace) -> int:
+def _print_json(payload: dict) -> None:
+    """Emit exactly one JSON object to stdout -- the single stable,
+    machine-readable result of a successful `extract`/`load`/`sync`
+    invocation. Never includes a secret (nothing in `payload` is ever
+    sourced from config.safe_dict()-excluded fields -- see each caller)."""
+    print(json.dumps(payload, sort_keys=True, default=str))
+
+
+def _validate_endpoint(endpoint: str) -> str:
+    """Reject an unknown --endpoint before any HTTP request or SQL
+    statement is issued (see endpoints.table_for_endpoint)."""
+    from .endpoints import table_for_endpoint
+
+    table_for_endpoint(endpoint)
+    return endpoint
+
+
+def _validate_since(value: str | None) -> str | None:
+    """Reject a malformed --since before any HTTP request is issued.
+    Only a plain ISO-8601 calendar date (YYYY-MM-DD) is accepted --
+    never a datetime, never a relative expression -- matching the
+    manifest/API query-parameter contract (see extract.extract_endpoint_snapshot,
+    docs/API_MANIFEST.md)."""
+    if value is None:
+        return None
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise CliUsageError(f"--since {value!r} is not a valid ISO-8601 date (expected YYYY-MM-DD)") from None
+    return value
+
+
+# --- extract / load / sync (endpoint-scoped) --------------------------------
+
+
+def _build_api_client(config: IngestConfig, logger, *, run_id: str | None = None):
     from .api_client import ApiClient
-    from .extract import extract_snapshot
+
+    return ApiClient(
+        token=config.api_token_value or "",
+        timeout=config.httpx_timeout(),
+        max_retries=config.api_max_retries,
+        max_retry_delay_seconds=config.api_max_retry_delay_seconds,
+        logger=logger,
+        run_id=run_id,
+    )
+
+
+def _cmd_extract(args: argparse.Namespace) -> int:
+    from .extract import extract_endpoint_snapshot
+
+    endpoint = _validate_endpoint(args.endpoint)
+    since = _validate_since(args.since)
 
     config = IngestConfig.load(required=REQUIRE_API | REQUIRE_RAW_DATA)
     logger = configure_logging(config.log_level)
 
-    client = ApiClient(
-        token=config.api_token,
-        timeout_seconds=config.api_timeout_seconds,
-        max_retries=config.api_max_retries,
-        logger=logger,
-    )
+    client = _build_api_client(config, logger)
     try:
-        result = extract_snapshot(config, client, logger)
-        if result.skipped:
-            print(f"Snapshot {result.snapshot_id!r} is already published (identical content); nothing to do.")
-        print(str(result.path))
-        return 0
+        result = extract_endpoint_snapshot(config, client, logger, endpoint=endpoint, since=since)
     finally:
         client.close()
+
+    _print_json(
+        {
+            "event": "extract",
+            "run_id": result.run_id,
+            "endpoint": result.endpoint,
+            "table": result.table,
+            "since": result.since,
+            "status": "skipped" if result.skipped else "succeeded",
+            "path": str(result.path),
+        }
+    )
+    return 0
+
+
+def _run_load(run_id: str, *, config: IngestConfig, logger) -> dict:
+    """Resolve `run_id` to the exact published, endpoint-scoped extraction
+    it names, verify its success marker and checksums, and transactionally
+    load only that one endpoint's raw table -- never any other raw table
+    (see raw_loader.load_single_endpoint_snapshot). Safe/deterministic to
+    call again for the same `run_id` (see state.upsert_running_run/
+    state.upsert_table_load_pending).
+
+    Returns a JSON-able result dict on success. Raises a `ConnectorError`
+    subclass (`RunNotFoundError`, `RawLoadError`, ...) on any failure --
+    callers (both `_cmd_load` and `_cmd_sync`) let `main()` translate that
+    into a single sanitized stderr line and exit code 1, so `sync` can
+    never report success after a partial failure, and a caller never sees
+    a JSON "success" result for a run that actually failed.
+    """
+    from . import raw_loader, state
+    from .db import connect
+    from .endpoints import table_for_endpoint
+    from .extract import RawSnapshotStore
+
+    store = RawSnapshotStore(config.raw_data_dir, config.source_name)
+    if not store.is_published(run_id):
+        raise RunNotFoundError(
+            f"run_id {run_id!r} does not resolve to a published extraction under "
+            f"{store.snapshot_dir(run_id)} (missing _SUCCESS marker) -- run `tuva-ingest extract` first"
+        )
+
+    manifest = store.read_manifest(run_id)
+    checksums = store.read_checksums(run_id)
+    endpoint = manifest.get("_requested_endpoint")
+    since = manifest.get("_requested_since")
+    if endpoint is None:
+        raise RunNotFoundError(
+            f"run_id {run_id!r} is a legacy full-manifest snapshot (published by `extract` with no "
+            "--endpoint, or by `run`) -- use `tuva-ingest load-raw --snapshot-id ...` for it instead"
+        )
+    table = table_for_endpoint(endpoint)
+    snapshot_dir = store.snapshot_dir(run_id)
+
+    conn = connect(config.pg_dsn_value)
+    try:
+        state.upsert_running_run(
+            conn, config.ops_schema, run_id=run_id, source=config.source_name, snapshot_id=run_id,
+            endpoint=endpoint, requested_since=since, environment=config.pipeline_environment,
+            app_version=__version__, host=_run_host_identity(),
+        )
+        table_checksum = checksums.get(table, {})
+        state.upsert_table_load_pending(
+            conn, config.ops_schema, run_id, table=table,
+            expected_sha256=table_checksum.get("sha256", ""), expected_size_bytes=table_checksum.get("size_bytes", 0),
+        )
+
+        try:
+            row_count = raw_loader.load_single_endpoint_snapshot(conn, config, snapshot_dir, run_id, table, checksums)
+        except RawLoadError as exc:
+            conn.rollback()
+            state.mark_failed(conn, config.ops_schema, run_id, stage="load", error_category="raw_load", error_message=str(exc))
+            state.mark_table_load_failed(conn, config.ops_schema, run_id, table, error_message=str(exc))
+            raise
+
+        state.mark_table_load_succeeded(
+            conn, config.ops_schema, run_id, table, row_count=row_count,
+            actual_sha256=table_checksum.get("sha256", ""), actual_size_bytes=table_checksum.get("size_bytes", 0),
+        )
+        conn.commit()
+        state.mark_succeeded(conn, config.ops_schema, run_id, rows_loaded={table: row_count}, tables_loaded=[table])
+
+        log_event(logger, "raw_table_loaded", run_id=run_id, endpoint=endpoint, table=table, row_count=row_count)
+        return {
+            "event": "load",
+            "run_id": run_id,
+            "endpoint": endpoint,
+            "table": table,
+            "since": since,
+            "status": "succeeded",
+            "row_count": row_count,
+            "path": str(snapshot_dir),
+        }
+    finally:
+        conn.close()
+
+
+def _cmd_load(args: argparse.Namespace) -> int:
+    config = IngestConfig.load(required=REQUIRE_DB | REQUIRE_RAW_DATA)
+    logger = configure_logging(config.log_level)
+    result = _run_load(args.run_id, config=config, logger=logger)
+    _print_json(result)
+    return 0
+
+
+def _cmd_sync(args: argparse.Namespace) -> int:
+    from .extract import extract_endpoint_snapshot
+
+    endpoint = _validate_endpoint(args.endpoint)
+    since = _validate_since(args.since)
+
+    config = IngestConfig.load(required=ALL_REQUIREMENTS)
+    logger = configure_logging(config.log_level)
+
+    # Extraction failure must stop the pipeline immediately -- any
+    # exception here propagates straight out of _cmd_sync (never
+    # caught/swallowed), so main() reports it as a sanitized, nonzero-exit
+    # error and `_run_load` below is never reached.
+    client = _build_api_client(config, logger)
+    try:
+        extracted = extract_endpoint_snapshot(config, client, logger, endpoint=endpoint, since=since)
+    finally:
+        client.close()
+
+    load_result = _run_load(extracted.run_id, config=config, logger=logger)
+
+    log_event(logger, "sync_succeeded", run_id=extracted.run_id, endpoint=endpoint, table=extracted.table)
+    _print_json(
+        {
+            "event": "sync",
+            "run_id": extracted.run_id,
+            "endpoint": endpoint,
+            "table": extracted.table,
+            "since": since,
+            "status": "succeeded",
+            "row_count": load_result.get("row_count"),
+            "path": str(extracted.path),
+        }
+    )
+    return 0
+
+
+# --- legacy full-manifest commands (unchanged behavior) ----------------
 
 
 def _cmd_load_raw(args: argparse.Namespace) -> int:
     from . import raw_loader, state
     from .db import connect
     from .extract import RawSnapshotStore
-    from .errors import RawLoadError
 
     config = IngestConfig.load(required=REQUIRE_DB | REQUIRE_RAW_DATA)
     logger = configure_logging(config.log_level)
@@ -88,7 +298,7 @@ def _cmd_load_raw(args: argparse.Namespace) -> int:
     checksums = store.read_checksums(snapshot_id)
     run_id = f"load-{snapshot_id}-{uuid.uuid4().hex[:8]}"
 
-    conn = connect(config.pg_dsn)
+    conn = connect(config.pg_dsn_value)
     try:
         state.create_running_run(
             conn, config.ops_schema, run_id=run_id, source=config.source_name, snapshot_id=snapshot_id,
@@ -134,7 +344,7 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     from .db import connect
 
     config = IngestConfig.load(required=REQUIRE_DB)
-    conn = connect(config.pg_dsn)
+    conn = connect(config.pg_dsn_value)
     try:
         if args.status:
             return migrations.print_status(conn, config)
@@ -154,7 +364,7 @@ def _cmd_dbt(args: argparse.Namespace) -> int:
         dbt_args = dbt_args[1:]
 
     env = dict(os.environ)
-    env["PG_DSN"] = config.pg_dsn or ""
+    env["PG_DSN"] = config.pg_dsn_value or ""
     env["RAW_SCHEMA"] = config.raw_schema
     env["INPUT_LAYER_SCHEMA"] = config.input_layer_schema
 
@@ -170,19 +380,17 @@ def _cmd_dbt(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(_args: argparse.Namespace) -> int:
-    """Full pipeline: extract -> load-raw -> dbt deps -> dbt build."""
+    """Full legacy pipeline: extract (full manifest) -> load-raw -> dbt deps -> dbt build."""
     from . import migrations, raw_loader, state
-    from .api_client import ApiClient
-    from .config import ALL_REQUIREMENTS
+    from .config import ALL_REQUIREMENTS as _ALL_REQUIREMENTS
     from .db import connect
-    from .errors import RawLoadError
     from .extract import RawSnapshotStore, extract_snapshot
 
-    config = IngestConfig.load(required=ALL_REQUIREMENTS)
+    config = IngestConfig.load(required=_ALL_REQUIREMENTS)
     logger = configure_logging(config.log_level)
     run_id = f"run-{uuid.uuid4().hex[:12]}"
 
-    conn = connect(config.pg_dsn)
+    conn = connect(config.pg_dsn_value)
     try:
         migrations.apply_pending(conn, config)
 
@@ -191,7 +399,7 @@ def _cmd_run(_args: argparse.Namespace) -> int:
             environment=config.pipeline_environment, app_version=__version__, host=_run_host_identity(),
         )
 
-        client = ApiClient(token=config.api_token, timeout_seconds=config.api_timeout_seconds, max_retries=config.api_max_retries, logger=logger)
+        client = _build_api_client(config, logger, run_id=run_id)
         try:
             state.update_stage(conn, config.ops_schema, run_id, "extract")
             extracted = extract_snapshot(config, client, logger)
@@ -214,7 +422,7 @@ def _cmd_run(_args: argparse.Namespace) -> int:
 
         state.update_stage(conn, config.ops_schema, run_id, "dbt")
         env = dict(os.environ)
-        env["PG_DSN"] = config.pg_dsn or ""
+        env["PG_DSN"] = config.pg_dsn_value or ""
         env["RAW_SCHEMA"] = config.raw_schema
         env["INPUT_LAYER_SCHEMA"] = config.input_layer_schema
         dbt_common = ["--project-dir", str(config.dbt_project_dir), "--profiles-dir", str(config.dbt_profiles_dir), "--target", config.dbt_target]
@@ -271,12 +479,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"tuva-ingest {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    p_extract = subparsers.add_parser("extract", help="fetch + validate the manifest and publish a raw snapshot")
+    from .endpoints import SUPPORTED_ENDPOINTS
+
+    p_extract = subparsers.add_parser(
+        "extract", help="fetch + validate a manifest for one --endpoint and publish a raw snapshot"
+    )
+    p_extract.add_argument(
+        "--endpoint", required=True, choices=SUPPORTED_ENDPOINTS, help="one supported endpoint (see docs/API_MANIFEST.md)"
+    )
+    p_extract.add_argument("--since", default=None, help="ISO-8601 date (YYYY-MM-DD); optional, passed through to the manifest request")
     p_extract.set_defaults(func=_cmd_extract)
 
-    p_load = subparsers.add_parser("load-raw", help="load a published raw snapshot into the raw schema")
-    p_load.add_argument("--snapshot-id", default=None, help="defaults to the 'current' published snapshot")
-    p_load.set_defaults(func=_cmd_load_raw)
+    p_load = subparsers.add_parser(
+        "load", help="load a previously extracted run (--run-id) into that one endpoint's raw table only"
+    )
+    p_load.add_argument("--run-id", required=True, help="the run_id printed by `tuva-ingest extract`")
+    p_load.set_defaults(func=_cmd_load)
+
+    p_sync = subparsers.add_parser("sync", help="extract, then load, one --endpoint in a single command")
+    p_sync.add_argument("--endpoint", required=True, choices=SUPPORTED_ENDPOINTS)
+    p_sync.add_argument("--since", default=None, help="ISO-8601 date (YYYY-MM-DD)")
+    p_sync.set_defaults(func=_cmd_sync)
+
+    p_load_raw = subparsers.add_parser(
+        "load-raw",
+        help="[legacy] load a full-manifest (all three tables) raw snapshot into the raw schema",
+    )
+    p_load_raw.add_argument("--snapshot-id", default=None, help="defaults to the 'current' published snapshot")
+    p_load_raw.set_defaults(func=_cmd_load_raw)
 
     p_migrate = subparsers.add_parser("migrate", help="apply pending operational migrations")
     p_migrate.add_argument("--status", action="store_true", help="print migration status and exit (read-only)")
@@ -286,7 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dbt.add_argument("dbt_args", nargs=argparse.REMAINDER, help="arguments passed through to `dbt` (e.g. deps, build, test)")
     p_dbt.set_defaults(func=_cmd_dbt)
 
-    p_run = subparsers.add_parser("run", help="full pipeline: extract, load-raw, dbt deps, dbt build")
+    p_run = subparsers.add_parser("run", help="[legacy] full pipeline: extract (full manifest), load-raw, dbt deps, dbt build")
     p_run.set_defaults(func=_cmd_run)
 
     p_health = subparsers.add_parser("healthcheck", help="verify DB connectivity, migrations, and run freshness")

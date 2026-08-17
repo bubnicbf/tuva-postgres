@@ -72,6 +72,24 @@ tables are created and owned entirely by the pinned dbt package.
    them, in its own schema(s). This repository never vendors or
    duplicates any of that package's model files.
 
+**Object storage (production ingestion path)**: `extract`/`load`/`sync
+--storage object-storage` (added alongside the filesystem-backed
+commands above, default `--storage filesystem` unchanged) publish every
+page, then a run manifest, then a success marker as IMMUTABLE objects in
+object storage (`OBJECT_STORAGE_PROVIDER=local` for development,
+`=s3` for AWS S3/MinIO in production -- see
+`src/tuva_ingest/object_storage/`) -- the durable, replayable source of
+truth. `load`/`sync` independently re-verify every page's checksum/gzip
+integrity/record count from object storage (never trusting a
+filesystem-only copy), then COPY accepted rows into a temp table and
+merge them into `RAW_SCHEMA` (default `raw_incoming`) with
+`ON CONFLICT DO NOTHING` against a source-stable uniqueness rule, all in
+one transaction alongside a `(vendor, endpoint)` cursor advance
+(`ops.ingestion_cursor`) -- see `docs/SOURCE_CONTRACT.md` "Object
+storage" for the complete contract (object-key convention, raw metadata
+columns, rejected-record handling, schema-drift observation, cursor
+concurrency).
+
 **Secret manager**: `extract`/`sync` never read an API token from an
 environment variable by default in a production deployment --
 `src/tuva_ingest/secrets.py` retrieves one credential per process from
@@ -170,9 +188,17 @@ field's own default (standard `pydantic-settings` precedence).
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `PG_DSN` | PostgreSQL connection string (`SecretStr`) | *(required for DB commands)* |
-| `RAW_SCHEMA` | Raw landing schema (never Tuva-managed) | `raw` |
-| `OPS_SCHEMA` | Operational/control schema (run/table-load history) | `ingest_ops` |
+| `RAW_SCHEMA` | Raw landing schema (never Tuva-managed) | `raw_incoming` (was `raw` -- see "Upgrade notes" in docs/RUNBOOK.md) |
+| `OPS_SCHEMA` | Operational/control schema (run/table-load history) | `ops` (was `ingest_ops`) |
+| `STAGING_SCHEMA` | Schema dbt materializes `models/staging/*.sql` into | `staging_incoming` |
 | `INPUT_LAYER_SCHEMA` | Schema dbt materializes `models/final/*.sql` into | `input_layer` |
+| `ANALYTICS_CORE_SCHEMA` | Schema the pinned Tuva package's own core/terminology models route into | `analytics_core` |
+| `ANALYTICS_MARTS_SCHEMA` | Schema the pinned Tuva package's own mart models route into | `analytics_marts` |
+| `OBJECT_STORAGE_PROVIDER` | `local` or `s3` (see `src/tuva_ingest/object_storage/`) | `local` |
+| `OBJECT_STORAGE_BUCKET` | S3(-compatible) bucket name (required for `s3`) | *(none)* |
+| `OBJECT_STORAGE_PREFIX` | Object-key prefix (see docs/SOURCE_CONTRACT.md "Object storage") | `raw` |
+| `OBJECT_STORAGE_REGION` | AWS region (optional) | *(none)* |
+| `OBJECT_STORAGE_ENDPOINT_URL` | Custom S3-compatible endpoint (e.g. MinIO) | *(none)* |
 | `INGEST_ROLE` / `TRANSFORM_ROLE` | Least-privilege role names (see `migrations/003_roles_and_grants.sql`) | `tuva_ingest_role` / `tuva_transform_role` |
 | `TUVA_API_MANIFEST_URL` | Page-request endpoint (`extract`/`sync`) and legacy manifest endpoint (`run`/`load-raw`'s underlying `extract_snapshot`) | *(required for `extract`/`sync`/`run`)* |
 | `TUVA_API_TOKEN` | Bearer token (`SecretStr`); used directly when `TUVA_API_SECRET_PROVIDER=env` (the default) and always by the legacy `run`/`load-raw` path | *(required unless `TUVA_API_SECRET_PROVIDER=aws`)* |
@@ -507,19 +533,29 @@ make local-db-reset     # DESTRUCTIVE: also drops the data volume
 ## Migrations
 
 `migrations/001_operational_schemas.sql`, `002_ingestion_control.sql`,
-`003_roles_and_grants.sql`, `004_endpoint_scoped_ingestion.sql`, and
-`005_paginated_extraction_state.sql` are the only DDL this repository
+`003_roles_and_grants.sql`, `004_endpoint_scoped_ingestion.sql`,
+`005_paginated_extraction_state.sql`, and
+`006_object_storage_raw_contract.sql` are the only DDL this repository
 owns: the raw and operational-control schemas, run/table-load
 bookkeeping tables, least-privilege role grants, (004) the
 `endpoint`/`requested_since` columns on `ingestion_runs` plus the unique
 index on `table_loads (run_id, table_name)` that makes
-`tuva-ingest load --run-id ...` safe to repeat, and (005) the
+`tuva-ingest load --run-id ...` safe to repeat, (005) the
 `ingest_ops.source_watermarks` table (the durable per-`(source,
 endpoint)` high-water mark `load`/`sync` commit into -- see "High-water
 mark semantics" above) plus five new nullable metadata columns and a new
 unique index (`(_snapshot_id, _source_row_number)`) on each of the three
 raw tables, which is what makes the paginated loader's `INSERT ... ON
-CONFLICT DO NOTHING` idempotency possible. They are checksum-tracked
+CONFLICT DO NOTHING` idempotency possible, and (006) the object-storage-
+backed workflow's canonical operational model -- five new SINGULAR
+tables (`ingestion_run`, `ingestion_page`, `ingestion_cursor`,
+`rejected_record`, `schema_observation`; the pre-existing PLURAL
+`ingestion_runs`/`table_loads`/`source_watermarks` above are untouched
+and remain the legacy/local-filesystem workflows' own tables) plus seven
+new nullable raw-metadata columns and a source-stable partial unique
+index on each raw table, and least-privilege grants for the new tables
+-- see `docs/SOURCE_CONTRACT.md` "Object storage" for the full contract.
+They are checksum-tracked
 (`src/tuva_ingest/migrations.py`), applied at most once each, and
 rerunning `tuva-ingest migrate` against an already-migrated database is
 always a true no-op. Dynamic identifiers (schema/role names) use
@@ -898,15 +934,25 @@ src/tuva_ingest/     the connector: config (pydantic-settings), api_client (http
                      endpoints (--endpoint <-> raw table mapping), secrets (credential providers),
                      pagination (paginated extract + immutable page files), paginated_loader
                      (reconciled, idempotent raw load), extract, raw_loader (legacy CSV contract),
-                     state, migrations, cli
-migrations/           001-005: raw + operational schemas, run/table-load control, role grants,
+                     state, migrations, cli,
+                     object_storage/ (StorageBackend interface + local/memory/s3 backends,
+                       key construction, immutable publish/verify), object_extract (object-
+                       storage-backed extraction), object_raw_loader (COPY-to-temp + merge +
+                       cursor-safe load), endpoint_contract (source-record-id/updated-at/
+                       payload-hash contract), schema_observation (PHI-free drift detection)
+migrations/           001-006: raw + operational schemas, run/table-load control, role grants,
                      endpoint-scoped ingestion metadata, paginated-extraction watermark state
-                     + raw-table idempotency indexes
+                     + raw-table idempotency indexes, object-storage-backed canonical
+                     operational model + raw-metadata columns + source-stable uniqueness
 dbt_project.yml, packages.yml, profiles.example.yml, macros/, models/   the dbt project
 tests/unit/            database-free tests (including test_input_layer_contract.py's
                         file-level Input Layer contract checks, test_secrets.py,
-                        test_pagination.py, test_paginated_loader.py)
-tests/integration/     tests requiring a disposable PostgreSQL database
+                        test_pagination.py, test_paginated_loader.py, test_object_storage_*.py,
+                        test_endpoint_contract.py, test_schema_observation.py,
+                        test_state_object_storage.py, test_object_raw_loader.py)
+tests/integration/     tests requiring a disposable PostgreSQL database (test_pipeline_integration.py,
+                        test_object_storage_pipeline_integration.py) and the opt-in
+                        MinIO-backed test_object_storage_minio_integration.py
 tests/fixtures/         small synthetic CSV fixtures used by tests/integration
 docs/RUNBOOK.md         day-to-day operational runbook
 docs/SOURCE_CONTRACT.md the full operational source contract: auth, secret manager, pagination,

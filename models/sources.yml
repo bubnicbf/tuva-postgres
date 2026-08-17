@@ -4,15 +4,19 @@ sources:
   - name: raw
     schema: "{{ var('raw_schema') }}"
     description: >
-      Raw landing tables loaded by the tuva_ingest Python connector
-      (src/tuva_ingest/raw_loader.py) from the extracted, checksum-
-      verified snapshot published under RAW_DATA_DIR (see
-      src/tuva_ingest/extract.py). Every row is stored as a single
-      `raw_row` JSONB column, keyed exactly by that source CSV's own
-      header -- no type coercion, renaming, or filtering happens before
-      this point. dbt only ever reads from this source; it is never
-      written to by any dbt model (see models/staging/ for where typing
-      and normalization happens).
+      Raw landing tables (default schema: raw_incoming -- see config.py's
+      RAW_SCHEMA) populated by TWO independent, coexisting loaders:
+      the legacy CSV/full-manifest loader (src/tuva_ingest/raw_loader.py,
+      `raw_row` jsonb column) and the new object-storage-backed loader
+      (src/tuva_ingest/object_raw_loader.py, `_raw_payload` jsonb plus
+      six other `_`-prefixed metadata columns -- see
+      docs/SOURCE_CONTRACT.md "Raw metadata definitions"). Neither loader
+      ever type-coerces, renames, or filters a field -- see each
+      loader's own module docstring. dbt only ever reads from this
+      source; it is never written to by any dbt model (see
+      models/staging/*.sql, which read `coalesce(_raw_payload, raw_row)`
+      so both loaders' rows normalize identically -- see each staging
+      model's `source` CTE).
     loaded_at_field: _loaded_at
     freshness:
       warn_after: { count: 24, period: hour }
@@ -34,8 +38,35 @@ sources:
             description: Timestamp this row was loaded into the raw schema.
             data_tests: [not_null]
           - name: raw_row
-            description: The full source row as JSON, keyed by the source CSV's own header.
-            data_tests: [not_null]
+            description: >
+              [legacy loader only] The full source row as JSON, keyed by
+              the source CSV's own header. NULL for every row loaded by
+              the new object-storage-backed loader (see _raw_payload).
+          - name: _ingestion_run_id
+            description: "[new loader only] The UUID run_id of the object-storage-backed run that loaded this row."
+          - name: _ingested_at
+            description: "[new loader only] Timestamp this row was loaded into the raw schema."
+          - name: _source_endpoint
+            description: "[new loader only] The normalized snake_case endpoint name (see endpoints.py)."
+          - name: _source_record_id
+            description: >
+              [new loader only] The stable, collision-safe source-record
+              identifier derived by endpoint_contract.py -- NOT unique on
+              its own (see the source-stable unique constraint, which
+              also includes _source_updated_at and _payload_hash).
+          - name: _source_updated_at
+            description: "[new loader only] The source's own explicit update timestamp for this record (never ingestion time)."
+          - name: _payload_hash
+            description: >
+              [new loader only] Lowercase SHA-256 over the canonical JSON
+              serialization of the complete source record (sorted keys,
+              compact separators) -- identical for the same logical
+              object regardless of input key order.
+          - name: _raw_payload
+            description: >
+              [new loader only] The minimally interpreted complete source
+              object as JSON. NULL for every row loaded by the legacy CSV
+              loader (see raw_row).
 
       - name: medical_claim
         description: >
@@ -52,8 +83,35 @@ sources:
             description: Timestamp this row was loaded into the raw schema.
             data_tests: [not_null]
           - name: raw_row
-            description: The full source row as JSON, keyed by the source CSV's own header.
-            data_tests: [not_null]
+            description: >
+              [legacy loader only] The full source row as JSON, keyed by
+              the source CSV's own header. NULL for every row loaded by
+              the new object-storage-backed loader (see _raw_payload).
+          - name: _ingestion_run_id
+            description: "[new loader only] The UUID run_id of the object-storage-backed run that loaded this row."
+          - name: _ingested_at
+            description: "[new loader only] Timestamp this row was loaded into the raw schema."
+          - name: _source_endpoint
+            description: "[new loader only] The normalized snake_case endpoint name (see endpoints.py)."
+          - name: _source_record_id
+            description: >
+              [new loader only] The stable, collision-safe source-record
+              identifier derived by endpoint_contract.py -- NOT unique on
+              its own (see the source-stable unique constraint, which
+              also includes _source_updated_at and _payload_hash).
+          - name: _source_updated_at
+            description: "[new loader only] The source's own explicit update timestamp for this record (never ingestion time)."
+          - name: _payload_hash
+            description: >
+              [new loader only] Lowercase SHA-256 over the canonical JSON
+              serialization of the complete source record (sorted keys,
+              compact separators) -- identical for the same logical
+              object regardless of input key order.
+          - name: _raw_payload
+            description: >
+              [new loader only] The minimally interpreted complete source
+              object as JSON. NULL for every row loaded by the legacy CSV
+              loader (see raw_row).
 
       - name: pharmacy_claim
         description: >
@@ -70,5 +128,32 @@ sources:
             description: Timestamp this row was loaded into the raw schema.
             data_tests: [not_null]
           - name: raw_row
-            description: The full source row as JSON, keyed by the source CSV's own header.
-            data_tests: [not_null]
+            description: >
+              [legacy loader only] The full source row as JSON, keyed by
+              the source CSV's own header. NULL for every row loaded by
+              the new object-storage-backed loader (see _raw_payload).
+          - name: _ingestion_run_id
+            description: "[new loader only] The UUID run_id of the object-storage-backed run that loaded this row."
+          - name: _ingested_at
+            description: "[new loader only] Timestamp this row was loaded into the raw schema."
+          - name: _source_endpoint
+            description: "[new loader only] The normalized snake_case endpoint name (see endpoints.py)."
+          - name: _source_record_id
+            description: >
+              [new loader only] The stable, collision-safe source-record
+              identifier derived by endpoint_contract.py -- NOT unique on
+              its own (see the source-stable unique constraint, which
+              also includes _source_updated_at and _payload_hash).
+          - name: _source_updated_at
+            description: "[new loader only] The source's own explicit update timestamp for this record (never ingestion time)."
+          - name: _payload_hash
+            description: >
+              [new loader only] Lowercase SHA-256 over the canonical JSON
+              serialization of the complete source record (sorted keys,
+              compact separators) -- identical for the same logical
+              object regardless of input key order.
+          - name: _raw_payload
+            description: >
+              [new loader only] The minimally interpreted complete source
+              object as JSON. NULL for every row loaded by the legacy CSV
+              loader (see raw_row).

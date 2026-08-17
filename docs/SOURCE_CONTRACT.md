@@ -9,8 +9,13 @@ checked, and kept current -- see "Readiness" and "Automated validation".
 
 It complements, and does not replace, `docs/API_MANIFEST.md` (the wire
 format only) and `docs/RUNBOOK.md` (day-to-day operation). Implementation:
-`src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state}.py`.
-Validated by: `tests/unit/test_source_contract.py`.
+`src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state}.py`
+for the wire/legacy contract; `src/tuva_ingest/{object_storage/,
+object_extract,object_raw_loader,endpoint_contract,schema_observation}.py`
+and `migrations/006_object_storage_raw_contract.sql` for the object-storage-
+backed contract (Section 15). Validated by: `tests/unit/test_source_contract.py`,
+`tests/unit/test_object_storage_*.py`, `tests/unit/test_endpoint_contract.py`,
+`tests/unit/test_schema_observation.py`, `tests/integration/test_object_storage_*.py`.
 
 ## A repository-derived fact this document leads with
 

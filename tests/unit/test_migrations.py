@@ -38,6 +38,18 @@ class TestDiscoverRealMigrations(unittest.TestCase):
             ],
         )
 
+    def test_migration_006_mentions_every_new_canonical_table(self):
+        # A structural (not checksum-weakening) proof that 006 actually
+        # defines every required new operational/raw object -- catches an
+        # accidental partial migration without needing a live database.
+        sql_text = (REPO_ROOT / "migrations" / "006_object_storage_raw_contract.sql").read_text(encoding="utf-8")
+        for expected in (
+            "ingestion_run", "ingestion_page", "ingestion_cursor", "rejected_record", "schema_observation",
+            "_ingestion_run_id", "_ingested_at", "_source_endpoint", "_source_record_id",
+            "_source_updated_at", "_payload_hash", "_raw_payload",
+        ):
+            self.assertIn(expected, sql_text, f"migration 006 does not mention {expected!r}")
+
     def test_checksums_are_stable_across_repeated_discovery(self):
         first = migrations.discover(REPO_ROOT / "migrations")
         second = migrations.discover(REPO_ROOT / "migrations")

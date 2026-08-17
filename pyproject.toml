@@ -22,11 +22,16 @@ dependencies = [
   "dbt-postgres==1.10.0",
 ]
 
-# `boto3` backs the optional `aws` secret provider
-# (TUVA_API_SECRET_PROVIDER=aws, see src/tuva_ingest/secrets.py) and is
-# imported lazily, only when that provider is actually selected --
-# deployments using the default `env` provider need not install it.
-# Install with `uv sync --locked --extra aws` when TUVA_API_SECRET_PROVIDER=aws.
+# `boto3` backs two independently-optional AWS integrations, both lazily
+# imported (only when actually selected) so a deployment using neither
+# need not install it:
+#   - the `aws` secret provider (TUVA_API_SECRET_PROVIDER=aws, see
+#     src/tuva_ingest/secrets.py)
+#   - the `s3` object storage backend (OBJECT_STORAGE_PROVIDER=s3, see
+#     src/tuva_ingest/object_storage/s3.py) -- also used against any
+#     S3-compatible endpoint (e.g. local MinIO, via
+#     OBJECT_STORAGE_ENDPOINT_URL), not just real AWS S3.
+# Install with `uv sync --locked --extra aws` when either is selected.
 [project.optional-dependencies]
 aws = [
   "boto3==1.35.90",

@@ -235,13 +235,166 @@ make local-db-down      # stop containers, KEEP data
 make local-db-reset     # DESTRUCTIVE: drop the data volume too (asks for confirmation)
 ```
 
+## Local PostgreSQL + MinIO (object-storage-backed workflow)
+
+MinIO is a disposable, local-only S3-compatible object store -- entirely
+optional; every command above works unchanged with the default
+`OBJECT_STORAGE_PROVIDER=local` (a real-file-I/O local backend, see
+`src/tuva_ingest/object_storage/local.py`), which never touches MinIO.
+Start it only when you want to exercise `OBJECT_STORAGE_PROVIDER=s3`
+locally, e.g. before deploying against real AWS S3:
+
+```bash
+docker compose up -d minio                # start MinIO, wait for its healthcheck
+docker compose run --rm minio-mc          # idempotent: creates the local dev bucket (tuva-raw-local)
+```
+
+Then, in `.env` (or the environment `tuva-ingest` runs in):
+
+```bash
+export OBJECT_STORAGE_PROVIDER="s3"
+export OBJECT_STORAGE_BUCKET="tuva-raw-local"
+export OBJECT_STORAGE_ENDPOINT_URL="http://localhost:9000"
+export OBJECT_STORAGE_REGION="us-east-1"
+# Ambient credentials only (see src/tuva_ingest/object_storage/s3.py) --
+# for this LOCAL MinIO instance only, boto3's ambient chain is satisfied
+# by ordinary AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY env vars matching
+# compose.yml's MINIO_ROOT_USER/MINIO_ROOT_PASSWORD. Never do this
+# against real AWS -- use an IAM role/AWS_PROFILE instead (see "Ambient
+# IAM authentication" below).
+export AWS_ACCESS_KEY_ID="tuva-local-minio"
+export AWS_SECRET_ACCESS_KEY="local-only-example-minio-secret-change-me"
+```
+
+```bash
+tuva-ingest extract --endpoint eligibility --storage object-storage
+tuva-ingest load --run-id <run_id> --storage object-storage
+# or in one step:
+tuva-ingest sync --endpoint eligibility --storage object-storage
+```
+
+### Bucket creation and required settings (production)
+
+- Create the bucket out-of-band (Terraform/CloudFormation/console/CLI --
+  this repository does not provision cloud infrastructure).
+- Set `OBJECT_STORAGE_PROVIDER=s3`, `OBJECT_STORAGE_BUCKET=<name>`,
+  `OBJECT_STORAGE_REGION=<region>`; leave `OBJECT_STORAGE_ENDPOINT_URL`
+  unset for real AWS S3 (set it only for a non-AWS S3-compatible
+  service).
+- **Never** set a static `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in
+  production configuration -- see "Ambient IAM authentication" below.
+
+### Ambient IAM authentication and least-privilege bucket permissions
+
+`object_storage.s3.S3Backend` authenticates only via boto3's default
+ambient credential chain (an IAM role attached to the compute the
+connector runs on, an assumed role, or `AWS_PROFILE` in local
+development) -- this connector never accepts, stores, or logs a static
+access-key/secret-key pair for object storage (or, per `secrets.py`, for
+the AWS Secrets Manager API credential provider either). Grant the
+ingestion role's IAM policy only what it needs on the configured bucket
+(least privilege), scoped to the configured `OBJECT_STORAGE_PREFIX`:
+`s3:PutObject`, `s3:GetObject`, `s3:ListBucket` (prefix-scoped),
+`s3:HeadObject`. Do not grant `s3:DeleteObject` -- this connector never
+deletes a published object, and a production bucket policy should not
+allow it either (see "PHI implications" below for object versioning as
+the correct way to handle any future need to remove an object).
+
+### PHI implications, encryption, retention, versioning, lifecycle, access logging
+
+Every page object is potentially PHI-bearing (it is the source's own
+record, byte-for-byte). At minimum for a production bucket:
+
+- **Encryption at rest:** enable default bucket encryption
+  (SSE-S3 or SSE-KMS) -- this repository does not configure this for
+  you; it is an infrastructure/bucket-policy concern.
+- **Encryption in transit:** enforce HTTPS-only bucket policy
+  (`aws:SecureTransport`); `S3Backend` itself always uses `boto3`'s
+  default HTTPS client.
+- **Retention:** define a retention/lifecycle policy appropriate to your
+  regulatory obligations -- this repository does not define one; the
+  object-key layout's `load_date=`/`run_id=` partitioning makes
+  date-scoped lifecycle rules (e.g. transition-to-Glacier or expire
+  after N days) straightforward to write against the actual bucket.
+- **Object versioning:** enabling bucket versioning is a defense-in-depth
+  recommendation (protects against an out-of-band accidental delete or
+  overwrite bypassing this connector's own immutability checks) --
+  this connector's own immutability guarantee (Section 15 of
+  `docs/SOURCE_CONTRACT.md`) does not depend on it, but does not conflict
+  with it either.
+- **Access logging:** enable S3 server access logging (or CloudTrail data
+  events) on the bucket for audit/investigation purposes.
+- **Public access:** the bucket must NEVER be public -- block all public
+  access at the bucket/account level. This connector's own IAM policy
+  recommendation above never requires public access.
+
+### Known limitations (object storage)
+
+- `object_storage.s3.S3Backend`'s conditional-write race-window
+  limitation on S3-compatible services that do not support
+  `IfNoneMatch` -- see that module's own docstring.
+- `macros/generate_schema_name.sql`'s Tuva-package core/marts routing
+  heuristic could not be verified against the real pinned package via
+  `dbt deps`/`dbt parse` in this repository's own sandboxed development
+  environment (no network access to fetch the package) -- verify with
+  `dbt list --output json --output-keys unique_id,schema` once you have
+  network access, and adjust the macro's `_tuva_core_schema_names` list
+  if any Tuva-configured schema name differs from what is assumed.
+- `boto3` (needed for BOTH the `aws` secret provider and the `s3` object
+  storage backend) is declared in `pyproject.toml`'s `aws` extra but was
+  ALREADY absent from `uv.lock` before this change (a pre-existing gap,
+  confirmed against `origin/dev`) -- run `uv lock` once you have network
+  access to PyPI to resolve and pin it before relying on
+  `uv sync --locked --extra aws` for either feature.
+
+## Upgrade notes
+
+**RAW_SCHEMA/OPS_SCHEMA default values changed** as part of adding
+object storage (from `raw`/`ingest_ops` to `raw_incoming`/`ops` -- see
+`docs/SOURCE_CONTRACT.md` "Six-schema lineage"). An existing deployment
+that never explicitly set `RAW_SCHEMA`/`OPS_SCHEMA` (relying on the old
+defaults) MUST set them explicitly to its CURRENT values
+(`RAW_SCHEMA=raw`, `OPS_SCHEMA=ingest_ops`) before upgrading, or the
+connector will start creating/reading a NEW, empty `raw_incoming`/`ops`
+schema pair instead of its existing data. A deployment that already sets
+either variable explicitly is unaffected -- only the default changed,
+never override behavior.
+
+`migrations/006_object_storage_raw_contract.sql` is purely additive
+(new tables, new nullable columns, new grants) and safe to apply to any
+existing database regardless of whether you adopt the object-storage
+workflow -- the legacy CSV and local-filesystem-paginated workflows are
+completely unaffected by it.
+
 ## Running the test suite
 
 ```bash
-make test-unit          # database-free
+make test-unit          # database-free (includes object_storage/endpoint_contract/schema_observation tests)
 make test-integration   # requires PG_DSN pointed at a DISPOSABLE database -- never production
 make quality             # full database-free quality gate (lock check, lint, types, unit tests, sql lint)
 make ci-full              # quality + dbt parse/deps + the full integration suite
+```
+
+Object-storage-specific suites (also collected by the targets above,
+listed here for direct/opt-in invocation):
+
+```bash
+# Deterministic, database-free, always run by `make test-unit`:
+python3 -m pytest tests/unit/test_object_storage_keys.py tests/unit/test_object_storage_backends.py \
+  tests/unit/test_object_storage_publish_verify.py tests/unit/test_endpoint_contract.py \
+  tests/unit/test_schema_observation.py tests/unit/test_state_object_storage.py \
+  tests/unit/test_object_raw_loader.py -v
+
+# Requires PG_DSN (disposable database):
+PG_DSN=postgresql://user:pass@host:port/db \
+  python3 -m pytest tests/integration/test_object_storage_pipeline_integration.py -v
+
+# Opt-in, requires a running MinIO (docker compose up -d minio && docker compose run --rm minio-mc):
+OBJECT_STORAGE_TEST_ENDPOINT_URL=http://localhost:9000 \
+OBJECT_STORAGE_TEST_BUCKET=tuva-raw-local \
+OBJECT_STORAGE_TEST_ACCESS_KEY_ID=tuva-local-minio \
+OBJECT_STORAGE_TEST_SECRET_ACCESS_KEY=local-only-example-minio-secret-change-me \
+  python3 -m pytest tests/integration/test_object_storage_minio_integration.py -v
 ```
 
 `tests/integration/` creates its own uniquely-suffixed

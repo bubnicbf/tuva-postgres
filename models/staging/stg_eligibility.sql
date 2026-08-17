@@ -21,7 +21,17 @@
 
 with source as (
 
-    select *
+    select
+        *,
+        -- Compatibility path (see migrations/006_object_storage_raw_contract.sql):
+        -- the new object-storage-backed loader (object_raw_loader.py) populates
+        -- _raw_payload; the legacy CSV loader (raw_loader.py) populates raw_row
+        -- only and always leaves _raw_payload NULL. coalesce() here is the one,
+        -- explicit place these two independently-populated payload columns are
+        -- ever reconciled -- every staging model reads _effective_payload, never
+        -- raw_row or _raw_payload directly, so the two columns can never silently
+        -- drift against each other in more than one place.
+        coalesce(_raw_payload, raw_row) as _effective_payload
     from {{ source('raw', 'eligibility') }}
 
 ),
@@ -33,26 +43,26 @@ renamed as (
         _source_row_number,
         _loaded_at,
 
-        {{ raw_field('raw_row', 'person_id') }}                          as person_id,
-        {{ raw_field('raw_row', 'member_id') }}                          as member_id,
-        {{ raw_field('raw_row', 'subscriber_id') }}                      as subscriber_id,
+        {{ raw_field('_effective_payload', 'person_id') }}                          as person_id,
+        {{ raw_field('_effective_payload', 'member_id') }}                          as member_id,
+        {{ raw_field('_effective_payload', 'subscriber_id') }}                      as subscriber_id,
 
-        {{ safe_date(raw_field('raw_row', 'birth_date')) }}              as birth_date,
-        {{ safe_date(raw_field('raw_row', 'death_date')) }}              as death_date,
+        {{ safe_date(raw_field('_effective_payload', 'birth_date')) }}              as birth_date,
+        {{ safe_date(raw_field('_effective_payload', 'death_date')) }}              as death_date,
 
-        {{ safe_date(raw_field('raw_row', 'enrollment_start_date')) }}   as enrollment_start_date,
-        {{ safe_date(raw_field('raw_row', 'enrollment_end_date')) }}     as enrollment_end_date,
+        {{ safe_date(raw_field('_effective_payload', 'enrollment_start_date')) }}   as enrollment_start_date,
+        {{ safe_date(raw_field('_effective_payload', 'enrollment_end_date')) }}     as enrollment_end_date,
 
-        {{ raw_field('raw_row', 'payer') }}                              as payer,
-        {{ raw_field('raw_row', 'payer_type') }}                         as payer_type,
-        {{ raw_field('raw_row', 'plan') }}                               as plan,
+        {{ raw_field('_effective_payload', 'payer') }}                              as payer,
+        {{ raw_field('_effective_payload', 'payer_type') }}                         as payer_type,
+        {{ raw_field('_effective_payload', 'plan') }}                               as plan,
 
-        {{ raw_field('raw_row', 'original_reason_entitlement_code') }}   as original_reason_entitlement_code,
-        {{ raw_field('raw_row', 'dual_status_code') }}                   as dual_status_code,
-        {{ raw_field('raw_row', 'medicare_status_code') }}               as medicare_status_code,
+        {{ raw_field('_effective_payload', 'original_reason_entitlement_code') }}   as original_reason_entitlement_code,
+        {{ raw_field('_effective_payload', 'dual_status_code') }}                   as dual_status_code,
+        {{ raw_field('_effective_payload', 'medicare_status_code') }}               as medicare_status_code,
 
-        {{ raw_field('raw_row', 'group_id') }}                           as group_id,
-        {{ raw_field('raw_row', 'group_name') }}                         as group_name,
+        {{ raw_field('_effective_payload', 'group_id') }}                           as group_id,
+        {{ raw_field('_effective_payload', 'group_name') }}                         as group_name,
 
         -- Present in source, but NOT part of the Input Layer contract:
         -- the contract's `state` field expects a 2-letter USPS
@@ -61,9 +71,9 @@ renamed as (
         -- inventing values (see models/final/eligibility.sql). Retained
         -- here, untyped-cast, for lineage/debugging visibility only --
         -- intentionally not selected by models/final/eligibility.sql.
-        {{ raw_field('raw_row', 'fips_state_code') }}                    as fips_state_code,
+        {{ raw_field('_effective_payload', 'fips_state_code') }}                    as fips_state_code,
 
-        coalesce({{ raw_field('raw_row', 'data_source') }}, 'tuva')      as data_source
+        coalesce({{ raw_field('_effective_payload', 'data_source') }}, 'tuva')      as data_source
 
     from source
 

@@ -346,3 +346,304 @@ def commit_watermark(conn, ops_schema, source, endpoint, *, high_water_mark, suc
             f"committed_at = EXCLUDED.committed_at",
             (source, endpoint, high_water_mark, successful_run_id, datetime.now(timezone.utc)),
         )
+
+
+# --- canonical object-storage-backed operational model (migrations/006) ---
+#
+# Everything below writes to the five NEW singular tables
+# (ingestion_run, ingestion_page, ingestion_cursor, rejected_record,
+# schema_observation) that back ONLY the object-storage-backed workflow
+# (object_extract.py/object_raw_loader.py) -- never the legacy
+# ingestion_runs/table_loads/source_watermarks tables above, and never
+# mixed with them.
+#
+# Two different commit disciplines are used here, mirroring the split
+# already established above for the legacy tables:
+#
+#   * create_ingestion_run / mark_run_published / mark_run_load_started /
+#     mark_run_failed each commit their own small write immediately (the
+#     same "operational state must survive a crash a moment later"
+#     rationale as create_running_run/mark_failed above) -- these run
+#     BEFORE or (for mark_run_failed) AFTER the one atomic load
+#     transaction, never inside it.
+#
+#   * lock_cursor_for_update / commit_cursor / insert_ingestion_page /
+#     mark_run_committed / insert_rejected_records /
+#     upsert_schema_observations NEVER commit -- they are always called
+#     from inside object_raw_loader.load_verified_run's single atomic
+#     transaction, and the CALLER (see cli._run_object_load) issues the
+#     one conn.commit() that makes the raw merge, every operational
+#     write below, and the cursor advance all become visible together,
+#     or (on any failure) all roll back together. Calling any of these
+#     five and then never committing/rolling back the connection is a
+#     caller bug -- these functions have no way to protect against that
+#     themselves (see docs/SOURCE_CONTRACT.md "COPY and transactional
+#     merge").
+
+_INGESTION_RUN = "ingestion_run"
+_INGESTION_PAGE = "ingestion_page"
+_INGESTION_CURSOR = "ingestion_cursor"
+_REJECTED_RECORD = "rejected_record"
+_SCHEMA_OBSERVATION = "schema_observation"
+
+
+def create_ingestion_run(
+    conn, ops_schema, *, run_id, vendor, endpoint, load_date, storage_bucket, storage_run_prefix,
+    requested_cursor, app_version, environment,
+) -> None:
+    """Insert the initial `running` ingestion_run row at the START of
+    extraction (before any object is published) -- auto-commits
+    immediately so the run is observable even if the process crashes
+    mid-extraction. Idempotent for a retried `run_id` (ON CONFLICT DO
+    UPDATE resets it back to 'running', the same upsert shape
+    `upsert_running_run` above already uses for the legacy contract)."""
+    relation = _relation(ops_schema, _INGESTION_RUN)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {relation} "
+            "(run_id, vendor, endpoint, load_date, storage_bucket, storage_run_prefix, requested_cursor, "
+            "status, started_at, app_version, environment) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, 'running', %s, %s, %s) "
+            "ON CONFLICT (run_id) DO UPDATE SET "
+            "status = 'running', started_at = EXCLUDED.started_at, published_at = NULL, "
+            "load_started_at = NULL, committed_at = NULL, failed_at = NULL, finished_at = NULL, "
+            "failure_category = NULL, failure_message = NULL",
+            (
+                run_id, vendor, endpoint, load_date, storage_bucket, storage_run_prefix, requested_cursor,
+                datetime.now(timezone.utc), app_version, environment,
+            ),
+        )
+    conn.commit()
+
+
+def mark_run_published(conn, ops_schema, run_id, *, candidate_cursor, page_count, extracted_count) -> None:
+    """Transition a `running` run to `published` -- called once every
+    page and the manifest and the success marker are durable in object
+    storage (see object_storage/publish.py), still before any PostgreSQL
+    load transaction begins. Auto-commits immediately."""
+    relation = _relation(ops_schema, _INGESTION_RUN)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE {relation} SET "
+            "status = 'published', published_at = %s, candidate_cursor = %s, page_count = %s, "
+            "extracted_count = %s "
+            "WHERE run_id = %s AND status = 'running'",
+            (datetime.now(timezone.utc), candidate_cursor, page_count, extracted_count, run_id),
+        )
+    conn.commit()
+
+
+def mark_run_load_started(conn, ops_schema, run_id) -> None:
+    """Transition a `published` run to `loading`, immediately before the
+    one atomic load transaction opens. Auto-commits immediately -- a
+    crash during loading still leaves 'loading' (not 'published')
+    visible to operators."""
+    relation = _relation(ops_schema, _INGESTION_RUN)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE {relation} SET status = 'loading', load_started_at = %s "
+            "WHERE run_id = %s AND status = 'published'",
+            (datetime.now(timezone.utc), run_id),
+        )
+    conn.commit()
+
+
+def mark_run_failed(conn, ops_schema, run_id, *, failure_category, failure_message) -> None:
+    """Transition a run to `failed` in a separate, safe auto-committing
+    write -- called AFTER the caller has already rolled back the atomic
+    load transaction (see object_raw_loader's module docstring, item 14
+    of docs/SOURCE_CONTRACT.md's "COPY and transactional merge"). Never
+    called from inside the transaction it is reporting the failure of."""
+    relation = _relation(ops_schema, _INGESTION_RUN)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE {relation} SET "
+            "status = 'failed', failed_at = %s, finished_at = %s, failure_category = %s, "
+            "failure_message = %s "
+            "WHERE run_id = %s AND status IN ('running', 'published', 'loading')",
+            (datetime.now(timezone.utc), datetime.now(timezone.utc), failure_category, failure_message, run_id),
+        )
+    conn.commit()
+
+
+def mark_run_committed(
+    conn, ops_schema, run_id, *, accepted_count, rejected_count, inserted_count, duplicate_count,
+) -> None:
+    """Transition a `loading` run to `committed`. NEVER commits (see
+    module section docstring) -- must be the last operational write
+    before the caller's own `conn.commit()`, alongside `commit_cursor`."""
+    relation = _relation(ops_schema, _INGESTION_RUN)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE {relation} SET "
+            "status = 'committed', committed_at = %s, finished_at = %s, accepted_count = %s, "
+            "rejected_count = %s, inserted_count = %s, duplicate_count = %s "
+            "WHERE run_id = %s AND status = 'loading'",
+            (
+                datetime.now(timezone.utc), datetime.now(timezone.utc), accepted_count, rejected_count,
+                inserted_count, duplicate_count, run_id,
+            ),
+        )
+
+
+def insert_ingestion_page(
+    conn, ops_schema, *, run_id, page_number, object_key, checksum, compressed_size_bytes,
+    source_record_count, accepted_count, rejected_count, request_cursor, response_cursor,
+    next_page_cursor, retrieved_at, status,
+) -> None:
+    """Upsert one page's audit row. NEVER commits. `ON CONFLICT (run_id,
+    page_number)` makes retrying the same run's load safe -- a repeated
+    load of the same page re-affirms the identical, immutable
+    object_key/checksum rather than erroring or duplicating."""
+    relation = _relation(ops_schema, _INGESTION_PAGE)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {relation} "
+            "(run_id, page_number, object_key, checksum, compressed_size_bytes, source_record_count, "
+            "accepted_count, rejected_count, request_cursor, response_cursor, next_page_cursor, "
+            "retrieved_at, verified_at, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (run_id, page_number) DO UPDATE SET "
+            "accepted_count = EXCLUDED.accepted_count, rejected_count = EXCLUDED.rejected_count, "
+            "verified_at = EXCLUDED.verified_at, status = EXCLUDED.status",
+            (
+                run_id, page_number, object_key, checksum, compressed_size_bytes, source_record_count,
+                accepted_count, rejected_count, request_cursor, response_cursor, next_page_cursor,
+                retrieved_at, datetime.now(timezone.utc), status,
+            ),
+        )
+
+
+def lock_cursor_for_update(conn, ops_schema, vendor, endpoint):
+    """`SELECT ... FOR UPDATE` the (vendor, endpoint) cursor row, creating
+    it first (at NULL/0) if it does not exist yet -- so every load for a
+    given (vendor, endpoint) serializes on this one row regardless of
+    whether it is the endpoint's first ever load. NEVER commits. Returns
+    `(committed_cursor, successful_run_id, lock_version)`. A concurrent
+    second run for the same (vendor, endpoint) blocks here until the
+    first run's transaction commits or rolls back -- see
+    docs/SOURCE_CONTRACT.md "Cursor safety"."""
+    relation = _relation(ops_schema, _INGESTION_CURSOR)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {relation} (vendor, endpoint, committed_cursor, lock_version) "
+            "VALUES (%s, %s, NULL, 0) ON CONFLICT (vendor, endpoint) DO NOTHING",
+            (vendor, endpoint),
+        )
+        cur.execute(
+            f"SELECT committed_cursor, successful_run_id, lock_version FROM {relation} "
+            "WHERE vendor = %s AND endpoint = %s FOR UPDATE",
+            (vendor, endpoint),
+        )
+        return cur.fetchone()
+
+
+def commit_cursor(conn, ops_schema, vendor, endpoint, *, committed_cursor, successful_run_id, expected_lock_version) -> None:
+    """Advance the (vendor, endpoint) cursor. NEVER commits. Caller MUST
+    have already called `lock_cursor_for_update` in the same transaction
+    and MUST have already independently confirmed `committed_cursor`
+    does not move backward relative to what that call returned (see
+    `errors.CursorError`, raised by object_raw_loader.py's caller-side
+    guard, never by this function itself). `expected_lock_version` is an
+    optimistic-concurrency belt-and-braces check on top of the row lock
+    already held: since this connection holds `FOR UPDATE` on the row
+    for the whole transaction, `expected_lock_version` can only ever
+    fail to match here if a caller bug re-reads the row on a different
+    connection/transaction than the one holding the lock."""
+    relation = _relation(ops_schema, _INGESTION_CURSOR)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE {relation} SET "
+            "committed_cursor = %s, successful_run_id = %s, committed_at = %s, lock_version = lock_version + 1 "
+            "WHERE vendor = %s AND endpoint = %s AND lock_version = %s",
+            (
+                committed_cursor, successful_run_id, datetime.now(timezone.utc), vendor, endpoint,
+                expected_lock_version,
+            ),
+        )
+        if cur.rowcount != 1:
+            from .errors import CursorError
+
+            raise CursorError(
+                f"failed to advance ingestion_cursor for (vendor={vendor!r}, endpoint={endpoint!r}): "
+                f"expected lock_version={expected_lock_version} was not matched (0 rows updated) -- "
+                "another transaction must have advanced this cursor concurrently, which should be "
+                "impossible while this transaction holds the row lock; this indicates a caller bug, "
+                "not a legitimate race"
+            )
+
+
+def insert_rejected_records(conn, ops_schema, rows: list[dict]) -> None:
+    """Bulk-insert rejected-record rows via `executemany`, retry-safe via
+    `ON CONFLICT (run_id, page_number, record_position) DO NOTHING`.
+    NEVER commits. `rows` are plain dicts with keys matching
+    `rejected_record`'s columns (see object_raw_loader.py's
+    RejectedRecordRow); this function never receives or persists a raw
+    payload value itself -- only `raw_object_key` (a durable pointer)
+    and already-sanitized `detail` text (see endpoint_contract.Rejected)."""
+    if not rows:
+        return
+    relation = _relation(ops_schema, _REJECTED_RECORD)
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO {relation} "
+            "(run_id, page_number, record_position, reason_code, detail, source_record_id, payload_hash, "
+            "raw_object_key) "
+            "VALUES (%(run_id)s, %(page_number)s, %(record_position)s, %(reason_code)s, %(detail)s, "
+            "%(source_record_id)s, %(payload_hash)s, %(raw_object_key)s) "
+            "ON CONFLICT (run_id, page_number, record_position) DO NOTHING",
+            rows,
+        )
+
+
+def upsert_schema_observations(
+    conn, ops_schema, *, vendor, endpoint, run_id, page_number, observations: dict, fingerprint: str,
+) -> None:
+    """Idempotently upsert `{field_path: {type_names}}` observations
+    (see schema_observation.py). NEVER commits. Each (vendor, endpoint,
+    field_path, observed_type) row's occurrence_count increments and
+    last_observed_* updates on every call that observes it again; a
+    path/type never observed before is inserted fresh with
+    occurrence_count = 1."""
+    if not observations:
+        return
+    relation = _relation(ops_schema, _SCHEMA_OBSERVATION)
+    now = datetime.now(timezone.utc)
+    rows = [
+        (vendor, endpoint, path, type_name, fingerprint, run_id, page_number, now, run_id, page_number, now)
+        for path, type_names in observations.items()
+        for type_name in sorted(type_names)
+    ]
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO {relation} AS so "
+            "(vendor, endpoint, field_path, observed_type, fingerprint, first_observed_run_id, "
+            "first_observed_page_number, first_observed_at, last_observed_run_id, "
+            "last_observed_page_number, last_observed_at, occurrence_count) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1) "
+            "ON CONFLICT (vendor, endpoint, field_path, observed_type) DO UPDATE SET "
+            "fingerprint = EXCLUDED.fingerprint, last_observed_run_id = EXCLUDED.last_observed_run_id, "
+            "last_observed_page_number = EXCLUDED.last_observed_page_number, "
+            "last_observed_at = EXCLUDED.last_observed_at, "
+            "occurrence_count = so.occurrence_count + 1",
+            rows,
+        )
+
+
+def get_cursor(conn, ops_schema, vendor, endpoint):
+    """Read-only (no row lock) lookup of the current committed cursor for
+    (vendor, endpoint) -- used by `object_extract.py` to resolve the
+    default `--since`/requested cursor for a fresh extraction. Returns
+    `None` if this (vendor, endpoint) has never had a committed run."""
+    relation = _relation(ops_schema, _INGESTION_CURSOR)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT committed_cursor, successful_run_id, committed_at FROM {relation} "
+            "WHERE vendor = %s AND endpoint = %s",
+            (vendor, endpoint),
+        )
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    committed_cursor, successful_run_id, committed_at = row
+    return {"committed_cursor": committed_cursor, "successful_run_id": successful_run_id, "committed_at": committed_at}

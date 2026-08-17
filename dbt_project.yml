@@ -37,18 +37,36 @@ flags:
   require_ref_searches_node_package_before_root: true
 
 vars:
+  # Six-schema lineage (see docs/SOURCE_CONTRACT.md "Schema lineage" and
+  # config.py's IngestConfig -- these defaults are kept in sync with that
+  # module's own RAW_SCHEMA/OPS_SCHEMA/STAGING_SCHEMA/INPUT_LAYER_SCHEMA/
+  # ANALYTICS_CORE_SCHEMA/ANALYTICS_MARTS_SCHEMA defaults). Always pass
+  # --vars (or rely on the CLI's `tuva-ingest dbt`/`tuva-ingest run`,
+  # which does this for you from IngestConfig) rather than hard-coding a
+  # deployment-specific schema name here.
+  #
   # Read by models/sources.yml and models/staging/*.sql -- the schema
-  # src/tuva_ingest/raw_loader.py loads eligibility/medical_claim/
-  # pharmacy_claim into. Always pass --vars (or rely on the CLI's `tuva-
-  # ingest dbt`/`tuva-ingest run`, which does this for you) rather than
-  # hard-coding a deployment-specific schema name here.
-  raw_schema: raw
+  # both the legacy raw_loader.py and the new object_raw_loader.py load
+  # eligibility/medical_claim/pharmacy_claim into.
+  raw_schema: raw_incoming
+  # Read by the custom generate_schema_name macro (see
+  # macros/generate_schema_name.sql) for models/staging/* -- the schema
+  # dbt's staging (cast/normalize/dedupe) models materialize into.
+  staging_schema: staging_incoming
   # Read by the custom generate_schema_name macro (see
   # macros/generate_schema_name.sql) for models/final/* -- the schema the
   # Tuva Input Layer models are materialized into, and therefore the
   # schema the Tuva package's own sources.yml-equivalent ref() calls
   # resolve against.
   input_layer_schema: input_layer
+  # Read by generate_schema_name.sql's Tuva-package-routing heuristic
+  # (see that macro's own docstring for exactly how, and its documented
+  # "best-effort, unverified without `dbt deps`" caveat) -- routes the
+  # pinned Tuva package's own `core`/`terminology` schema output into
+  # analytics_core_schema, and every other Tuva-package schema (its
+  # various mart schemas) into analytics_marts_schema.
+  analytics_core_schema: analytics_core
+  analytics_marts_schema: analytics_marts
 
   # Tuva 0.18.0 domain enablement (see README.md "dbt Variables" /
   # https://thetuvaproject.com/getting-started and
@@ -74,7 +92,7 @@ vars:
 models:
   tuva_ingest_connector:
     staging:
-      +schema: staging
+      +schema: "{{ var('staging_schema') }}"
       +materialized: view
       +tags: ["input_layer"]
       +docs:

@@ -70,7 +70,7 @@ from datetime import date
 from pathlib import Path
 
 from . import __version__
-from .config import ALL_REQUIREMENTS, REQUIRE_DB, REQUIRE_PAGINATED, REQUIRE_RAW_DATA, IngestConfig
+from .config import ALL_REQUIREMENTS, REQUIRE_DB, REQUIRE_OBJECT_STORAGE, REQUIRE_PAGINATED, REQUIRE_RAW_DATA, IngestConfig
 from .errors import (
     CliUsageError,
     ConnectorError,
@@ -223,6 +223,9 @@ def _resolve_since(config: IngestConfig, *, endpoint: str, since_override: str |
 
 
 def _cmd_extract(args: argparse.Namespace) -> int:
+    if getattr(args, "storage", "filesystem") == "object-storage":
+        return _cmd_extract_object_storage(args)
+
     from .pagination import extract_paginated_run
 
     endpoint = _validate_endpoint(args.endpoint)
@@ -251,6 +254,194 @@ def _cmd_extract(args: argparse.Namespace) -> int:
             "page_count": result.page_count,
             "record_count": result.total_record_count,
             "candidate_high_water_mark": result.candidate_high_water_mark,
+        }
+    )
+    return 0
+
+
+# --- extract / load / sync (object-storage-backed) --------------------------
+#
+# The `--storage object-storage` variant of `extract`/`load`/`sync` --
+# see object_extract.py/object_raw_loader.py's module docstrings. Shares
+# the same --endpoint/--since vocabulary and validation as the
+# filesystem-backed commands above; only the durable storage target and
+# the operational/control tables it writes to (ingestion_run/page/
+# cursor/rejected_record/schema_observation, never ingestion_runs/
+# table_loads/source_watermarks) differ. `--storage filesystem` (the
+# default) preserves the exact pre-existing behavior of every command
+# above, unchanged.
+
+
+def _resolve_object_storage_since(config: IngestConfig, *, endpoint: str, since_override: str | None) -> str | None:
+    from . import state
+    from .db import connect
+    from .endpoint_contract import normalized_endpoint
+
+    if since_override is not None:
+        return since_override
+    conn = connect(config.pg_dsn_value)
+    try:
+        prior = state.get_cursor(conn, config.ops_schema, config.source_name, normalized_endpoint(endpoint))
+    finally:
+        conn.close()
+    return prior["committed_cursor"] if prior else None
+
+
+def _cmd_extract_object_storage(args: argparse.Namespace) -> int:
+    from .object_extract import extract_to_object_storage
+    from .object_storage.factory import build_backend
+    from .secrets import retrieve_api_credential
+    from .db import connect
+
+    endpoint = _validate_endpoint(args.endpoint)
+    since_override = _validate_since(args.since)
+
+    config = IngestConfig.load(required=REQUIRE_OBJECT_STORAGE)
+    logger = configure_logging(config.log_level)
+
+    since = _resolve_object_storage_since(config, endpoint=endpoint, since_override=since_override)
+    credential = retrieve_api_credential(config, logger=logger)
+    backend = build_backend(config)
+
+    client = _build_api_client(config, logger, token=credential.api_token_value)
+    conn = connect(config.pg_dsn_value)
+    try:
+        result = extract_to_object_storage(conn, config, client, backend, logger, endpoint=endpoint, since=since)
+    finally:
+        client.close()
+        conn.close()
+
+    _print_json(
+        {
+            "event": "extract",
+            "storage": "object-storage",
+            "run_id": result.run_id,
+            "endpoint": result.endpoint,
+            "since": result.since,
+            "status": "succeeded",
+            "run_prefix": result.run_prefix,
+            "page_count": result.page_count,
+            "record_count": result.total_record_count,
+            "candidate_cursor": result.candidate_cursor,
+        }
+    )
+    return 0
+
+
+def _run_object_load(run_id: str, *, config: IngestConfig, logger) -> dict:
+    """The object-storage-backed analogue of `_run_paginated_load` -- see
+    object_raw_loader.load_verified_run's module docstring for the exact
+    step-by-step transactional contract this wraps: one auto-committing
+    'loading' status write, then a single atomic transaction (verify,
+    page-by-page COPY+merge, cursor lock/validate/advance, run
+    'committed' status), committed once at the very end -- or rolled
+    back entirely, followed by a separate `state.mark_run_failed` write,
+    on any failure."""
+    from . import state
+    from .db import connect, qualified_relation
+    from .object_raw_loader import load_verified_run
+    from .object_storage.factory import build_backend
+    from .object_storage.keys import build_run_key, validate_run_id
+
+    config_run_id = validate_run_id(run_id)
+    backend = build_backend(config)
+
+    conn = connect(config.pg_dsn_value)
+    try:
+        ingestion_run_relation = qualified_relation(config.ops_schema, "ingestion_run", schema_label="ops_schema")
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT vendor, endpoint, load_date, storage_run_prefix FROM {ingestion_run_relation} "
+                f"WHERE run_id = %s",
+                (config_run_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            raise RunNotFoundError(
+                f"run_id {run_id!r} has no ingestion_run row -- run `tuva-ingest extract --storage "
+                "object-storage` first"
+            )
+        vendor, endpoint, load_date, _storage_run_prefix = row
+        run_key = build_run_key(
+            prefix=config.object_storage_prefix, vendor=vendor, endpoint=endpoint, load_date=load_date,
+            run_id=config_run_id,
+        )
+
+        state.mark_run_load_started(conn, config.ops_schema, config_run_id)
+
+        try:
+            result = load_verified_run(conn, config, backend, run_key, logger=logger)
+        except (ReconciliationError, CursorError, RawLoadError) as exc:
+            conn.rollback()
+            category = getattr(exc, "category", "raw_load")
+            state.mark_run_failed(conn, config.ops_schema, config_run_id, failure_category=category, failure_message=str(exc))
+            log_event(logger, "object_run_failed", run_id=config_run_id, endpoint=endpoint, error_category=category, error_message=str(exc))
+            raise
+
+        conn.commit()
+        log_event(logger, "object_run_succeeded", run_id=config_run_id, endpoint=endpoint, inserted_count=result.inserted_count)
+        return {
+            "event": "load",
+            "storage": "object-storage",
+            "run_id": result.run_id,
+            "endpoint": result.endpoint,
+            "table": result.table,
+            "status": "succeeded",
+            "extracted_count": result.extracted_count,
+            "accepted_count": result.accepted_count,
+            "rejected_count": result.rejected_count,
+            "inserted_count": result.inserted_count,
+            "duplicate_count": result.duplicate_count,
+            "candidate_cursor": result.candidate_cursor,
+        }
+    finally:
+        conn.close()
+
+
+def _cmd_load_object_storage(args: argparse.Namespace) -> int:
+    config = IngestConfig.load(required=REQUIRE_DB)
+    logger = configure_logging(config.log_level)
+    result = _run_object_load(args.run_id, config=config, logger=logger)
+    _print_json(result)
+    return 0
+
+
+def _cmd_sync_object_storage(args: argparse.Namespace) -> int:
+    from .object_extract import extract_to_object_storage
+    from .object_storage.factory import build_backend
+    from .secrets import retrieve_api_credential
+    from .db import connect
+
+    endpoint = _validate_endpoint(args.endpoint)
+    since_override = _validate_since(args.since)
+
+    config = IngestConfig.load(required=REQUIRE_OBJECT_STORAGE)
+    logger = configure_logging(config.log_level)
+
+    since = _resolve_object_storage_since(config, endpoint=endpoint, since_override=since_override)
+    credential = retrieve_api_credential(config, logger=logger)
+    backend = build_backend(config)
+
+    client = _build_api_client(config, logger, token=credential.api_token_value)
+    conn = connect(config.pg_dsn_value)
+    try:
+        extracted = extract_to_object_storage(conn, config, client, backend, logger, endpoint=endpoint, since=since)
+    finally:
+        client.close()
+        conn.close()
+
+    load_result = _run_object_load(extracted.run_id, config=config, logger=logger)
+
+    _print_json(
+        {
+            "event": "sync",
+            "storage": "object-storage",
+            "run_id": extracted.run_id,
+            "endpoint": endpoint,
+            "since": since,
+            "status": "succeeded",
+            "inserted_count": load_result.get("inserted_count"),
+            "candidate_cursor": load_result.get("candidate_cursor"),
         }
     )
     return 0
@@ -396,6 +587,9 @@ def _cmd_load(args: argparse.Namespace) -> int:
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
+    if getattr(args, "storage", "filesystem") == "object-storage":
+        return _cmd_sync_object_storage(args)
+
     from .pagination import extract_paginated_run
 
     endpoint = _validate_endpoint(args.endpoint)
@@ -644,6 +838,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     from .endpoints import SUPPORTED_ENDPOINTS
 
+    _storage_help = (
+        "'filesystem' (default): the pre-existing local-directory pagination contract "
+        "(pagination.py/paginated_loader.py), unchanged. 'object-storage': durable, immutable "
+        "object-storage-backed extraction/load (object_extract.py/object_raw_loader.py) -- see "
+        "docs/SOURCE_CONTRACT.md 'Object storage'."
+    )
+
     p_extract = subparsers.add_parser(
         "extract", help="fetch + validate a manifest for one --endpoint and publish a raw snapshot"
     )
@@ -651,17 +852,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--endpoint", required=True, choices=SUPPORTED_ENDPOINTS, help="one supported endpoint (see docs/API_MANIFEST.md)"
     )
     p_extract.add_argument("--since", default=None, help="ISO-8601 date (YYYY-MM-DD); optional, passed through to the manifest request")
+    p_extract.add_argument("--storage", choices=("filesystem", "object-storage"), default="filesystem", help=_storage_help)
     p_extract.set_defaults(func=_cmd_extract)
 
     p_load = subparsers.add_parser(
         "load", help="load a previously extracted run (--run-id) into that one endpoint's raw table only"
     )
     p_load.add_argument("--run-id", required=True, help="the run_id printed by `tuva-ingest extract`")
+    p_load.add_argument("--storage", choices=("filesystem", "object-storage"), default="filesystem", help=_storage_help)
     p_load.set_defaults(func=_cmd_load)
 
     p_sync = subparsers.add_parser("sync", help="extract, then load, one --endpoint in a single command")
     p_sync.add_argument("--endpoint", required=True, choices=SUPPORTED_ENDPOINTS)
     p_sync.add_argument("--since", default=None, help="ISO-8601 date (YYYY-MM-DD)")
+    p_sync.add_argument("--storage", choices=("filesystem", "object-storage"), default="filesystem", help=_storage_help)
     p_sync.set_defaults(func=_cmd_sync)
 
     p_load_raw = subparsers.add_parser(

@@ -142,11 +142,37 @@ class _TestConfig:
 
 
 class TestMigrationsAgainstRealDatabase(_IsolatedSchemaTestCase):
-    def test_all_five_migrations_applied(self):
+    def test_all_six_migrations_applied(self):
         status = migrations.status(self.conn, self.config)
-        self.assertEqual([m.version for m in status.applied], ["001", "002", "003", "004", "005"])
+        self.assertEqual([m.version for m in status.applied], ["001", "002", "003", "004", "005", "006"])
         self.assertEqual(status.pending, ())
         self.assertFalse(status.has_integrity_failures)
+
+    def test_five_canonical_operational_tables_exist(self):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = %s ORDER BY table_name",
+                (self.ops_schema,),
+            )
+            tables = {row[0] for row in cur.fetchall()}
+        for expected in (
+            "ingestion_run", "ingestion_page", "ingestion_cursor", "rejected_record", "schema_observation",
+        ):
+            self.assertIn(expected, tables)
+
+    def test_raw_tables_have_seven_new_metadata_columns(self):
+        expected_columns = {
+            "_ingestion_run_id", "_ingested_at", "_source_endpoint", "_source_record_id",
+            "_source_updated_at", "_payload_hash", "_raw_payload",
+        }
+        for table in ("eligibility", "medical_claim", "pharmacy_claim"):
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+                    (self.raw_schema, table),
+                )
+                columns = {row[0] for row in cur.fetchall()}
+            self.assertTrue(expected_columns.issubset(columns), f"{table} missing metadata columns: {expected_columns - columns}")
 
     def test_second_apply_is_a_true_no_op(self):
         first = migrations.apply_pending(self.conn, self.config)

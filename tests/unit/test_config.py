@@ -44,6 +44,15 @@ _ENV_KEYS = [
     "TUVA_API_PAGE_SIZE",
     "TUVA_API_MAX_PAGES",
     "TUVA_API_MAX_PAGE_BYTES",
+    "STAGING_SCHEMA",
+    "ANALYTICS_CORE_SCHEMA",
+    "ANALYTICS_MARTS_SCHEMA",
+    "OBJECT_STORAGE_PROVIDER",
+    "OBJECT_STORAGE_BUCKET",
+    "OBJECT_STORAGE_PREFIX",
+    "OBJECT_STORAGE_REGION",
+    "OBJECT_STORAGE_ENDPOINT_URL",
+    "OBJECT_STORAGE_LOCAL_ROOT",
 ]
 
 
@@ -79,12 +88,81 @@ class TestIngestConfig(_EnvIsolatedTestCase):
     def test_valid_config_loads_with_defaults(self):
         self._set(**_valid_env())
         config = IngestConfig.load()
-        self.assertEqual(config.raw_schema, "raw")
-        self.assertEqual(config.ops_schema, "ingest_ops")
+        # Six-schema lineage defaults (see docs/SOURCE_CONTRACT.md "Schema
+        # lineage") -- changed from raw/ingest_ops as part of adding
+        # object storage; RAW_SCHEMA/OPS_SCHEMA overrides still work
+        # exactly as before (see test_unsafe_raw_schema_identifier_rejected
+        # and the override tests below).
+        self.assertEqual(config.raw_schema, "raw_incoming")
+        self.assertEqual(config.ops_schema, "ops")
+        self.assertEqual(config.staging_schema, "staging_incoming")
         self.assertEqual(config.input_layer_schema, "input_layer")
+        self.assertEqual(config.analytics_core_schema, "analytics_core")
+        self.assertEqual(config.analytics_marts_schema, "analytics_marts")
         self.assertEqual(config.source_name, "tuva")
         self.assertEqual(config.ingest_role, "tuva_ingest_role")
         self.assertEqual(config.transform_role, "tuva_transform_role")
+        # Object storage defaults (see docs/SOURCE_CONTRACT.md "Object storage").
+        self.assertEqual(config.object_storage_provider, "local")
+        self.assertIsNone(config.object_storage_bucket)
+        self.assertEqual(config.object_storage_prefix, "raw")
+        self.assertIsNone(config.object_storage_region)
+        self.assertIsNone(config.object_storage_endpoint_url)
+
+    def test_raw_schema_override_still_works_for_existing_deployments(self):
+        # An existing deployment that explicitly pins RAW_SCHEMA/OPS_SCHEMA
+        # to its pre-existing value must keep working unchanged -- only the
+        # DEFAULT changed, never override behavior.
+        env = _valid_env()
+        env["RAW_SCHEMA"] = "raw"
+        env["OPS_SCHEMA"] = "ingest_ops"
+        self._set(**env)
+        config = IngestConfig.load()
+        self.assertEqual(config.raw_schema, "raw")
+        self.assertEqual(config.ops_schema, "ingest_ops")
+
+    def test_object_storage_s3_requires_bucket(self):
+        env = _valid_env()
+        env["OBJECT_STORAGE_PROVIDER"] = "s3"
+        self._set(**env)
+        with self.assertRaises(ConfigError) as ctx:
+            IngestConfig.load()
+        self.assertIn("OBJECT_STORAGE_BUCKET", str(ctx.exception))
+
+    def test_object_storage_s3_with_bucket_succeeds(self):
+        env = _valid_env()
+        env["OBJECT_STORAGE_PROVIDER"] = "s3"
+        env["OBJECT_STORAGE_BUCKET"] = "my-bucket"
+        self._set(**env)
+        config = IngestConfig.load()
+        self.assertEqual(config.object_storage_bucket, "my-bucket")
+
+    def test_unsupported_object_storage_provider_rejected(self):
+        env = _valid_env()
+        env["OBJECT_STORAGE_PROVIDER"] = "azure-blob"
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
+
+    def test_object_storage_config_redacted_in_safe_dict(self):
+        # No credentials are ever stored in IngestConfig for object
+        # storage (ambient credentials only) -- safe_dict() should
+        # surface the non-secret settings plainly (nothing to redact).
+        env = _valid_env()
+        env["OBJECT_STORAGE_BUCKET"] = "my-bucket"
+        self._set(**env)
+        config = IngestConfig.load()
+        safe = config.safe_dict()
+        self.assertEqual(safe["object_storage_bucket"], "my-bucket")
+        self.assertNotIn("access_key", str(safe).lower())
+        self.assertNotIn("secret_key", str(safe).lower())
+
+    def test_six_schemas_must_be_pairwise_distinct(self):
+        env = _valid_env()
+        env["ANALYTICS_CORE_SCHEMA"] = "analytics_marts"  # collides with the other default
+        self._set(**env)
+        with self.assertRaises(ConfigError):
+            IngestConfig.load()
 
     def test_missing_required_fields_fail_fast_with_all_errors_listed(self):
         with self.assertRaises(ConfigError) as ctx:

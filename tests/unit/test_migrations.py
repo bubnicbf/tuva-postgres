@@ -23,9 +23,9 @@ class TestDiscoverRealMigrations(unittest.TestCase):
     directory -- proves the three shipped files are well-formed, unique,
     and discoverable, not just that discover() works in the abstract."""
 
-    def test_discovers_five_migrations_in_order(self):
+    def test_discovers_six_migrations_in_order(self):
         found = migrations.discover(REPO_ROOT / "migrations")
-        self.assertEqual([m.version for m in found], ["001", "002", "003", "004", "005"])
+        self.assertEqual([m.version for m in found], ["001", "002", "003", "004", "005", "006"])
         self.assertEqual(
             [m.filename for m in found],
             [
@@ -34,8 +34,21 @@ class TestDiscoverRealMigrations(unittest.TestCase):
                 "003_roles_and_grants.sql",
                 "004_endpoint_scoped_ingestion.sql",
                 "005_paginated_extraction_state.sql",
+                "006_object_storage_raw_contract.sql",
             ],
         )
+
+    def test_migration_006_mentions_every_new_canonical_table(self):
+        # A structural (not checksum-weakening) proof that 006 actually
+        # defines every required new operational/raw object -- catches an
+        # accidental partial migration without needing a live database.
+        sql_text = (REPO_ROOT / "migrations" / "006_object_storage_raw_contract.sql").read_text(encoding="utf-8")
+        for expected in (
+            "ingestion_run", "ingestion_page", "ingestion_cursor", "rejected_record", "schema_observation",
+            "_ingestion_run_id", "_ingested_at", "_source_endpoint", "_source_record_id",
+            "_source_updated_at", "_payload_hash", "_raw_payload",
+        ):
+            self.assertIn(expected, sql_text, f"migration 006 does not mention {expected!r}")
 
     def test_checksums_are_stable_across_repeated_discovery(self):
         first = migrations.discover(REPO_ROOT / "migrations")

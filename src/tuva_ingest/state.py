@@ -38,6 +38,7 @@ from .db import qualified_relation
 
 _INGESTION_RUNS = "ingestion_runs"
 _TABLE_LOADS = "table_loads"
+_SOURCE_WATERMARKS = "source_watermarks"
 
 
 def _relation(ops_schema: str, table: str) -> str:
@@ -244,16 +245,15 @@ def upsert_running_run(
 
     This is what makes `tuva-ingest load --run-id X` (and `sync`, which
     calls it with the same `run_id` `extract` just produced) safe to
-    repeat: `run_id` is stable (this connector reuses the extraction's
-    own immutable `snapshot_id` as its run id -- see
-    `extract.EndpointExtractResult`), so a second `load --run-id X` must
-    never fail with a duplicate-primary-key error against
-    `ingestion_runs`; it must instead idempotently redo the load and
-    leave `ingestion_runs` describing the most recent attempt. Contrast
-    with `create_running_run` above, which every *fresh*-run-id caller
-    (`run`, legacy `load-raw`, both of which mint a new uuid4-based
-    run_id every invocation) still uses -- those never need upsert
-    semantics because their run_id is never reused.
+    repeat: `run_id` is stable for the lifetime of one extraction attempt
+    (see `pagination.extract_paginated_run`'s `_mint_run_id`), so a
+    second `load --run-id X` must never fail with a duplicate-primary-key
+    error against `ingestion_runs`; it must instead idempotently redo the
+    load and leave `ingestion_runs` describing the most recent attempt.
+    Contrast with `create_running_run` above, which every *fresh*-run-id
+    caller (`run`, legacy `load-raw`, both of which mint a new
+    uuid4-based run_id every invocation) still uses -- those never need
+    upsert semantics because their run_id is never reused.
 
     Requires migrations/004_endpoint_scoped_ingestion.sql (the `endpoint`/
     `requested_since` columns on `ingestion_runs`).
@@ -298,3 +298,51 @@ def upsert_table_load_pending(conn, ops_schema, run_id, *, table, expected_sha25
             (run_id, table, expected_sha256, expected_size_bytes, datetime.now(timezone.utc)),
         )
     conn.commit()
+
+
+
+# --- durable high-water-mark state (migrations/005_paginated_extraction_state.sql) ---
+
+
+def get_watermark(conn, ops_schema, source, endpoint) -> dict | None:
+    """Read the durable, committed high-water mark for one (source,
+    endpoint) pair. Returns `None` if no watermark has ever been
+    committed for it (a fresh endpoint, or one that has never had a
+    fully-successful paginated `load`/`sync`) -- never a default/zero
+    value that could be mistaken for a real prior commit."""
+    relation = _relation(ops_schema, _SOURCE_WATERMARKS)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT high_water_mark, successful_run_id, committed_at FROM {relation} "
+            f"WHERE source = %s AND endpoint = %s",
+            (source, endpoint),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    high_water_mark, successful_run_id, committed_at = row
+    return {"high_water_mark": high_water_mark, "successful_run_id": successful_run_id, "committed_at": committed_at}
+
+
+def commit_watermark(conn, ops_schema, source, endpoint, *, high_water_mark, successful_run_id) -> None:
+    """Advance the durable high-water mark for (source, endpoint) to
+    `high_water_mark`/`successful_run_id`. Callers (see
+    `paginated_loader`/cli.py's `_run_paginated_load`) must call this as
+    the LAST step of the load transaction, immediately before
+    `conn.commit()`, and only after every page has been loaded and every
+    reconciliation count has matched -- this function itself does not
+    re-validate backward movement (see `cli._run_paginated_load`'s
+    explicit backward-movement guard, which runs before this is called);
+    it unconditionally sets the value it is given. Does not commit --
+    the caller's single transaction commit covers this write too, so the
+    data load and the watermark advance are atomic together."""
+    relation = _relation(ops_schema, _SOURCE_WATERMARKS)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {relation} (source, endpoint, high_water_mark, successful_run_id, committed_at) "
+            f"VALUES (%s, %s, %s, %s, %s) "
+            f"ON CONFLICT (source, endpoint) DO UPDATE SET "
+            f"high_water_mark = EXCLUDED.high_water_mark, successful_run_id = EXCLUDED.successful_run_id, "
+            f"committed_at = EXCLUDED.committed_at",
+            (source, endpoint, high_water_mark, successful_run_id, datetime.now(timezone.utc)),
+        )

@@ -162,8 +162,13 @@ services:
       DBT_PROJECT_DIR: /app
       DBT_TARGET: dev
       # Not set here on purpose (see usage note above): TUVA_API_MANIFEST_URL,
-      # TUVA_API_TOKEN. Supply them on the command line or a local .env
-      # file (never committed) to run `ingest extract`/`ingest run` end to end.
+      # TUVA_API_TOKEN, TUVA_API_SECRET_PROVIDER/TUVA_API_SECRET_ID/AWS_REGION.
+      # Supply them on the command line or a local .env file (never
+      # committed) to run `ingest extract`/`ingest sync`/`ingest run` end
+      # to end. The default TUVA_API_SECRET_PROVIDER (env) needs only
+      # TUVA_API_TOKEN; TUVA_API_SECRET_PROVIDER=aws additionally needs
+      # ambient AWS credentials mounted/available to the container (this
+      # compose file does not configure that -- it is a local-only setup).
     volumes:
       - raw-data:/app/data/raw
       - dbt-packages:/app/dbt_packages

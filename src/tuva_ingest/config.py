@@ -59,6 +59,15 @@ REQUIRE_RAW_DATA = frozenset({"raw_data_dir"})
 
 ALL_REQUIREMENTS = REQUIRE_API | REQUIRE_DB | REQUIRE_RAW_DATA
 
+# The paginated extract/load/sync commands (see cli.py, pagination.py,
+# paginated_loader.py) retrieve their API credential from the configured
+# secret provider (see secrets.py) rather than requiring TUVA_API_TOKEN
+# directly -- so, unlike REQUIRE_API above, this set deliberately omits
+# "api_token". They do need TUVA_API_MANIFEST_URL (reused as the page-
+# request URL), RAW_DATA_DIR (immutable page-file staging/publish), and
+# PG_DSN (watermark lookups plus the load/reconcile/commit transaction).
+REQUIRE_PAGINATED = frozenset({"api_manifest_url", "raw_data_dir", "pg_dsn"})
+
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 # Single source of truth mapping each pydantic field name to the exact
@@ -94,6 +103,19 @@ _ENV_ALIASES: dict[str, str] = {
     "source_name": "SOURCE_NAME",
     "ingest_role": "INGEST_ROLE",
     "transform_role": "TRANSFORM_ROLE",
+    "api_secret_provider": "TUVA_API_SECRET_PROVIDER",
+    "api_secret_id": "TUVA_API_SECRET_ID",
+    "aws_region": "AWS_REGION",
+    "api_page_size": "TUVA_API_PAGE_SIZE",
+    "api_max_pages": "TUVA_API_MAX_PAGES",
+    "api_max_page_bytes": "TUVA_API_MAX_PAGE_BYTES",
+    "api_max_records_per_run": "TUVA_API_MAX_RECORDS_PER_RUN",
+    "api_max_retry_duration_seconds": "TUVA_API_MAX_RETRY_DURATION_SECONDS",
+    "oauth_token_url": "TUVA_OAUTH_TOKEN_URL",
+    "oauth_client_id": "TUVA_OAUTH_CLIENT_ID",
+    "oauth_client_secret": "TUVA_OAUTH_CLIENT_SECRET",
+    "oauth_scopes": "TUVA_OAUTH_SCOPES",
+    "oauth_refresh_skew_seconds": "TUVA_OAUTH_REFRESH_SKEW_SECONDS",
 }
 
 
@@ -215,6 +237,69 @@ class IngestConfig(BaseSettings):
     ingest_role: str = Field(default="tuva_ingest_role", validation_alias=_ENV_ALIASES["ingest_role"])
     transform_role: str = Field(default="tuva_transform_role", validation_alias=_ENV_ALIASES["transform_role"])
 
+    # --- cloud secret manager (see secrets.py) --------------------------
+    # Non-secret lookup information only -- the credential itself is
+    # always retrieved at runtime from the configured provider, never
+    # read from a plaintext env var here (except the "env" provider,
+    # which *is* TUVA_API_TOKEN by design -- see secrets.EnvSecretProvider
+    # and this field's own default, kept for full backward compatibility
+    # with every existing local/CI/test workflow).
+    api_secret_provider: str = Field(default="env", validation_alias=_ENV_ALIASES["api_secret_provider"])
+    api_secret_id: str | None = Field(default=None, validation_alias=_ENV_ALIASES["api_secret_id"])
+    aws_region: str | None = Field(default=None, validation_alias=_ENV_ALIASES["aws_region"])
+
+    # --- paginated extraction (see pagination.py) -----------------------
+    api_page_size: int | None = Field(default=None, gt=0, validation_alias=_ENV_ALIASES["api_page_size"])
+    # Hard ceiling on pagination loop iterations -- the final defense
+    # against an infinite pagination loop (a source that never returns a
+    # null next_page_token, or a pagination cycle this connector's own
+    # repeated-token detection somehow missed).
+    api_max_pages: int = Field(default=10_000, gt=0, validation_alias=_ENV_ALIASES["api_max_pages"])
+    # Per-page response size ceiling (mirrors api_client.MAX_MANIFEST_BYTES'
+    # role for the manifest contract, sized larger since a page of JSON
+    # records is expected to be larger than a manifest document).
+    api_max_page_bytes: int = Field(
+        default=64 * 1024 * 1024, gt=0, validation_alias=_ENV_ALIASES["api_max_page_bytes"]
+    )
+    # Absolute safety ceiling on total source records accepted in one
+    # extraction run (counts every record, including any later
+    # quarantined -- see pagination.py's record-count enforcement,
+    # applied after each page's envelope is validated but before that
+    # page is published/loaded). A conservative default for the current,
+    # self-defined source contract (see docs/SOURCE_CONTRACT.md
+    # "Maximum expected backfill volume"); override for a source with a
+    # legitimately larger expected volume.
+    api_max_records_per_run: int = Field(
+        default=2_000_000, gt=0, validation_alias=_ENV_ALIASES["api_max_records_per_run"]
+    )
+    # Absolute wall-clock ceiling (via a monotonic clock -- see retry.py)
+    # on how long the bounded retry loop for one logical request may keep
+    # retrying, on top of (never instead of) api_max_retries. Whichever
+    # bound is hit first stops the loop; a computed delay is never slept
+    # if it would exceed the remaining budget (see retry.BoundedRetryExecutor).
+    api_max_retry_duration_seconds: float = Field(
+        default=120.0, gt=0, validation_alias=_ENV_ALIASES["api_max_retry_duration_seconds"]
+    )
+
+    # --- OAuth 2.0 token lifecycle (see oauth.py) -------------------------
+    # All optional and unset by default -- this connector's default auth
+    # mode remains the pre-existing static bearer token (TUVA_API_TOKEN /
+    # secrets.py). Setting TUVA_OAUTH_TOKEN_URL is what opts a deployment
+    # into OAuth (see cli.py's `_build_api_client`): when set,
+    # TUVA_OAUTH_CLIENT_ID and TUVA_OAUTH_CLIENT_SECRET become required
+    # (enforced in `_check_cross_field_rules` below, not via `required=`,
+    # since this applies uniformly regardless of which CLI command runs).
+    oauth_token_url: str | None = Field(default=None, validation_alias=_ENV_ALIASES["oauth_token_url"])
+    oauth_client_id: str | None = Field(default=None, validation_alias=_ENV_ALIASES["oauth_client_id"])
+    oauth_client_secret: SecretStr | None = Field(default=None, validation_alias=_ENV_ALIASES["oauth_client_secret"])
+    oauth_scopes: str | None = Field(default=None, validation_alias=_ENV_ALIASES["oauth_scopes"])
+    # How many seconds of remaining token lifetime trigger a proactive
+    # refresh (see oauth.OAuthTokenManager.get_access_token) -- refreshing
+    # a little early avoids a request racing an about-to-expire token.
+    oauth_refresh_skew_seconds: float = Field(
+        default=60.0, gt=0, validation_alias=_ENV_ALIASES["oauth_refresh_skew_seconds"]
+    )
+
     # --- field-level validators (always run, regardless of `required`) ---
 
     @field_validator("raw_schema")
@@ -261,6 +346,15 @@ class IngestConfig(BaseSettings):
             raise ValueError("must not be empty")
         return value
 
+    @field_validator("api_secret_provider")
+    @classmethod
+    def _check_api_secret_provider(cls, value: str) -> str:
+        from .secrets import SUPPORTED_SECRET_PROVIDERS
+
+        if value not in SUPPORTED_SECRET_PROVIDERS:
+            raise ValueError(f"must be one of {sorted(SUPPORTED_SECRET_PROVIDERS)}")
+        return value
+
     @field_validator("api_manifest_url")
     @classmethod
     def _check_manifest_url_scheme(cls, value: str | None) -> str | None:
@@ -275,6 +369,8 @@ class IngestConfig(BaseSettings):
         "api_write_timeout_seconds",
         "api_pool_timeout_seconds",
         "api_max_retry_delay_seconds",
+        "api_max_retry_duration_seconds",
+        "oauth_refresh_skew_seconds",
         "pipeline_max_success_age_hours",
     )
     @classmethod
@@ -310,6 +406,25 @@ class IngestConfig(BaseSettings):
             )
         if self.ingest_role == self.transform_role:
             errors.append("INGEST_ROLE and TRANSFORM_ROLE must differ (least-privilege role separation)")
+
+        if self.api_secret_provider == "aws" and not self.api_secret_id:
+            errors.append(
+                "TUVA_API_SECRET_PROVIDER=aws requires TUVA_API_SECRET_ID to be set (the AWS Secrets "
+                "Manager secret name or ARN to retrieve -- see secrets.py)"
+            )
+
+        if self.oauth_token_url:
+            if not self.oauth_client_id:
+                errors.append("TUVA_OAUTH_TOKEN_URL is set but TUVA_OAUTH_CLIENT_ID is not (both are required for OAuth)")
+            if not self.oauth_client_secret:
+                errors.append("TUVA_OAUTH_TOKEN_URL is set but TUVA_OAUTH_CLIENT_SECRET is not (both are required for OAuth)")
+            if not self.oauth_token_url.startswith(("https://", "http://")):
+                errors.append("TUVA_OAUTH_TOKEN_URL must be an http(s) URL")
+            elif self.oauth_token_url.startswith("http://") and not self.api_allow_insecure_http:
+                errors.append(
+                    "TUVA_OAUTH_TOKEN_URL uses plain HTTP but TUVA_API_ALLOW_INSECURE_HTTP is not enabled; "
+                    "HTTPS is required by default for an endpoint that receives a client secret"
+                )
 
         if errors:
             raise ValueError("; ".join(errors))
@@ -372,6 +487,13 @@ class IngestConfig(BaseSettings):
         return value anywhere that might be logged."""
         return self.pg_dsn.get_secret_value() if self.pg_dsn else None
 
+    @property
+    def oauth_client_secret_value(self) -> str | None:
+        """The real OAuth client secret, unwrapped. Call only at the
+        point `oauth.OAuthTokenManager` is constructed -- never store the
+        return value anywhere that might be logged."""
+        return self.oauth_client_secret.get_secret_value() if self.oauth_client_secret else None
+
     def httpx_timeout(self):
         """Build an `httpx.Timeout` with explicit connect/read/write/pool
         bounds -- each phase-specific env var overrides
@@ -416,6 +538,19 @@ class IngestConfig(BaseSettings):
             "source_name": self.source_name,
             "ingest_role": self.ingest_role,
             "transform_role": self.transform_role,
+            "api_secret_provider": self.api_secret_provider,
+            "api_secret_id": self.api_secret_id,
+            "aws_region": self.aws_region,
+            "api_page_size": self.api_page_size,
+            "api_max_pages": self.api_max_pages,
+            "api_max_page_bytes": self.api_max_page_bytes,
+            "api_max_records_per_run": self.api_max_records_per_run,
+            "api_max_retry_duration_seconds": self.api_max_retry_duration_seconds,
+            "oauth_token_url": self.oauth_token_url,
+            "oauth_client_id": self.oauth_client_id,
+            "oauth_client_secret": "***REDACTED***" if self.oauth_client_secret else None,
+            "oauth_scopes": self.oauth_scopes,
+            "oauth_refresh_skew_seconds": self.oauth_refresh_skew_seconds,
         }
 
     def __repr__(self) -> str:  # never let a stray print() leak secrets

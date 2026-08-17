@@ -274,5 +274,75 @@ class TestUpsertTableLoadPending(unittest.TestCase):
         self.assertIn("load_status = 'pending'", sql)
 
 
+
+
+class TestGetWatermark(unittest.TestCase):
+    def test_rejects_hostile_schema_before_touching_connection(self):
+        conn = _FakeConnection()
+        with self.assertRaises(InvalidIdentifierError):
+            state.get_watermark(conn, "ops; DROP TABLE x", "tuva", "eligibility")
+        self.assertEqual(conn.log, [])
+
+    def test_returns_none_when_no_row(self):
+        conn = _FakeConnection()
+        result = state.get_watermark(conn, "ingest_ops", "tuva", "eligibility")
+        self.assertIsNone(result)
+
+    def test_returns_dict_when_row_present(self):
+        class _Cursor(_FakeCursor):
+            def fetchone(self):
+                return ("2025-01-01T00:00:00Z", "run-123", "2025-01-02T00:00:00Z")
+
+        class _Conn(_FakeConnection):
+            def cursor(self):
+                return _Cursor(self.log)
+
+        conn = _Conn()
+        result = state.get_watermark(conn, "ingest_ops", "tuva", "eligibility")
+        self.assertEqual(result["high_water_mark"], "2025-01-01T00:00:00Z")
+        self.assertEqual(result["successful_run_id"], "run-123")
+
+    def test_queries_scoped_by_source_and_endpoint(self):
+        conn = _FakeConnection()
+        state.get_watermark(conn, "ingest_ops", "tuva", "eligibility")
+        sql, params = conn.log[0]
+        self.assertIn('"ingest_ops"."source_watermarks"', sql)
+        self.assertEqual(params, ("tuva", "eligibility"))
+
+
+class TestCommitWatermark(unittest.TestCase):
+    def test_rejects_hostile_schema_before_touching_connection(self):
+        conn = _FakeConnection()
+        with self.assertRaises(InvalidIdentifierError):
+            state.commit_watermark(
+                conn, "ops; DROP TABLE x", "tuva", "eligibility",
+                high_water_mark="hwm-1", successful_run_id="run-1",
+            )
+        self.assertEqual(conn.log, [])
+        self.assertEqual(conn.commits, 0)
+
+    def test_does_not_commit_itself(self):
+        # commit_watermark must be callable inside the caller's existing
+        # transaction, sharing its eventual conn.commit() with the data
+        # load -- it must never commit on its own.
+        conn = _FakeConnection()
+        state.commit_watermark(
+            conn, "ingest_ops", "tuva", "eligibility",
+            high_water_mark="hwm-1", successful_run_id="run-1",
+        )
+        self.assertEqual(conn.commits, 0)
+
+    def test_upsert_targets_source_and_endpoint_conflict(self):
+        conn = _FakeConnection()
+        state.commit_watermark(
+            conn, "ingest_ops", "tuva", "eligibility",
+            high_water_mark="hwm-1", successful_run_id="run-1",
+        )
+        sql, params = conn.log[0]
+        self.assertIn('"ingest_ops"."source_watermarks"', sql)
+        self.assertIn("ON CONFLICT (source, endpoint) DO UPDATE", sql)
+        self.assertEqual(params[:4], ("tuva", "eligibility", "hwm-1", "run-1"))
+
+
 if __name__ == "__main__":
     unittest.main()

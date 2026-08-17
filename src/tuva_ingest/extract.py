@@ -47,7 +47,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .api_client import ApiClient
-from .endpoints import table_for_endpoint
 from .errors import ExtractError
 from .logging_utils import log_event
 from .manifest import Manifest, parse_and_validate
@@ -180,13 +179,14 @@ class RawSnapshotStore:
         self.source_dir.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
         os.rename(staging_dir, final_dir)  # atomic: same filesystem (staging is a sibling)
 
-        # `advance_current=False` for endpoint-scoped extractions (see
-        # `extract_endpoint_snapshot` below): the source-level `current`
-        # pointer is only meaningful for the legacy, full-manifest
-        # (all-three-tables-in-one-snapshot) `run`/`load-raw` flow --
-        # advancing it for a single-endpoint snapshot would make
-        # `load-raw`'s no-`--snapshot-id` default resolve to a snapshot
-        # that is missing two of the three raw tables.
+        # `advance_current=False` exists for callers that publish a
+        # snapshot which does not contain every managed raw table (kept
+        # for API stability/testability even though every current
+        # caller -- `extract_snapshot` below -- always publishes the
+        # full three-table manifest and uses the default `True`; the
+        # paginated extraction contract, see `pagination.py`, uses its
+        # own separate `PaginatedRunStore` and never touches this
+        # `current` pointer at all).
         if advance_current:
             self._advance_current(snapshot_id)
 
@@ -247,115 +247,3 @@ def extract_snapshot(config, client: ApiClient, logger) -> ExtractResult:
     published = store.finalize(staging_dir, manifest.snapshot_id, manifest_raw, checksums)
     log_event(logger, "raw_snapshot_published", snapshot_id=manifest.snapshot_id, raw_path=str(published.path))
     return ExtractResult(snapshot_id=manifest.snapshot_id, path=published.path, skipped=False, manifest=manifest)
-
-
-@dataclass(frozen=True)
-class EndpointExtractResult:
-    """The result of one `extract --endpoint ... [--since ...]` run.
-
-    `run_id` is the stable, machine-readable identifier `load --run-id`
-    later resolves back to this exact extraction -- this connector reuses
-    the source manifest's own immutable `snapshot_id` as the run id
-    (rather than minting a second, separate identifier) since the
-    on-disk snapshot layout is already keyed by `snapshot_id`
-    (`RawSnapshotStore.snapshot_dir`); `load --run-id <value>` is
-    therefore always resolvable after this process exits, with no
-    separate run-id-to-snapshot-id mapping to keep in sync. See
-    `state.py`'s `endpoint`/`requested_since` columns (migrations/
-    004_endpoint_scoped_ingestion.sql) for where this run's requested
-    endpoint/since are additionally recorded for operator auditing.
-    """
-
-    run_id: str
-    snapshot_id: str
-    endpoint: str
-    table: str
-    since: str | None
-    path: Path
-    skipped: bool
-    manifest: Manifest
-
-
-def extract_endpoint_snapshot(
-    config, client: ApiClient, logger, *, endpoint: str, since: str | None = None
-) -> EndpointExtractResult:
-    """Fetch + validate a manifest scoped to exactly one endpoint (see
-    `endpoints.table_for_endpoint`), then either skip (identical snapshot
-    already published) or download that one artifact and publish it
-    atomically -- never touching the other two raw tables' snapshots or
-    the legacy `current` pointer (see `RawSnapshotStore.finalize`'s
-    `advance_current=False` above). `endpoint`/`since` are sent as httpx
-    query parameters (never string-concatenated into the URL) and are
-    retained in the persisted `manifest.json` (as `_requested_endpoint`/
-    `_requested_since`) so a run can be audited and reloaded
-    deterministically from disk alone, without a database.
-    """
-    table = table_for_endpoint(endpoint)
-    params: dict[str, str] = {"endpoint": endpoint}
-    if since is not None:
-        params["since"] = since
-
-    manifest_raw = client.fetch_manifest_json(config.api_manifest_url, params=params)
-    manifest = parse_and_validate(manifest_raw, allow_insecure_http=config.api_allow_insecure_http, expected_tables=(table,))
-    log_event(
-        logger, "manifest_fetched", snapshot_id=manifest.snapshot_id, endpoint=endpoint, table=table,
-        artifact_count=len(manifest.artifacts),
-    )
-
-    # The persisted manifest augments the source's own response with the
-    # client-requested endpoint/since -- this is metadata about *this
-    # extraction request*, not part of the source's manifest contract
-    # itself (see manifest.parse_and_validate, which validates the
-    # source's own fields only), so it is added after validation, not
-    # before.
-    manifest_to_persist = dict(manifest_raw)
-    manifest_to_persist["_requested_endpoint"] = endpoint
-    manifest_to_persist["_requested_since"] = since
-
-    store = RawSnapshotStore(config.raw_data_dir, config.source_name)
-    run_id = manifest.snapshot_id
-    if store.check_idempotent_or_conflicting(manifest.snapshot_id, manifest_to_persist):
-        log_event(logger, "extract_skipped_already_published", snapshot_id=manifest.snapshot_id, endpoint=endpoint)
-        return EndpointExtractResult(
-            run_id=run_id,
-            snapshot_id=manifest.snapshot_id,
-            endpoint=endpoint,
-            table=table,
-            since=since,
-            path=store.snapshot_dir(manifest.snapshot_id),
-            skipped=True,
-            manifest=manifest,
-        )
-
-    staging_dir = store.begin_staging(manifest.snapshot_id)
-    checksums: dict[str, dict] = {}
-    try:
-        artifact = manifest.artifact_for(table)
-        log_event(logger, "artifact_download_started", table=table, endpoint=endpoint)
-        result = client.download_artifact(artifact, staging_dir)
-        log_event(logger, "artifact_download_completed", table=table, endpoint=endpoint, duration_ms=result.duration_ms)
-        checksums[table] = {"sha256": result.sha256, "size_bytes": result.size_bytes}
-    except Exception:
-        # Any failure here -- a download error, a checksum mismatch --
-        # removes the staging directory so no partial snapshot is ever
-        # left where a reader could mistake it for a real one.
-        store.abort_staging(staging_dir)
-        raise
-
-    published = store.finalize(
-        staging_dir, manifest.snapshot_id, manifest_to_persist, checksums, advance_current=False
-    )
-    log_event(
-        logger, "raw_snapshot_published", snapshot_id=manifest.snapshot_id, endpoint=endpoint, table=table,
-        raw_path=str(published.path),
-    )
-    return EndpointExtractResult(
-        run_id=run_id,
-        snapshot_id=manifest.snapshot_id,
-        endpoint=endpoint,
-        table=table,
-        since=since,
-        path=published.path,
-        skipped=False,
-        manifest=manifest,
-    )

@@ -1,26 +1,42 @@
 # Runbook
 
 Day-to-day operational reference for the `tuva-ingest` connector. See
-`README.md` for architecture and setup; `docs/API_MANIFEST.md` for the
-manifest contract `extract` consumes.
+`README.md` for architecture and setup; `docs/SOURCE_CONTRACT.md` for
+the full paginated extraction/reconciliation/watermark contract
+`extract`/`load`/`sync` implement; `docs/API_MANIFEST.md` for the legacy
+manifest contract `run`/`load-raw` consume.
 
 ## Routine operation
 
-Endpoint-scoped, one endpoint at a time (the current, recommended way to
-operate this connector -- see README.md's "extract / load / sync"
-section for the full JSON output/run-id/retry contract):
+Paginated, endpoint-scoped, one endpoint at a time (the current,
+recommended way to operate this connector -- see README.md's
+"`extract` / `load` / `sync`" section for the full secret-manager/
+pagination/reconciliation/watermark contract):
+
+```bash
+uv run tuva-ingest sync --endpoint medical-claims
+# resolves the endpoint's last committed watermark automatically, then
+# extracts and loads in one command:
+# {"event": "sync", "run_id": "medical-claims-20260816T140302-...", "status": "succeeded", "row_count": 1214, "high_water_mark": "2026-08-16T14:03:00Z", ...}
+```
+
+Or step by step, for more visibility between extraction and load (e.g.
+to inspect the published run before loading it):
 
 ```bash
 uv run tuva-ingest extract --endpoint medical-claims --since 2025-01-01
-# {"event": "extract", "run_id": "019...", ...}
-uv run tuva-ingest load --run-id 019...
-# or, in one command:
-uv run tuva-ingest sync --endpoint medical-claims --since 2025-01-01
+# {"event": "extract", "run_id": "medical-claims-20260816T140302-...", "page_count": 3, "record_count": 1214, ...}
+uv run tuva-ingest load --run-id medical-claims-20260816T140302-...
 ```
 
-Repeat for each endpoint (`medical-claims`, `pharmacy-claims`,
-`eligibility`) your operational schedule needs -- each is independent;
-loading one never truncates or touches another endpoint's raw table.
+An explicit `--since` overrides what is requested for that one
+extraction only -- it never lowers the durable watermark; omit it (as in
+the `sync` example above) to continue automatically from the last
+committed watermark. Repeat for each endpoint (`medical-claims`,
+`pharmacy-claims`, `eligibility`) your operational schedule needs -- each
+progresses independently; loading one never truncates or touches
+another endpoint's raw table, and each endpoint has its own watermark
+row in `ingest_ops.source_watermarks`.
 
 Legacy full pipeline (all three tables, one manifest request), one
 command (requires `.env` populated -- see `scripts/setup_env.example`;
@@ -88,10 +104,49 @@ LIMIT 5;
 Recovery is always "run the same command again" -- every stage is
 designed to be retry-safe:
 
-- **`extract` failed partway through a download**: the partially
-  staged snapshot was already cleaned up (see `extract.py`'s
-  `RawSnapshotStore.abort_staging`); nothing was published. Just rerun
-  `make extract`.
+- **`extract` failed partway through (a page request, envelope
+  validation, or a detected pagination cycle)**: the partially staged
+  run was already cleaned up (`pagination.PaginatedRunStore.abort_staging`,
+  invoked from `extract_paginated_run`'s `finally` block); nothing was
+  published. Just rerun `uv run tuva-ingest extract --endpoint <name>`
+  -- it mints a fresh `run_id`, so a retry is a wholly new run, not a
+  resume.
+- **`load`/`sync` failed partway through (checksum/reconciliation
+  mismatch, a quarantine-insert failure, a backward-moving candidate
+  watermark, a connection drop)**: the whole transaction (the raw table
+  load, any quarantine rows, run/table-load bookkeeping, and the
+  watermark write) rolled back together; the endpoint's previously
+  committed high-water mark is completely untouched, and no partial rows
+  are visible in either the raw table or the quarantine table. Rerun
+  `uv run tuva-ingest load --run-id <same value>` -- re-loading an
+  already-loaded run is a safe no-op (`ON CONFLICT DO NOTHING`, for both
+  the raw and quarantine tables); if the underlying cause was a
+  corrupted page file or a source data problem, re-run `extract` for a
+  fresh run instead.
+- **`extract` failed with a pagination-limit or cycle error
+  (`TUVA_API_MAX_PAGES`/`TUVA_API_MAX_RECORDS_PER_RUN` exceeded, or a
+  repeated/self-referencing page token detected)**: the run is stopped
+  immediately and never published -- nothing partial is left on disk,
+  and (since `load` never runs) the watermark is untouched. This
+  usually means either the source's pagination is misbehaving (a stuck
+  or looping `next_page_token`) or the configured limits are genuinely
+  too low for the endpoint's current data volume; investigate the
+  source's page-token behavior first, and only raise the limit(s) in
+  `.env` deliberately once you've confirmed the endpoint really does
+  need to return that many pages/records in one run.
+- **`extract`/`sync` failed with an OAuth error (`TUVA_OAUTH_TOKEN_URL`
+  configured)**: a permanent grant failure (`invalid_client`/
+  `invalid_grant`) means the configured `TUVA_OAUTH_CLIENT_ID`/
+  `TUVA_OAUTH_CLIENT_SECRET` (or a rotated refresh token this connector
+  no longer has) is wrong -- verify/rotate the credential with the
+  source and update `.env`/your secret store; this is never retried
+  automatically. A transient token-endpoint failure (connection error,
+  `429`/`502`/`503`/`504`) is retried automatically under the same
+  bounded retry policy as source API requests, then surfaces as a
+  normal OAuth error if it never recovers. A single unexpected `401`
+  from the source API itself triggers one automatic forced refresh and
+  replay; a `401` on that replay too means the token (or the
+  credentials behind it) is invalid and fails immediately.
 - **`load-raw` failed partway through (bad checksum, connection
   drop)**: the whole transaction (all three raw tables + run
   bookkeeping) rolled back together; no partial snapshot is visible.
@@ -143,12 +198,28 @@ designed to be retry-safe:
 
 ## Retention and reruns
 
-- Raw snapshots under `RAW_DATA_DIR` are never deleted automatically --
-  prune old ones manually once you no longer need to replay them.
-- Reloading an already-loaded `snapshot_id` is always safe (no
-  duplication); reloading a *different* `snapshot_id` replaces the raw
-  tables' contents entirely (each raw table only ever holds the most
-  recently loaded snapshot).
+- Raw snapshots/paginated runs under `RAW_DATA_DIR` are never deleted
+  automatically -- prune old ones manually once you no longer need to
+  replay them. A published paginated run is likewise never
+  auto-deleted; only its temporary `.staging/` directory is cleaned up
+  on failure.
+- **Paginated (`extract`/`load`/`sync`)**: loading is additive, never a
+  replacement -- each run's rows are inserted alongside every prior
+  run's rows for that endpoint (`ON CONFLICT DO NOTHING` keyed on
+  `(_snapshot_id, _source_row_number)`), so a raw table accumulates
+  every successfully loaded run over time. Reloading an already-loaded
+  `run_id` is always safe (no duplication).
+- **Legacy (`load-raw`/`run`)**: reloading an already-loaded
+  `snapshot_id` is always safe (no duplication); reloading a
+  *different* `snapshot_id` replaces the raw tables' contents entirely
+  (`TRUNCATE` + reload -- each raw table only ever holds the most
+  recently loaded legacy snapshot). Mixing both contracts against the
+  same raw tables is expected and safe -- they use disjoint metadata
+  columns and never truncate rows the other contract loaded (the
+  legacy path's `TRUNCATE` does clear the whole table, including any
+  paginated rows, so avoid running `load-raw`/`run` against a raw
+  schema you are also loading paginated data into, unless a full reset
+  is actually what you want).
 - `dbt build` is always safe to rerun -- staging models are views,
   final Input Layer models are tables rebuilt from the current raw
   contents each run.
@@ -198,11 +269,57 @@ upgrade is a deliberate, single-commit, reviewed change.
 - `PG_DSN`/`TUVA_API_TOKEN` are redacted from every log line, error
   message, and `IngestConfig.safe_dict()`/`repr()` (see
   `src/tuva_ingest/logging_utils.py`).
-- Rotate `TUVA_API_TOKEN` by updating `.env`/your secret store -- no
-  code change is required.
+- Rotate the API credential by updating `TUVA_API_TOKEN` in `.env`/your
+  secret store (`TUVA_API_SECRET_PROVIDER=env`), or by rotating the
+  secret's value in AWS Secrets Manager (`TUVA_API_SECRET_PROVIDER=aws`)
+  -- no code change is required either way. The credential is retrieved
+  fresh at the start of every `extract`/`sync` run, never cached to
+  disk between runs.
 - This repository's own test fixtures (`tests/fixtures/*.csv`) are
   synthetic and contain no PHI; do not commit real extracted snapshots
   or database dumps to this repository.
+- `TUVA_OAUTH_CLIENT_SECRET` (when OAuth mode is in use) is redacted the
+  same way as `PG_DSN`/`TUVA_API_TOKEN`; rotate it in `.env`/your secret
+  store the same way -- no code change required. OAuth access/refresh
+  tokens themselves are never persisted anywhere by this connector
+  (memory-only, per process), so there is nothing to rotate or revoke
+  on this side beyond the client secret itself.
+- `ingest_ops.quarantined_records` contains PHI (see "Quarantined
+  records" below) and is access-restricted at the database level --
+  `PUBLIC` and `TRANSFORM_ROLE` have no access, and `INGEST_ROLE` can
+  only `INSERT`, never read it back. No dbt model or downstream
+  consumer ever reads from it.
+
+## Quarantined records
+
+A structurally invalid record (missing/blank required identifier,
+wrong type, unrecognizable date shape) is written to
+`ingest_ops.quarantined_records` instead of its endpoint's raw table --
+see README.md's "Quarantine" section for the exact structural rules and
+the fixed reason-code allowlist. `load`/`sync`'s JSON result reports
+`quarantined_count`/`quarantined_by_reason` for the run, and each
+quarantined record also emits a `record_quarantined` structured log
+event (run id, endpoint, page/record position, reason code, and a
+non-reversible fingerprint -- never the record itself).
+
+No operational "quarantine review" role exists in this repository's
+role model yet -- `INGEST_ROLE` itself cannot read this table back (by
+design), so an operator must explicitly `GRANT SELECT ON
+ingest_ops.quarantined_records TO <a role you create and control>`
+before anyone can review quarantined records, and should scope that
+role as narrowly as any other PHI-bearing access in your environment
+(audited, time-limited, least-privilege). This repository deliberately
+does not create that role for you.
+
+A `reason_code` on a quarantined row tells you *why* (e.g.
+`missing_required_field`); `reason_detail` names the specific field/rule
+(bounded, never a raw value); `raw_record` (jsonb) and
+`source_record_sha256` let a reviewer with granted access correlate the
+row back to the exact source payload. A quarantined record is never
+retried automatically -- if the source later sends a corrected version
+of the same logical record, it arrives as a new record in a later
+`extract` run and is reclassified independently; there is no
+"un-quarantine" operation in this connector today.
 
 ## What this repository does not own
 

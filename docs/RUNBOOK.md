@@ -366,6 +366,43 @@ existing database regardless of whether you adopt the object-storage
 workflow -- the legacy CSV and local-filesystem-paginated workflows are
 completely unaffected by it.
 
+## Building and validating the Input Layer transformation
+
+Full build + validation sequence for the raw -> staging -> intermediate
+-> final (Input Layer) transformation pipeline (see README.md
+"Architecture" and `docs/CLAIMS_MAPPING_DECISIONS.md` for the mapping
+this implements). Run in this exact order -- each stage gates the next,
+same as `make pipeline`:
+
+```bash
+uv lock --check                    # locked dependency set matches pyproject.toml
+uv sync --locked                   # install the exact locked toolchain (dbt-core, dbt-postgres, ruff, mypy, pytest, sqlfluff)
+make test-unit                      # database-free: staging/intermediate/final structural contract tests, claims_mapping.py's own readiness gate
+make lint-python                    # ruff check
+make format-python-check            # ruff format --check
+make typecheck                      # mypy src/tuva_ingest
+make lint-sql                       # sqlfluff lint (models/**/*.sql, migrations/*.sql)
+make dbt-deps                       # fetch the pinned Tuva 0.18.0 package + dbt_utils (requires network access to dbt Hub)
+make dbt-parse                      # Jinja/YAML/ref() validation, no database connection required
+make migrate                        # apply operational migrations against a DISPOSABLE PostgreSQL database (never production)
+make dbt-input-layer                 # dbt build --select tag:input_layer: seed -> staging -> intermediate -> final, from an empty database
+make dbt-dq-structural               # the pinned Tuva package's own structural DQ checks (requires dbt-input-layer to have passed)
+make test-integration                # tests/integration/*, including a real `dbt build` against loaded fixtures
+uv run dbt test --select tag:input_layer   # targeted dbt tests for the new intermediate models + tests/dbt/*.sql singular tests
+make quality                         # the full database-free gate (lock check, lint, format, types, unit tests, sql lint) in one command
+pre-commit run --all-files           # every configured hook, including the ones above
+```
+
+`make dbt-input-layer` is the target that actually proves the four-layer
+separation this pipeline depends on: it builds ONLY this connector's own
+nodes (`seeds.tuva_ingest_connector.member_crosswalk_seed`,
+`models/staging/*.sql`, `models/intermediate/*.sql`,
+`models/final/*.sql` -- all tagged `input_layer`, see `dbt_project.yml`)
+plus their schema tests, before the pinned Tuva package's own models are
+built at all. A failure here means the connector's own transformation is
+broken -- never proceed to `dbt-dq-structural`/`test-integration` when
+this fails.
+
 ## Running the test suite
 
 ```bash
@@ -473,6 +510,57 @@ retried automatically -- if the source later sends a corrected version
 of the same logical record, it arrives as a new record in a later
 `extract` run and is reclassified independently; there is no
 "un-quarantine" operation in this connector today.
+
+## Known limitations (Input Layer transformation)
+
+Carried over from `docs/CLAIMS_MAPPING_DECISIONS.md` "Readiness" and
+restated here as operational limitations, not just design notes:
+
+1. **Member crosswalk has no real raw ingestion path yet.**
+   `models/intermediate/int_member_crosswalk.sql` resolves
+   `member_key -> person_id` from `seeds/member_crosswalk_seed.csv` -- a
+   versioned, deterministic, representative-sample-derived dbt seed,
+   not a fabricated production source. Before real historical ingestion
+   of the incoming vendor source, this needs a real raw ingestion
+   endpoint/loader for the vendor's crosswalk feed, landing in its own
+   raw table, and `int_member_crosswalk.sql`'s single `from` clause
+   repointed at it. The crosswalk also cannot yet represent an
+   identifier split or reuse (decision 5) -- that requires a
+   time-versioned crosswalk (`member_key`, `person_id`, effective date
+   range), which is a real vendor-data question this repository cannot
+   answer without a live source.
+2. **No vendor-shaped pharmacy claim mapping is documented yet.**
+   `docs/CLAIMS_MAPPING.csv` documents eligibility and medical claim
+   fields only. `models/staging/stg_pharmacy_claim.sql` and
+   `models/intermediate/int_pharmacy_claim_lines.sql` therefore only
+   support the existing "tuva" test source's field shape today --
+   extending them to the incoming vendor's pharmacy file requires that
+   vendor's field-level mapping to be documented in `docs/
+   CLAIMS_MAPPING.csv`/`docs/CLAIMS_MAPPING_DECISIONS.md` first (this
+   repository's own "typed NULL or the real value, never a guess"
+   policy rules out inventing a pharmacy field mapping with no
+   specification behind it).
+3. **`clm_status_code`'s vocabulary (1/7/8) is this implementation's
+   design**, chosen to mirror the common original/replacement/void
+   three-way distinction -- not a confirmed real-vendor convention. Must
+   be reconciled against the actual vendor's claim-status/
+   frequency-code values before historical ingestion.
+4. **The 90% FK-coverage threshold** (`claims_mapping.
+   FK_COVERAGE_THRESHOLD`) is a representative-sample gate convenience
+   value, not a reconciled production SLA.
+5. **Diagnosis/procedure codes delivered without an expected decimal
+   point** are not normalized and would load as-is -- confirm the real
+   vendor's code formatting before relying on those fields downstream.
+6. **No disposable PostgreSQL or Docker was available in this
+   repository's own development/validation environment** when this
+   transformation was implemented -- `make dbt-input-layer`,
+   `make test-integration`, and the Postgres-backed CI job could not be
+   executed directly here. See the branch's own commit message and PR
+   description for the exact commands run, their results, and what
+   static/unit validation was completed instead. Re-run the full
+   sequence in "Building and validating the Input Layer transformation"
+   above in an environment with both before relying on this in
+   production.
 
 ## What this repository does not own
 

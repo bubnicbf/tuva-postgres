@@ -16,12 +16,21 @@ tables are created and owned entirely by the pinned dbt package.
 ## Architecture
 
 ```
-   API manifest              raw PostgreSQL schema        dbt: staging          dbt: Input Layer         Tuva package (0.18.0)
-  (versioned JSON)     -->    (JSONB schema-on-read)  -->  (typed, trimmed) -->  (eligibility,       -->  (core, terminology,
-                                                                                  medical_claim,           marts -- never
-  src/tuva_ingest/            src/tuva_ingest/             models/staging/       pharmacy_claim)          duplicated locally)
-  extract.py, api_client.py   raw_loader.py                                      models/final/
+   API manifest              raw PostgreSQL schema        dbt: staging          dbt: intermediate        dbt: Input Layer          Tuva package (0.18.0)
+  (versioned JSON)     -->    (JSONB schema-on-read)  -->  (typed, trimmed, --> (joins, crosswalk,   -->  (eligibility,        -->  (core, terminology,
+                                                             row-local only)     dedup, lifecycle,         medical_claim,             marts -- never
+  src/tuva_ingest/            src/tuva_ingest/             models/staging/      span consolidation)        pharmacy_claim)            duplicated locally)
+  extract.py, api_client.py   raw_loader.py                                     models/intermediate/       models/final/
 ```
+
+Four dbt layers, each with strictly separated responsibilities -- see
+"dbt project" below for the full detail. In short: `models/staging/`
+never joins, deduplicates, resolves identity, or applies lifecycle
+logic (row-local rename/trim/cast/unit-conversion only); every join,
+member-crosswalk resolution, eligibility-span consolidation, and claim
+adjustment/void handling lives in `models/intermediate/`; `models/final/`
+is a thin, explicit Tuva Input Layer contract projection over
+`models/intermediate/`, never a place where new business logic begins.
 
 1. **Extract** (`tuva-ingest extract --endpoint <name> [--since <date>]`)
    -- retrieves an API credential once from the configured secret
@@ -63,9 +72,13 @@ tables are created and owned entirely by the pinned dbt package.
    watermark untouched) if `extract` fails.
 4. **dbt** (`tuva-ingest dbt -- <args>`) -- `models/staging/*.sql`
    types and normalizes the raw JSONB into typed columns;
+   `models/intermediate/*.sql` resolves member identity, consolidates
+   eligibility spans, and handles claim lifecycle (adjustments/voids) --
+   every join and multi-row rule this connector applies;
    `models/final/{eligibility,medical_claim,pharmacy_claim}.sql`
-   expose the Tuva Input Layer contract those staging models feed. dbt
-   never writes back into the raw schema.
+   expose the Tuva Input Layer contract those intermediate models feed,
+   as thin explicit projections. dbt never writes back into the raw
+   schema.
 5. **Tuva package** -- pinned to exactly `0.18.0`
    (`packages.yml`), `ref()`s this project's Input Layer models by
    name and builds its own core/terminology/mart models on top of
@@ -690,20 +703,45 @@ numbered migration file.
 
 ## dbt project
 
+Four-layer transformation pipeline, each layer with strictly separated
+responsibilities (see each layer's own model/macro header comments for
+the executable detail; `docs/CLAIMS_MAPPING.csv` and `docs/
+CLAIMS_MAPPING_DECISIONS.md` are the source-to-Tuva mapping
+specification the intermediate layer implements):
+
+```
+   raw                  staging                 intermediate                final              Tuva package (0.18.0)
+(JSONB,          (typed/trimmed/cast,    (joins, crosswalk,          (thin Input Layer     (core, terminology,
+ source-faithful) row-local only)         dedup, lifecycle,           contract projection)    marts -- never
+                                           span consolidation)                                 duplicated locally)
+raw.{eligibility,   models/staging/         models/intermediate/       models/final/
+ medical_claim,                                                        {eligibility,
+ pharmacy_claim}                                                       medical_claim,
+                                                                        pharmacy_claim}
+```
+
 - `dbt_project.yml` -- claims-only Tuva domain configuration
   (`claims_enabled: true`; `clinical_enabled`/`provider_attribution_enabled`/
   `semantic_layer_enabled: false`) and the
   `require_ref_searches_node_package_before_root` flag Tuva 0.18.0
-  requires. Both `models.tuva_ingest_connector.staging` and `.final`
-  carry `+tags: ["input_layer"]` -- not just `final` -- so `dbt build
-  --select tag:input_layer` can build this connector's entire
-  transformation pipeline (raw -> staging -> Input Layer) from an empty
-  database in one pass, matching the pattern used by Tuva's own
+  requires. `models.tuva_ingest_connector.staging`, `.intermediate`,
+  and `.final` -- plus `seeds.tuva_ingest_connector.member_crosswalk_seed`
+  -- all carry `+tags: ["input_layer"]`, so `dbt build --select
+  tag:input_layer` can build this connector's entire transformation
+  pipeline (raw -> staging -> intermediate -> Input Layer) from an
+  empty database in one pass, matching the pattern used by Tuva's own
   [connector_template](https://github.com/tuva-health/connector_template).
+  `models/intermediate/*.sql` shares `staging`'s configurable
+  `staging_schema` var rather than a dedicated physical schema -- see
+  that config block's own comment for why a separate schema buys
+  nothing operationally here, while the *logical* dbt layer stays fully
+  distinct via the directory, the `int_` naming convention, and its own
+  `schema.yml`.
 - `packages.yml` -- `tuva-health/the_tuva_project` pinned to exactly
   `0.18.0` (never a range, `main`, `latest`, or an unpinned git
   revision), plus `dbt_utils` (used by `models/final/schema.yml`'s
-  composite-primary-key uniqueness tests).
+  composite-primary-key uniqueness tests and by
+  `models/intermediate/schema.yml`'s).
 - `profiles.example.yml` -- entirely environment-variable-driven, with
   safe local placeholder defaults only; never a real credential. Copy
   to `profiles.yml` (git-ignored) or rely on the Docker image, which
@@ -711,25 +749,56 @@ numbered migration file.
   secret.
 - `models/sources.yml` -- declares the three raw tables
   (`eligibility`, `medical_claim`, `pharmacy_claim`) with freshness
-  checks.
-- `models/staging/*.sql` -- normalizes `raw_row` JSONB into typed,
-  trimmed columns (empty string -> `NULL`; malformed dates/numerics ->
-  typed `NULL` via the `safe_date`/`safe_numeric`/`safe_integer`
-  macros in `macros/safe_cast.sql`, since PostgreSQL has no
-  `TRY_CAST`) using the Input Layer's own column names directly
-  (`person_id`, `drg_code`/`drg_code_type`, `hcpcs_code`, etc. -- not an
-  internal naming convention that models/final/ then has to translate).
-  No Tuva-specific business logic here.
+  checks. Referenced only from `models/staging/*.sql` -- no other layer
+  ever reads `source('raw', ...)` directly.
+- `models/staging/*.sql` -- normalizes `raw_row`/`_raw_payload` JSONB
+  into typed, trimmed columns (empty string -> `NULL`; malformed dates/
+  numerics -> typed `NULL` via the `safe_date`/`safe_numeric`/
+  `safe_integer`/`cents_to_amount` macros in `macros/safe_cast.sql`,
+  since PostgreSQL has no `TRY_CAST`). Each staging model reconciles
+  TWO independent source-field vocabularies out of the same raw
+  payload: the existing "tuva" test source (already Tuva-shaped field
+  names) and the incoming vendor-shaped extract documented in `docs/
+  CLAIMS_MAPPING.csv` (abbreviated field names, integer-cents
+  financials, a member-key identity that requires crosswalk
+  resolution). Row-local extraction/casting/unit-conversion only --
+  never a join, a crosswalk lookup, deduplication, or any other
+  multi-row rule; those all belong to `models/intermediate/`.
+- `models/intermediate/*.sql` -- owns every join and multi-row business
+  rule this connector applies: member-identity crosswalk resolution
+  (`int_member_crosswalk.sql`, sourced from the interim
+  `seeds/member_crosswalk_seed.csv` -- see that model's header for the
+  documented raw-ingestion-contract gap this stands in for),
+  eligibility-span consolidation (`int_eligibility_resolved.sql` +
+  `int_eligibility_spans.sql` -- overlap/adjacency merging, gap
+  preservation, open-ended spans, invalid-range quarantine), and
+  medical-claim lifecycle handling (`int_medical_claim_lines.sql` --
+  exact-duplicate collapse with genuine-conflict surfacing, claim-header
+  date derivation, payer/plan inheritance from eligibility, deterministic
+  `claim_type` precedence via `macros/claim_type.sql`, diagnosis/
+  procedure normalization, and original/adjustment/void handling that
+  prevents double-counting while keeping every row auditable). See
+  `docs/CLAIMS_MAPPING_DECISIONS.md` for the full decision record each
+  of these implements, and `tests/dbt/*.sql` for the singular
+  data-quality tests proving the harder multi-row rules (no overlapping
+  spans, no silently-resolved grain conflicts, orig_clm_id referential
+  integrity, financial reconciliation, adjustment/void double-counting
+  prevention).
 - `models/final/*.sql` -- the full Tuva 0.18.0 Input Layer contract for
   each of the three claims models (35/148/25 explicit, ordered columns
   for `eligibility`/`medical_claim`/`pharmacy_claim` respectively -- see
   each model's own header comment for the two independent official
   sources used to confirm that column list, and `models/final/
-  schema.yml` for the composite-primary-key test on each). Fields this
-  connector's source data cannot confidently supply are explicitly
-  typed `NULL` (e.g. `cast(null as text)`) -- documented in each
-  model's own header comment -- never an invented mapping. The 100
-  numbered `diagnosis_code_N`/`diagnosis_poa_N`/`procedure_code_N`/
+  schema.yml` for the composite-primary-key test on each). Thin
+  contract projections only -- explicit column selection/casting and a
+  `where` filter to the rows that belong in the Input Layer contract
+  (matched identity; not a superseded original), never a join,
+  deduplication, or other business rule of their own; all of that
+  already happened in `models/intermediate/`. Fields this connector's
+  source data cannot confidently supply are explicitly typed `NULL`
+  (e.g. `cast(null as text)`) -- documented in each model's own header
+  comment -- never an invented mapping. The 100 numbered
+  `diagnosis_code_N`/`diagnosis_poa_N`/`procedure_code_N`/
   `procedure_date_N` columns on `medical_claim` are generated by a
   Jinja `{%- for i in range(1, 26) %}` loop purely to avoid 100 lines
   of repetition; the compiled SQL is the same fully explicit, named

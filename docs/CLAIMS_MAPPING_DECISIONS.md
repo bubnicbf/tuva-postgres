@@ -41,15 +41,55 @@ Tuva-shaped test double, not a real vendor extract.
 
 **Decision:** this mapping instead documents the field-abbreviated,
 cents-denominated, vendor-shaped extract format the four mandated rows
-imply -- the shape a real incoming claims vendor is likely to deliver --
-and implements it end-to-end (crosswalk, unit conversion, claim typing,
-adjustment netting, diagnosis/procedure normalization, eligibility
-consolidation) against a synthetic representative sample. It is
-additive: it does not modify `models/staging/stg_medical_claim.sql`,
-`models/staging/stg_eligibility.sql`, or the existing "tuva" test
-source's raw shape, and it does not touch `raw`/`ingest_ops` or
-`RAW_DATA_DIR`. See "Readiness" below for exactly what this does and
-does not unblock.
+imply -- the shape a real incoming claims vendor is likely to deliver.
+
+**Update (Action 6 -- real dbt implementation):** the mapping documented
+here is now ported into real, tested SQL, not just this Python
+specification. `models/staging/stg_medical_claim.sql` and
+`models/staging/stg_eligibility.sql` were extended (not replaced) to
+extract BOTH the existing "tuva" test source's field vocabulary and this
+vendor-shaped vocabulary out of the same raw payload, coalescing
+column-by-column; `models/intermediate/*.sql` implements crosswalk
+resolution, unit conversion, claim typing, adjustment/void netting,
+diagnosis/procedure normalization, and eligibility consolidation in SQL,
+against the same representative sample this document describes (see
+`models/intermediate/schema.yml` and `tests/dbt/*.sql` for the tests
+proving it). `src/tuva_ingest/claims_mapping.py` remains in place as a
+database-free specification/readiness tool (see its own module
+docstring) -- it is no longer the only executable form of this mapping,
+but production dbt never depends on it executing. This section's
+original "additive, does not modify staging" framing predates that
+implementation; it is kept above for historical context but no longer
+describes current behavior. Three implementation decisions this
+document did not previously resolve, made explicit here:
+
+- **member_id for the vendor source:** the vendor's claims/eligibility
+  files have no field distinct from `member_key` that plays the role of
+  a payer-assigned member ID. `member_id` is populated from
+  `member_key` directly (see `models/intermediate/
+  int_eligibility_resolved.sql`/`int_medical_claim_lines.sql`) -- a
+  documented decision, not an invented value, since `member_key` IS
+  documented as "Vendor-assigned member ID" in `docs/
+  CLAIMS_MAPPING.csv`.
+- **medical_claim payer/plan for the vendor source:** the vendor's
+  claims file has no payer/plan field at all (only the eligibility file
+  does -- see the `payer`/`plan` rows in `docs/CLAIMS_MAPPING.csv`,
+  which map only to `eligibility.payer`/`eligibility.plan`). `models/
+  intermediate/int_medical_claim_lines.sql` derives a claim line's
+  payer/plan from the consolidated eligibility span covering the same
+  person and service date, deterministically tie-broken when more than
+  one span could apply (e.g. genuinely concurrent medical/dental
+  coverage).
+- **claim_type precedence extended:** `macros/claim_type.sql`
+  implements decision 3's precedence rule with the "fourth,
+  higher-precedence rule" this document already anticipated: an
+  explicit, already-classified source `claim_type` (the existing "tuva"
+  source only) is checked BEFORE `claim_form_code`, so that source's
+  existing behavior is unchanged by this implementation.
+
+See "Readiness" below for exactly what real historical ingestion still
+does and does not require, independent of this SQL implementation now
+existing.
 
 ## 1. Final claim-line grain
 
@@ -426,8 +466,12 @@ the representative-sample gate above is a readiness *signal* only.
 
 ## Last verified
 
-2026-08-16, against this repository's `codex/add-source-to-tuva-claims-mapping`
-branch (based on commit `b138f8b`). Re-verify (and update this date)
-whenever `src/tuva_ingest/claims_mapping.py`, `models/final/
-medical_claim.sql`/`models/final/eligibility.sql`, or the connected
-upstream source changes.
+2026-08-27, against this repository's `claude/transform-tuva-input-layer`
+branch (based on `dev` at commit `35f6a5d`), which ported this mapping
+into `models/staging/*.sql`/`models/intermediate/*.sql` for the first
+time (see the "Update (Action 6 -- real dbt implementation)" note
+above). Re-verify (and update this date) whenever
+`src/tuva_ingest/claims_mapping.py`, `models/staging/*.sql`,
+`models/intermediate/*.sql`, `models/final/medical_claim.sql`/
+`models/final/eligibility.sql`, or the connected upstream source
+changes.

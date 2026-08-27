@@ -28,16 +28,23 @@
 -- enrollment_start_date, enrollment_end_date, data_source (enforced in
 -- models/final/schema.yml via dbt_utils.unique_combination_of_columns).
 --
--- All source-fidelity normalization (trimming, empty-string handling,
--- date parsing) already happened in models/staging/stg_eligibility.sql;
--- no further business logic is applied here beyond selecting/typing the
--- contract's column set. Fields this connector's source data does not
--- provide are explicitly typed NULL, never a guess (see the inline
--- comments below for exactly which fields those are and why).
+-- This is a thin contract projection: EVERY business rule -- field
+-- extraction/trimming/casting (models/staging/stg_eligibility.sql),
+-- member-identity crosswalk resolution and eligibility-span
+-- consolidation (models/intermediate/int_eligibility_resolved.sql,
+-- models/intermediate/int_eligibility_spans.sql) -- already happened
+-- upstream. This model performs no joins, no deduplication, and no
+-- multi-row logic of its own; it only selects/types the Input Layer's
+-- exact column set from models/intermediate/int_eligibility_spans.sql,
+-- which itself already excludes unmatched-identity and invalid-range
+-- rows (see that model's header). Fields this connector's source data
+-- does not provide anywhere are explicitly typed NULL, never a guess
+-- (see the inline comments below for exactly which fields those are
+-- and why).
 
-with staging as (
+with intermediate as (
 
-    select * from {{ ref('stg_eligibility') }}
+    select * from {{ ref('int_eligibility_spans') }}
 
 ),
 
@@ -46,9 +53,12 @@ final as (
     select
 
         -- Identifiers. person_id is populated from the source's own
-        -- person_id (mapping guide: "if you don't have a UUID, we
-        -- recommend mapping the source patient identifier to this
-        -- field" -- our source provides a stable person_id directly).
+        -- person_id (existing "tuva" source) or resolved through the
+        -- member crosswalk (the vendor source -- see
+        -- models/intermediate/int_member_crosswalk.sql). A row whose
+        -- identity could not be resolved never reaches this model (see
+        -- models/intermediate/int_eligibility_resolved.sql's
+        -- quarantine handling), so person_id is never NULL here.
         person_id::text                                       as person_id,
         member_id::text                                       as member_id,
         subscriber_id::text                                   as subscriber_id,
@@ -63,7 +73,9 @@ final as (
                                                                as death_flag,
 
         -- Enrollment span (this table is the eligibility-span format,
-        -- not member-month -- see models/staging/stg_eligibility.sql).
+        -- not member-month -- see models/intermediate/
+        -- int_eligibility_spans.sql for how overlapping/adjacent source
+        -- spans were consolidated into this span).
         enrollment_start_date::date                           as enrollment_start_date,
         enrollment_end_date::date                             as enrollment_end_date,
 
@@ -113,7 +125,7 @@ final as (
         cast(null as date)                                    as file_date,
         cast(null as timestamp)                               as ingest_datetime
 
-    from staging
+    from intermediate
 
 )
 

@@ -1,0 +1,40 @@
+version: 2
+
+seeds:
+  - name: member_crosswalk_seed
+    description: >
+      Interim, versioned, deterministic member_key -> person_id
+      crosswalk (docs/CLAIMS_MAPPING_DECISIONS.md decision 5),
+      identical in shape and content to the representative sample at
+      tests/fixtures/claims_mapping_sample/member_crosswalk.csv. Consumed
+      only by models/intermediate/int_member_crosswalk.sql.
+
+      KNOWN SOURCE-CONTRACT LIMITATION: this repository's raw ingestion
+      contract (models/sources.yml) has no fourth raw table/loader for a
+      real vendor-delivered member crosswalk feed today. This seed is a
+      deliberate, clearly-labeled stand-in -- not a fabricated
+      production source -- so that crosswalk resolution is real, tested,
+      and deterministic against a representative sample now, without
+      inventing a raw ingestion path this repository does not actually
+      have. See docs/RUNBOOK.md "Known limitations" and
+      models/intermediate/int_member_crosswalk.sql's header for what
+      closing this gap requires (a real raw.member_crosswalk table fed
+      by a real loader, at which point only that one model's `from`
+      needs to change).
+    config:
+      column_types:
+        member_key: text
+        person_id: text
+    columns:
+      - name: member_key
+        description: >
+          Vendor-assigned member identifier, as carried on both the
+          eligibility file and each claim line.
+        data_tests: [not_null, unique]
+      - name: person_id
+        description: >
+          Resolved Tuva person_id. Many-to-one is expected and supported
+          (multiple member_key values may resolve to the same
+          person_id, e.g. a documented identifier merge) -- this column
+          intentionally has no uniqueness test.
+        data_tests: [not_null]

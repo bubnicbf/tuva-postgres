@@ -9,6 +9,18 @@
 -- the normalization approach (raw_field()/safe_date()/safe_numeric()/
 -- safe_integer() -- macros/raw_field.sql, macros/safe_cast.sql).
 --
+-- Unlike stg_eligibility.sql/stg_medical_claim.sql, this model does NOT
+-- yet support a second, vendor-shaped source vocabulary: docs/
+-- CLAIMS_MAPPING.csv and docs/CLAIMS_MAPPING_DECISIONS.md (the incoming
+-- source's documented field mapping) cover eligibility and medical
+-- claims only -- no pharmacy claim field mapping has been documented or
+-- confirmed for the incoming vendor. Extending this model to a second
+-- vocabulary here would mean inventing source field names with no
+-- documented specification behind them, which this repository's own
+-- "typed NULL or the real value, never a guess" policy (README.md
+-- "Known limitations") rules out. See docs/RUNBOOK.md "Known
+-- limitations" for this gap and what closing it requires.
+--
 -- Column names here match the Tuva Input Layer `pharmacy_claim`
 -- contract directly (person_id not patient_id -- see models/final/
 -- pharmacy_claim.sql's header for how that contract was confirmed) so
@@ -72,6 +84,33 @@ renamed as (
 
     from source
 
+),
+
+hashed as (
+
+    -- Deterministic, payload-derived content fingerprint (see
+    -- stg_eligibility.sql's identical `hashed` CTE for why). Used by
+    -- models/intermediate/int_pharmacy_claim_lines.sql to collapse
+    -- byte-identical duplicate deliveries deterministically and to
+    -- detect genuine grain conflicts.
+    select
+        *,
+        md5(
+            concat_ws(
+                '|',
+                coalesce(claim_id, ''), coalesce(claim_line_number::text, ''),
+                coalesce(person_id, ''), coalesce(member_id, ''), coalesce(payer, ''), coalesce(plan, ''),
+                coalesce(prescribing_provider_npi, ''), coalesce(dispensing_provider_npi, ''),
+                coalesce(dispensing_date::text, ''), coalesce(ndc_code, ''),
+                coalesce(quantity::text, ''), coalesce(days_supply::text, ''), coalesce(refills::text, ''),
+                coalesce(paid_date::text, ''), coalesce(paid_amount::text, ''), coalesce(allowed_amount::text, ''),
+                coalesce(charge_amount::text, ''), coalesce(coinsurance_amount::text, ''),
+                coalesce(copayment_amount::text, ''), coalesce(deductible_amount::text, ''),
+                coalesce(data_source, '')
+            )
+        ) as _row_hash
+    from renamed
+
 )
 
-select * from renamed
+select * from hashed

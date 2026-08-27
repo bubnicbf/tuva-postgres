@@ -5,66 +5,151 @@ models:
     description: >
       Typed, trimmed view over raw.eligibility (see models/sources.yml).
       Field-level extraction/casting only -- see the model's header
-      comment for the normalization approach. No Tuva-specific business
-      logic; that begins in models/final/eligibility.sql. Column names
-      match the Input Layer `eligibility` contract directly.
+      comment for the normalization approach and the two source-field
+      vocabularies it reconciles. No joins, no crosswalk resolution, no
+      span consolidation, and no other multi-row business logic --
+      those begin in models/intermediate/int_eligibility_resolved.sql
+      and models/intermediate/int_eligibility_spans.sql. Column names
+      that match the Input Layer `eligibility` contract directly
+      (person_id, enrollment_start_date, ...) are a genuine
+      source-to-canonical rename/cast for the existing "tuva" source;
+      for the vendor source they stay NULL at this layer until resolved
+      downstream (see member_crosswalk_key/coverage_type below).
     columns:
       - name: person_id
-        description: Source person identifier, carried through unmapped as the Input Layer's person_id.
-        data_tests: [not_null]
+        description: >
+          Direct source person identifier (existing "tuva" source
+          only). NULL for the vendor source, which supplies
+          member_crosswalk_key instead -- see models/intermediate/
+          int_eligibility_resolved.sql for identity resolution.
       - name: member_id
-        description: Source member identifier.
-        data_tests: [not_null]
+        description: Source member identifier (existing "tuva" source only).
       - name: subscriber_id
         description: Source subscriber (policyholder) identifier.
+      - name: member_crosswalk_key
+        description: >
+          Vendor-shaped source's member_key (docs/CLAIMS_MAPPING.csv) --
+          the crosswalk join key models/intermediate/
+          int_eligibility_resolved.sql resolves to a person_id. No Input
+          Layer destination column of its own. NULL for the existing
+          "tuva" source, which supplies person_id directly instead.
+      - name: coverage_type
+        description: >
+          Vendor-shaped source's coverage_type (docs/CLAIMS_MAPPING.csv)
+          -- an eligibility-span-consolidation partition key only (docs/
+          CLAIMS_MAPPING_DECISIONS.md decision 7). No Input Layer
+          destination column of its own.
       - name: enrollment_start_date
-        description: Coverage start date, or NULL if the source value did not parse as YYYY-MM-DD.
+        description: >
+          Coverage start date -- coalesced from the existing "tuva"
+          source's enrollment_start_date or the vendor source's
+          span_start_dt (exactly one is ever populated per row). NULL if
+          the populated source value did not parse as YYYY-MM-DD.
       - name: enrollment_end_date
-        description: Coverage end date, or NULL if the source value did not parse as YYYY-MM-DD.
+        description: >
+          Coverage end date -- coalesced from enrollment_end_date or
+          span_end_dt. NULL if the populated source value did not parse,
+          or if coverage is open-ended (no end date supplied).
       - name: payer
         description: Source payer name.
       - name: data_source
-        description: Source system tag; defaults to 'tuva' when the source row does not supply one.
+        description: >
+          Source system tag; an explicit source value always wins,
+          otherwise defaults to 'incoming_source' for a row that
+          populates any vendor-shaped key, or 'tuva' for the existing
+          test source (see the model's `renamed` CTE for the exact
+          detection rule).
+        data_tests: [not_null]
+      - name: _row_hash
+        description: >
+          Deterministic md5 fingerprint over every normalized business
+          column (never over _loaded_at/_source_row_number, which differ
+          per delivery) -- used by models/intermediate/
+          int_eligibility_resolved.sql to collapse exact-duplicate
+          deliveries and to order window functions deterministically.
         data_tests: [not_null]
 
   - name: stg_medical_claim
     description: >
       Typed, trimmed view over raw.medical_claim (see models/sources.yml).
-      Field-level extraction/casting only; no Tuva-specific business
-      logic. See models/final/medical_claim.sql for the Input Layer
-      contract model. Column names match the Input Layer `medical_claim`
-      contract directly (drg_code/drg_code_type, hcpcs_code kept
-      distinct from ICD procedure codes -- which this source does not
-      supply).
+      Field-level extraction/casting only; no joins, crosswalk
+      resolution, claim-type derivation, lifecycle handling, or
+      diagnosis/procedure normalization -- all owned by
+      models/intermediate/int_medical_claim_lines.sql. See the model's
+      header for the two source-field vocabularies it reconciles.
     columns:
       - name: claim_id
-        description: Source claim identifier.
+        description: Source claim identifier -- coalesced from claim_id (tuva) or clm_id (vendor).
         data_tests: [not_null]
       - name: claim_line_number
         description: 1-based claim line number within claim_id, or NULL if unparseable.
         data_tests: [not_null]
-      - name: claim_type
-        description: Source-supplied claim type (institutional/professional/undetermined).
-        data_tests: [not_null]
+      - name: source_claim_type_hint
+        description: >
+          Existing "tuva" source's already-classified claim_type value,
+          carried through unmodified as ONE input to the deterministic
+          claim_type precedence rule (macros/claim_type.sql) applied in
+          models/intermediate/int_medical_claim_lines.sql. Deliberately
+          NOT named `claim_type` -- that name is reserved for the
+          Input Layer's own derived column, never a raw pass-through
+          (see the model header's note on the anti-pattern this
+          replaces).
+      - name: clm_status_code
+        description: >
+          Vendor-shaped lifecycle status (1=original, 7=adjustment/
+          replacement, 8=void -- docs/CLAIMS_MAPPING_DECISIONS.md
+          decision 2). NULL for the existing "tuva" source.
+        data_tests:
+          - accepted_values:
+              values: ["1", "7", "8"]
+              config:
+                where: "clm_status_code is not null"
+      - name: orig_clm_id
+        description: >
+          claim_id of the original claim an adjustment/void supersedes
+          or reverses (vendor source only; populated only when
+          clm_status_code in ('7', '8')).
+      - name: member_crosswalk_key
+        description: Vendor-shaped source's member_key -- see stg_eligibility.sql's identical column.
+      - name: payer
+        description: >
+          Source payer name. NULL for the vendor source (which has no
+          payer field on the claims file at all -- only on the
+          eligibility file, see docs/CLAIMS_MAPPING.csv); derived via a
+          join to eligibility in models/intermediate/
+          int_medical_claim_lines.sql.
       - name: person_id
         description: Source person identifier, carried through unmapped as the Input Layer's person_id.
-        data_tests: [not_null]
       - name: member_id
-        description: Source member identifier.
-        data_tests: [not_null]
+        description: Source member identifier (existing "tuva" source only).
       - name: paid_amount
-        description: Amount paid on this claim line, or NULL if the source value did not parse as numeric.
+        description: >
+          Amount paid on this claim line -- coalesced from the existing
+          "tuva" source's whole-dollar paid_amount or the vendor
+          source's integer-cents paid_cents (via cents_to_amount(), see
+          macros/safe_cast.sql), or NULL if the populated value did not
+          parse.
       - name: data_source
-        description: Source system tag; defaults to 'tuva' when the source row does not supply one.
+        description: >
+          Source system tag; same 'incoming_source' vs. 'tuva' default
+          rule as stg_eligibility.sql.
+        data_tests: [not_null]
+      - name: _row_hash
+        description: >
+          Deterministic md5 fingerprint over every normalized business
+          column -- see stg_eligibility.sql's identical column.
         data_tests: [not_null]
 
   - name: stg_pharmacy_claim
     description: >
       Typed, trimmed view over raw.pharmacy_claim (see models/sources.yml).
       Field-level extraction/casting only; no Tuva-specific business
-      logic. See models/final/pharmacy_claim.sql for the Input Layer
-      contract model. Column names match the Input Layer
-      `pharmacy_claim` contract directly.
+      logic. See models/intermediate/int_pharmacy_claim_lines.sql for
+      exact-duplicate-delivery collapse and models/final/
+      pharmacy_claim.sql for the Input Layer contract model. Column
+      names match the Input Layer `pharmacy_claim` contract directly.
+      No vendor-shaped source vocabulary is documented for pharmacy
+      claims yet -- see this model's header.
     columns:
       - name: claim_id
         description: Source claim identifier.
@@ -85,4 +170,9 @@ models:
         description: Amount paid on this claim line, or NULL if the source value did not parse as numeric.
       - name: data_source
         description: Source system tag; defaults to 'tuva' when the source row does not supply one.
+        data_tests: [not_null]
+      - name: _row_hash
+        description: >
+          Deterministic md5 fingerprint over every normalized business
+          column -- see stg_eligibility.sql's identical column.
         data_tests: [not_null]

@@ -1,0 +1,133 @@
+version: 2
+
+models:
+  - name: int_member_crosswalk
+    description: >
+      Deterministic member_key -> person_id crosswalk (docs/
+      CLAIMS_MAPPING_DECISIONS.md decision 5), sourced from the interim
+      seeds/member_crosswalk_seed.csv (see this model's header for the
+      documented source-contract limitation this stands in for).
+      Many-to-one (multiple member_key -> the same person_id) is valid
+      and expected; the reverse is not.
+    config:
+      tags: ["input_layer"]
+    columns:
+      - name: member_key
+        description: Vendor-assigned member identifier.
+        data_tests: [not_null, unique]
+      - name: person_id
+        description: Resolved Tuva person_id. No uniqueness test -- many-to-one is expected.
+        data_tests: [not_null]
+
+  - name: int_eligibility_resolved
+    description: >
+      Row-level eligibility resolution: member identity resolution,
+      exact-duplicate-delivery collapse, and invalid-range/unmatched-
+      member flagging. Every source row survives here (the auditability
+      layer) -- span consolidation and quarantine filtering happen in
+      models/intermediate/int_eligibility_spans.sql.
+    config:
+      tags: ["input_layer"]
+    columns:
+      - name: data_source
+        data_tests: [not_null]
+      - name: is_quarantined
+        description: >
+          True when this row was excluded from span consolidation:
+          unmatched member_key, a missing/unparseable start date, or an
+          end date before the start date (quarantine_reason names which).
+        data_tests: [not_null]
+      - name: resolved_person_id
+        description: >
+          Resolved Tuva person_id, or NULL exactly when
+          quarantine_reason = 'unmatched_member_key' -- see the
+          `assert_unmatched_eligibility_is_always_quarantined` singular
+          test, which proves this invariant rather than merely asserting
+          it in a comment.
+
+  - name: int_eligibility_spans
+    description: >
+      Consolidated eligibility spans (docs/CLAIMS_MAPPING_DECISIONS.md
+      decision 7): overlapping/adjacent closed spans merged per
+      partition, real gaps preserved, open-ended spans preserved as-is.
+      Consumes only matched, valid rows from
+      models/intermediate/int_eligibility_resolved.sql -- feeds
+      models/final/eligibility.sql directly (a thin projection).
+    config:
+      tags: ["input_layer"]
+    columns:
+      - name: person_id
+        data_tests: [not_null]
+      - name: member_id
+        data_tests: [not_null]
+      - name: enrollment_start_date
+        data_tests: [not_null]
+      - name: data_source
+        data_tests: [not_null]
+
+  - name: int_medical_claim_lines
+    description: >
+      Medical claim line intermediate model: exact-duplicate-delivery
+      collapse and grain-conflict surfacing, member identity resolution,
+      claim-header date derivation, payer/plan inheritance from
+      eligibility, deterministic claim_type derivation, diagnosis/
+      procedure normalization, and claim lifecycle (original/adjustment/
+      void) handling. Every row -- including a superseded original --
+      survives here for auditability; models/final/medical_claim.sql
+      filters to `matched_member and not is_superseded`.
+    config:
+      tags: ["input_layer"]
+    columns:
+      - name: claim_id
+        data_tests: [not_null]
+      - name: claim_line_number
+        data_tests: [not_null]
+      - name: claim_type
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["institutional", "professional", "undetermined"]
+      - name: clm_status_code
+        data_tests:
+          - accepted_values:
+              values: ["1", "7", "8"]
+              config:
+                where: "clm_status_code is not null"
+      - name: lifecycle_action
+        data_tests:
+          - not_null
+      - name: is_superseded
+        data_tests: [not_null]
+      - name: matched_member
+        data_tests: [not_null]
+      - name: data_source
+        data_tests: [not_null]
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - claim_id
+            - claim_line_number
+            - data_source
+          config:
+            where: "matched_member and not is_superseded"
+
+  - name: int_pharmacy_claim_lines
+    description: >
+      Pharmacy claim line intermediate model: exact-duplicate-delivery
+      collapse and grain-conflict surfacing. See this model's header for
+      why it does not yet also carry crosswalk/lifecycle logic.
+    config:
+      tags: ["input_layer"]
+    columns:
+      - name: claim_id
+        data_tests: [not_null]
+      - name: claim_line_number
+        data_tests: [not_null]
+      - name: data_source
+        data_tests: [not_null]
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - claim_id
+            - claim_line_number
+            - data_source

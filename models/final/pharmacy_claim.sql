@@ -21,15 +21,20 @@
 -- targets PostgreSQL only, so there is no cross-database reason to use
 -- a lower-precision float type here).
 --
--- All source-fidelity normalization already happened in
--- models/staging/stg_pharmacy_claim.sql; this model selects/types the
--- Input Layer's full column set and fills every field our source does
--- not provide (in_network_flag, file lineage) with an explicitly typed
--- NULL rather than an invented mapping.
+-- This is a thin contract projection: all row-local normalization
+-- already happened in models/staging/stg_pharmacy_claim.sql, and
+-- exact-duplicate-delivery collapse already happened in
+-- models/intermediate/int_pharmacy_claim_lines.sql (see that model's
+-- header for why this domain has no crosswalk/lifecycle logic yet).
+-- This model performs no joins, no deduplication, and no business
+-- logic of its own; it only selects/types the Input Layer's full column
+-- set and fills every field our source does not provide
+-- (in_network_flag, file lineage) with an explicitly typed NULL rather
+-- than an invented mapping.
 
-with staging as (
+with intermediate as (
 
-    select * from {{ ref('stg_pharmacy_claim') }}
+    select * from {{ ref('int_pharmacy_claim_lines') }}
 
 ),
 
@@ -73,7 +78,7 @@ final as (
         cast(null as date)                                    as file_date,
         cast(null as timestamp)                               as ingest_datetime
 
-    from staging
+    from intermediate
 
 )
 

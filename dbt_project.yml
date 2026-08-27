@@ -4,12 +4,24 @@
 # package (see packages.yml, release 0.18.0) then builds into Tuva's
 # core data model, terminology sets, and data marts.
 #
-# Lineage: raw.{eligibility,medical_claim,pharmacy_claim} (source, see
-# models/sources.yml) -> models/staging/*.sql (type/name normalization)
-# -> models/final/{eligibility,medical_claim,pharmacy_claim}.sql (the
-# Input Layer contract Tuva's package ref()s by name) -> the Tuva
-# package's own models (dbt_packages/the_tuva_project/, never
-# duplicated or vendored into this repository).
+# Four-layer lineage, each with strictly separated responsibilities
+# (see README.md "Architecture" for the full narrative):
+#
+#   raw.{eligibility,medical_claim,pharmacy_claim} (source, see
+#   models/sources.yml -- exact source fidelity only; no transformation)
+#     -> models/staging/*.sql (row-local rename/trim/cast/unit-conversion
+#        only -- never joins, dedup, crosswalk resolution, or multi-row
+#        business rules)
+#     -> models/intermediate/*.sql (owns every join, dedup, member
+#        crosswalk resolution, eligibility-span consolidation, and claim
+#        lifecycle/adjustment/void handling -- seeds/member_crosswalk_seed.csv
+#        is this layer's interim crosswalk source; see
+#        models/intermediate/int_member_crosswalk.sql)
+#     -> models/final/{eligibility,medical_claim,pharmacy_claim}.sql (thin
+#        Tuva Input Layer contract projections -- explicit column
+#        selection/casting only, the model Tuva's package ref()s by name)
+#     -> the Tuva package's own models (dbt_packages/the_tuva_project/,
+#        never duplicated or vendored into this repository).
 name: "tuva_ingest_connector"
 version: "1.0.0"
 config-version: 2
@@ -97,6 +109,29 @@ models:
       +tags: ["input_layer"]
       +docs:
         node_color: "#8BC34A"
+    # models/intermediate/*.sql: joins, member-crosswalk resolution,
+    # eligibility-span consolidation, and claim lifecycle handling (see
+    # README.md "Architecture" and each model's own header). Shares the
+    # same configurable staging_schema var as models/staging/*.sql --
+    # per this repository's own architecture, a separate physical schema
+    # buys nothing operationally (both layers are internal, never
+    # ref()'d by the Tuva package itself, which only ever resolves
+    # models/final/*.sql by name), while the *logical* dbt layer stays
+    # fully distinct via the models/intermediate/ directory, its own
+    # int_ naming convention, and its own schema.yml. Also tagged
+    # input_layer (not just staging/final) so `dbt build --select
+    # tag:input_layer` builds this connector's complete DAG -- raw's
+    # source rows all the way through to the Input Layer contract -- in
+    # one pass from an empty database, exactly like staging/final
+    # already do (see that var's own comment on the staging block above,
+    # and tuva-health/connector_template, which tags all of its
+    # transformation layers this same way for the same reason).
+    intermediate:
+      +schema: "{{ var('staging_schema') }}"
+      +materialized: view
+      +tags: ["input_layer"]
+      +docs:
+        node_color: "#FF9800"
     final:
       +schema: "{{ var('input_layer_schema') }}"
       +materialized: table
@@ -115,3 +150,26 @@ models:
   # and the final Input Layer models ref() the staging models -- see
   # tuva-health/connector_template, which tags all three of its
   # transformation layers this same way for exactly this reason.
+
+seeds:
+  tuva_ingest_connector:
+    # seeds/member_crosswalk_seed.csv: the interim, versioned,
+    # deterministic member_key -> person_id crosswalk consumed by
+    # models/intermediate/int_member_crosswalk.sql. See that model's
+    # header for why a seed (not a fabricated raw source/loader) is the
+    # right stand-in until a real vendor crosswalk feed exists. Same
+    # physical schema as staging/intermediate for the same reason
+    # documented on the intermediate models block above.
+    member_crosswalk_seed:
+      +schema: "{{ var('staging_schema') }}"
+      # Tagged input_layer, same as staging/intermediate/final, so that
+      # `dbt build --select tag:input_layer` -- this connector's
+      # documented one-pass, empty-database build target (see Makefile's
+      # dbt-input-layer target and README.md "Validation order") --
+      # actually loads this seed before models/intermediate/
+      # int_member_crosswalk.sql tries to ref() it. Without this tag,
+      # a tag-scoped selection would build the intermediate/final models
+      # against a crosswalk table that was never seeded.
+      +tags: ["input_layer"]
+      +docs:
+        node_color: "#9E9E9E"

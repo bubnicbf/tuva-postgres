@@ -74,10 +74,15 @@ from .config import ALL_REQUIREMENTS, REQUIRE_DB, REQUIRE_OBJECT_STORAGE, REQUIR
 from .errors import (
     CliUsageError,
     ConnectorError,
+    CursorError,
+    ObjectVerificationError,
+    OperationalStateError,
     QuarantineError,
+    RawContractError,
     RawLoadError,
     ReconciliationError,
     RunNotFoundError,
+    RunNotPublishedError,
     WatermarkError,
 )
 from .logging_utils import configure_logging, log_event, sanitize_error
@@ -371,7 +376,15 @@ def _run_object_load(run_id: str, *, config: IngestConfig, logger) -> dict:
 
         try:
             result = load_verified_run(conn, config, backend, run_key, logger=logger)
-        except (ReconciliationError, CursorError, RawLoadError) as exc:
+        except (
+            ReconciliationError,
+            CursorError,
+            RawLoadError,
+            OperationalStateError,
+            RunNotPublishedError,
+            ObjectVerificationError,
+            RawContractError,
+        ) as exc:
             conn.rollback()
             category = getattr(exc, "category", "raw_load")
             state.mark_run_failed(conn, config.ops_schema, config_run_id, failure_category=category, failure_message=str(exc))

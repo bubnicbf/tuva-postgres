@@ -3,9 +3,14 @@ object-storage-backed operational model (ingestion_run/page/cursor/
 rejected_record/schema_observation). Same fake-connection pattern as
 test_state.py: no real PostgreSQL connection, proving (a) generated SQL
 shape/ON CONFLICT targets, (b) which functions commit vs. never commit,
-and (c) CursorError is raised when the optimistic-concurrency UPDATE
-matches zero rows. Full round-trip behavior against a real database is
-covered by tests/integration/test_pipeline_integration.py.
+(c) CursorError is raised when the optimistic-concurrency UPDATE
+matches zero rows, and (d) OperationalStateError is raised whenever a
+lifecycle transition or a page upsert affects zero rows / conflicts with
+already-recorded immutable data -- a zero-row update must never be
+silently treated as success. Full round-trip behavior against a real
+database (including that occurrence_count genuinely does not inflate on
+a replayed run/page) is covered by
+tests/integration/test_object_storage_pipeline_integration.py.
 """
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from tuva_ingest import state  # noqa: E402
-from tuva_ingest.errors import CursorError  # noqa: E402
+from tuva_ingest.errors import CursorError, OperationalStateError  # noqa: E402
 
 
 class _FakeCursor:
@@ -51,6 +56,7 @@ class _FakeConnection:
     def __init__(self, *, fetchone_result=None, rowcount=1):
         self.log: list[tuple[str, tuple]] = []
         self.commits = 0
+        self.rollbacks = 0
         self._fetchone_result = fetchone_result
         self._rowcount = rowcount
         self.last_cursor: _FakeCursor | None = None
@@ -62,10 +68,16 @@ class _FakeConnection:
     def commit(self):
         self.commits += 1
 
+    def rollback(self):
+        self.rollbacks += 1
+
 
 class TestAutoCommittingWrites(unittest.TestCase):
     """create_ingestion_run / mark_run_published / mark_run_load_started /
-    mark_run_failed each commit their own write immediately."""
+    mark_run_failed each commit their own write immediately -- and, for
+    the three lifecycle transitions that require a specific prior status
+    (published/load_started, not create/failed), roll back and raise
+    OperationalStateError instead of committing a zero-row update."""
 
     def test_create_ingestion_run_commits(self):
         conn = _FakeConnection()
@@ -76,35 +88,70 @@ class TestAutoCommittingWrites(unittest.TestCase):
         )
         self.assertEqual(conn.commits, 1)
 
-    def test_mark_run_published_commits(self):
-        conn = _FakeConnection()
+    def test_mark_run_published_commits_on_success(self):
+        conn = _FakeConnection(rowcount=1)
         state.mark_run_published(conn, "ops", "r1", candidate_cursor="2026-08-14", page_count=1, extracted_count=10)
         self.assertEqual(conn.commits, 1)
+        self.assertEqual(conn.rollbacks, 0)
 
-    def test_mark_run_load_started_commits(self):
-        conn = _FakeConnection()
+    def test_mark_run_published_raises_and_rolls_back_on_zero_rows(self):
+        conn = _FakeConnection(rowcount=0)
+        with self.assertRaises(OperationalStateError):
+            state.mark_run_published(conn, "ops", "r1", candidate_cursor="2026-08-14", page_count=1, extracted_count=10)
+        self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.rollbacks, 1)
+
+    def test_mark_run_load_started_commits_on_success(self):
+        conn = _FakeConnection(rowcount=1)
         state.mark_run_load_started(conn, "ops", "r1")
         self.assertEqual(conn.commits, 1)
+        self.assertEqual(conn.rollbacks, 0)
+
+    def test_mark_run_load_started_raises_and_rolls_back_on_zero_rows(self):
+        conn = _FakeConnection(rowcount=0)
+        with self.assertRaises(OperationalStateError):
+            state.mark_run_load_started(conn, "ops", "r1")
+        self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.rollbacks, 1)
 
     def test_mark_run_failed_commits(self):
         conn = _FakeConnection()
         state.mark_run_failed(conn, "ops", "r1", failure_category="raw_load", failure_message="boom")
         self.assertEqual(conn.commits, 1)
 
+    def test_mark_run_failed_zero_rows_is_a_safe_no_op_not_an_error(self):
+        # Calling mark_run_failed for an already-terminal run is
+        # documented, intentional, idempotent behavior -- unlike the
+        # lifecycle-forward transitions above, this must NOT raise.
+        conn = _FakeConnection(rowcount=0)
+        state.mark_run_failed(conn, "ops", "r1", failure_category="raw_load", failure_message="boom")
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(conn.rollbacks, 0)
+
 
 class TestNonCommittingWrites(unittest.TestCase):
     """mark_run_committed / insert_ingestion_page / insert_rejected_records
     / upsert_schema_observations / lock_cursor_for_update / commit_cursor
     NEVER commit -- they must participate in the caller's own
-    transaction (see object_raw_loader.load_verified_run)."""
+    transaction (see object_raw_loader.load_verified_run). None of them
+    roll back internally either -- transaction-boundary ownership
+    belongs entirely to the caller."""
 
-    def test_mark_run_committed_never_commits(self):
-        conn = _FakeConnection()
+    def test_mark_run_committed_never_commits_on_success(self):
+        conn = _FakeConnection(rowcount=1)
         state.mark_run_committed(conn, "ops", "r1", accepted_count=1, rejected_count=0, inserted_count=1, duplicate_count=0)
         self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.rollbacks, 0)
+
+    def test_mark_run_committed_raises_without_committing_or_rolling_back_on_zero_rows(self):
+        conn = _FakeConnection(rowcount=0)
+        with self.assertRaises(OperationalStateError):
+            state.mark_run_committed(conn, "ops", "r1", accepted_count=1, rejected_count=0, inserted_count=1, duplicate_count=0)
+        self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.rollbacks, 0)  # the caller (cli._run_object_load) owns the rollback, not this function
 
     def test_insert_ingestion_page_never_commits(self):
-        conn = _FakeConnection()
+        conn = _FakeConnection(fetchone_result=(1,))
         state.insert_ingestion_page(
             conn, "ops", run_id="r1", page_number=1, object_key="raw/.../page=000001.jsonl.gz", checksum="a" * 64,
             compressed_size_bytes=100, source_record_count=1, accepted_count=1, rejected_count=0,
@@ -113,6 +160,31 @@ class TestNonCommittingWrites(unittest.TestCase):
         self.assertEqual(conn.commits, 0)
         sql, _params = conn.log[0]
         self.assertIn("ON CONFLICT (run_id, page_number) DO UPDATE", sql)
+        self.assertIn("RETURNING 1", sql)
+        # Only mutable verification/load-result columns are ever assigned
+        # in the SET list -- object_key/checksum/source_record_count must
+        # never appear there (they may only appear in the WHERE guard).
+        set_clause = sql.split("DO UPDATE SET", 1)[1].split("WHERE", 1)[0]
+        for immutable_column in ("object_key", "checksum", "source_record_count"):
+            self.assertNotIn(f"{immutable_column} = EXCLUDED", set_clause)
+        self.assertIn("object_key = EXCLUDED.object_key", sql)
+        self.assertIn("checksum = EXCLUDED.checksum", sql)
+        self.assertIn("source_record_count = EXCLUDED.source_record_count", sql)
+
+    def test_insert_ingestion_page_raises_on_conflicting_immutable_metadata(self):
+        # RETURNING produced no row -- the ON CONFLICT ... WHERE guard
+        # excluded the update because an existing row's immutable
+        # identity disagreed with what this call asserted.
+        conn = _FakeConnection(fetchone_result=None)
+        with self.assertRaises(OperationalStateError):
+            state.insert_ingestion_page(
+                conn, "ops", run_id="r1", page_number=1, object_key="raw/.../page=000001.jsonl.gz",
+                checksum="b" * 64, compressed_size_bytes=100, source_record_count=1, accepted_count=1,
+                rejected_count=0, request_cursor=None, response_cursor=None, next_page_cursor=None,
+                retrieved_at=None, status="loaded",
+            )
+        self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.rollbacks, 0)  # the caller owns rollback, not this function
 
     def test_insert_rejected_records_never_commits_and_no_op_on_empty(self):
         conn = _FakeConnection()
@@ -146,7 +218,19 @@ class TestNonCommittingWrites(unittest.TestCase):
         )
         self.assertEqual(conn.commits, 0)
         sql, _rows = conn.log[0]
-        self.assertIn("occurrence_count = so.occurrence_count + 1", sql)
+        # The occurrence_count increment must be CONDITIONAL on this
+        # call's (run_id, page_number) differing from what is already
+        # recorded as the row's last-observed occurrence -- a bare
+        # unconditional "+ 1" here would inflate occurrence_count on
+        # every replay of the same page (the bug this test guards
+        # against; see tests/integration's real-database idempotency
+        # proof for the actual replay behavior).
+        self.assertIn("occurrence_count = CASE", sql)
+        self.assertIn("so.last_observed_run_id IS DISTINCT FROM EXCLUDED.last_observed_run_id", sql)
+        self.assertIn("so.last_observed_page_number IS DISTINCT FROM EXCLUDED.last_observed_page_number", sql)
+        self.assertIn("THEN so.occurrence_count + 1", sql)
+        self.assertIn("ELSE so.occurrence_count", sql)
+        self.assertNotIn("occurrence_count = so.occurrence_count + 1", sql)
 
     def test_lock_cursor_for_update_never_commits(self):
         conn = _FakeConnection(fetchone_result=("2026-08-01", "prior-run", 3))

@@ -100,6 +100,9 @@ _ENV_ALIASES: dict[str, str] = {
     "pg_dsn": "PG_DSN",
     "raw_schema": "RAW_SCHEMA",
     "ops_schema": "OPS_SCHEMA",
+    "staging_schema": "STAGING_SCHEMA",
+    "analytics_core_schema": "ANALYTICS_CORE_SCHEMA",
+    "analytics_marts_schema": "ANALYTICS_MARTS_SCHEMA",
     "input_layer_schema": "INPUT_LAYER_SCHEMA",
     "dbt_target": "DBT_TARGET",
     "dbt_profiles_dir": "DBT_PROFILES_DIR",
@@ -123,6 +126,12 @@ _ENV_ALIASES: dict[str, str] = {
     "oauth_client_secret": "TUVA_OAUTH_CLIENT_SECRET",
     "oauth_scopes": "TUVA_OAUTH_SCOPES",
     "oauth_refresh_skew_seconds": "TUVA_OAUTH_REFRESH_SKEW_SECONDS",
+    "object_storage_provider": "OBJECT_STORAGE_PROVIDER",
+    "object_storage_bucket": "OBJECT_STORAGE_BUCKET",
+    "object_storage_prefix": "OBJECT_STORAGE_PREFIX",
+    "object_storage_region": "OBJECT_STORAGE_REGION",
+    "object_storage_endpoint_url": "OBJECT_STORAGE_ENDPOINT_URL",
+    "object_storage_local_root": "OBJECT_STORAGE_LOCAL_ROOT",
 }
 
 
@@ -222,7 +231,7 @@ class IngestConfig(BaseSettings):
     # that never explicitly set RAW_SCHEMA/OPS_SCHEMA must set them
     # explicitly to its current value (`raw`/`ingest_ops`) to keep reading
     # its existing data; see docs/RUNBOOK.md "Upgrade notes" and
-    # migrations/006_object_storage_raw_contract.sql's own comment on this.
+    # migrations/007_object_storage_raw_contract.sql's own comment on this.
     # An override of either variable continues to work exactly as before
     # (backward-compatible) -- only the *default* changed.
     raw_schema: str = Field(default="raw_incoming", validation_alias=_ENV_ALIASES["raw_schema"])

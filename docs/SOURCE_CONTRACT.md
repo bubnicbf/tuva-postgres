@@ -12,7 +12,7 @@ format only) and `docs/RUNBOOK.md` (day-to-day operation). Implementation:
 `src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state}.py`
 for the wire/legacy contract; `src/tuva_ingest/{object_storage/,
 object_extract,object_raw_loader,endpoint_contract,schema_observation}.py`
-and `migrations/006_object_storage_raw_contract.sql` for the object-storage-
+and `migrations/007_object_storage_raw_contract.sql`/`008_operational_table_hardening.sql` for the object-storage-
 backed contract (Section 15). Validated by: `tests/unit/test_source_contract.py`,
 `tests/unit/test_object_storage_*.py`, `tests/unit/test_endpoint_contract.py`,
 `tests/unit/test_schema_observation.py`, `tests/integration/test_object_storage_*.py`.
@@ -48,7 +48,7 @@ confirmation are marked **Repository-derived assumption**.
 ## 1. Base URL and API version
 
 - Production base URL: **Unverified / not a fixed constant.** `TUVA_API_MANIFEST_URL` is a full URL supplied per deployment via environment variable (`config.py`); no hostname or path prefix is hardcoded anywhere in `src/tuva_ingest/`. **Decision:** this is deliberate -- see "A repository-derived fact" above.
-- Environment-specific URLs: **Unverified.** No sandbox/production URL convention exists in the repository. `PIPELINE_ENVIRONMENT` (`config.py`) only labels operational metadata (`ingest_ops.ingestion_runs.environment`); it never selects a URL.
+- Environment-specific URLs: **Unverified.** No sandbox/production URL convention exists in the repository. `PIPELINE_ENVIRONMENT` (`config.py`) only labels operational metadata (`<OPS_SCHEMA>.ingestion_runs.environment`, default schema name `ops`); it never selects a URL.
 - API version and how it is selected: **Verified.** The manifest's wire-format version is the `version` field inside the fetched JSON body itself, checked against `SUPPORTED_MANIFEST_VERSIONS = (1,)` (`manifest.py`). There is no URL path segment (e.g. `/v1/`) or version header.
 - Version deprecation: **Unverified.** No deprecation policy exists for manifest version 1. Introducing version 2 requires a deliberate, reviewed update to `SUPPORTED_MANIFEST_VERSIONS` (see `docs/RUNBOOK.md` "Upgrading" for the analogous single-commit convention used for the pinned Tuva package).
 
@@ -151,7 +151,7 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
 - `--since` override: **Verified.** An operator-supplied `--since` overrides the *request* for one extraction (`cli._resolve_since`), but never permanently lowers the durable watermark -- the same backward-movement guard applies uniformly regardless of why a candidate value happens to be behind the currently committed one (see Section 14).
 - Multiple candidate watermarks within one run: **Decision.** When a run spans several pages, each may report its own candidate `high_water_mark`; this connector selects the **last page's** value deterministically (`pagination.extract_paginated_run`), because pages are fetched strictly in the order the source's own `next_page_token` chain dictates, so the final page necessarily reflects the most complete traversal of that run's result set.
 - Overlap/lookback window: **Unverified** for a real vendor (whether "since `X`" is inclusive/exclusive, or how far back a fresh backfill can safely reach) -- not established anywhere in this repository today.
-- Watermark persistence and restart: **Verified.** The durable watermark is `ingest_ops.source_watermarks` (`migrations/005_paginated_extraction_state.sql`), keyed by `(source, endpoint)`, and is only ever advanced transactionally -- in the same commit as the data load, after every reconciliation count matches (`state.commit_watermark`, `cli._run_paginated_load`; see Section 14). It is never advanced during extraction itself. The legacy snapshot-level watermark (`RawSnapshotStore.current_snapshot_id()`) is unchanged and still governs `run`/`load-raw` only.
+- Watermark persistence and restart: **Verified.** The durable watermark is `<OPS_SCHEMA>.source_watermarks` (default schema name `ops`; `migrations/005_paginated_extraction_state.sql`), keyed by `(source, endpoint)`, and is only ever advanced transactionally -- in the same commit as the data load, after every reconciliation count matches (`state.commit_watermark`, `cli._run_paginated_load`; see Section 14). It is never advanced during extraction itself. The legacy snapshot-level watermark (`RawSnapshotStore.current_snapshot_id()`) is unchanged and still governs `run`/`load-raw` only.
 - Why this captures corrections and late-arriving changes: **Unverified** for a real vendor -- whether "since `X`" reliably re-surfaces a corrected/late-arriving record depends entirely on how the (not-yet-connected) vendor implements its own watermark semantics; this connector has no way to confirm that from the wire contract alone.
 
 ## 7. Historical mutability
@@ -216,7 +216,7 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
   2. The sum of every page's `record_count` is checked against the run manifest's own `total_record_count` (`verify_run_manifest`).
   3. The number of raw rows actually present in the database for the run (`paginated_loader.loaded_row_count`, a fresh `COUNT(*) WHERE _snapshot_id = run_id` -- correct whether this is the first load or an idempotent repeat) is checked against that same `total_record_count` (`cli._run_paginated_load`).
   Any of the three mismatching raises `ReconciliationError`, rolls back the whole transaction, and never commits the watermark (Section 6) -- see `run_failed`/`reconciliation_completed` structured log events.
-- Compensating controls for the legacy full-manifest contract (**Verified**, unchanged): per-artifact SHA-256/byte-count verification (`ApiClient.download_artifact`, `raw_loader.verify_file_checksum`) and per-table row counts (`ingest_ops.table_loads.row_count`, `state.table_load_row_counts()`).
+- Compensating controls for the legacy full-manifest contract (**Verified**, unchanged): per-artifact SHA-256/byte-count verification (`ApiClient.download_artifact`, `raw_loader.verify_file_checksum`) and per-table row counts (`<OPS_SCHEMA>.table_loads.row_count`, default schema name `ops`; `state.table_load_row_counts()`).
 - Comparison tolerances, frequency, alert thresholds, investigation procedure: **Unverified.** None are defined in this repository for either contract; counts are recorded/reconciled per run but nothing currently compares them run-over-run or alerts on an unexpected swing.
 - **Blocking note:** without vendor-provided *business* totals (as opposed to this connector's own structural/technical reconciliation above), whether "did we receive every claim the payer sent this period" holds cannot be confirmed by this connector alone -- only structural/technical completeness (checksums, per-page/per-run/per-database record counts) is currently verifiable.
 
@@ -224,9 +224,251 @@ Detail/follow-up endpoints: **Verified absent.** The manifest must list exactly 
 
 - Mechanism: **Verified**, `src/tuva_ingest/validators.py`, applied at **load** time (extraction remains an unmodified, byte-for-byte mirror of what the source sent -- see Section 4). Every record is checked against a narrow, structural-only contract derived directly from Section 3's documented record grain: `eligibility` requires a non-blank string `person_id`; `medical_claim`/`pharmacy_claim` require a non-blank string `claim_id` and a scalar `claim_line_number`; any populated known date field must be recognizably date-shaped. **Decision:** this connector never invents a clinical/business rule here, and a null/absent *optional* field is never grounds for quarantine.
 - Reason codes: **Decision**, a fixed allowlist (`record_not_object`, `missing_required_field`, `invalid_required_type`, `invalid_identifier`, `invalid_date_format`, `schema_validation_failed`), enforced both in application code and by a database `CHECK` constraint (`migrations/006_record_quarantine.sql`).
-- Storage and access: **Verified.** A structurally invalid record is written to `ingest_ops.quarantined_records` (PHI-bearing) and is never also loaded into its endpoint's raw table. Access is more restrictive than the raw schema: `PUBLIC` and `TRANSFORM_ROLE` have no access at all; `INGEST_ROLE` is granted `INSERT` only, never `SELECT`/`UPDATE`/`DELETE`. No operational "quarantine review" role exists in this repository's role model yet -- see `docs/RUNBOOK.md` "Quarantined records".
+- Storage and access: **Verified.** A structurally invalid record is written to `<OPS_SCHEMA>.quarantined_records` (default schema name `ops`; PHI-bearing) and is never also loaded into its endpoint's raw table. Access is more restrictive than the raw schema: `PUBLIC` and `TRANSFORM_ROLE` have no access at all; `INGEST_ROLE` is granted `INSERT` only, never `SELECT`/`UPDATE`/`DELETE`. No operational "quarantine review" role exists in this repository's role model yet -- see `docs/RUNBOOK.md` "Quarantined records".
 - Reconciliation interaction: **Verified**, extends Section 14's three-way check to a required identity: `source_record_count == raw_loaded_count + quarantined_count`. `quarantined_count` is computed from the connector's own deterministic, idempotent classification pass over the immutable page files on every call -- never a `SELECT` against the quarantine table, consistent with its INSERT-only grant.
 - What this does *not* cover: **Unverified/out of scope.** Clinical or business-rule validity (a syntactically valid but clinically implausible diagnosis code, an out-of-range paid amount, a claim referencing a member not present in eligibility) is not checked here -- that remains a downstream (dbt staging/DQ) concern, unchanged by this section.
+
+## Operational tables (control plane)
+
+The five canonical operational/control tables the object-storage-backed
+workflow (`object_extract.py`/`object_raw_loader.py`) writes to --
+`ingestion_run`, `ingestion_page`, `ingestion_cursor`, `rejected_record`,
+`schema_observation` -- all live in the configurable `OPS_SCHEMA`
+(default `ops`; **Decision:** never hard-coded -- every reference goes
+through `db.qualified_relation`/`identifiers.validate_identifier`, see
+"Application implementation" in `docs/RUNBOOK.md`). They are **control-
+plane objects, never Tuva Input Layer models**: `migrations/007_object_storage_raw_contract.sql`/
+`008_operational_table_hardening.sql` create them with plain SQL, never
+dbt; `models/sources.yml` has no entry for `OPS_SCHEMA` at all (dbt only
+ever reads `RAW_SCHEMA`); and no dbt model may read `rejected_record` or
+any other operational table as a substitute for source data. See
+`migrations/007_object_storage_raw_contract.sql`/`008_operational_table_hardening.sql`
+for the exact column-level DDL this section summarizes; both are
+**Verified** directly from those files (which are also what
+`tests/unit/test_migrations.py`'s `TestMigration007ObjectStorageRawContract`/
+`TestMigration008OperationalTableHardening` structurally check).
+
+**Legacy plural tables, still present and unambiguous:** `ingestion_runs`/
+`table_loads` (`migrations/002_ingestion_control.sql`, extended by 004)
+and `source_watermarks` (`migrations/005_paginated_extraction_state.sql`)
+back the legacy CSV/full-manifest workflow (`raw_loader.py`) and the
+local-filesystem paginated workflow (`pagination.py`/`paginated_loader.py`)
+respectively; `quarantined_records` (`migrations/006_record_quarantine.sql`)
+backs that same local-filesystem workflow's structural-validation
+quarantine. **None of these four legacy tables is ever written to by the
+object-storage-backed workflow**, and the five canonical singular tables
+above are never written to by the legacy/local-filesystem workflows --
+`object_raw_loader.py`/`state.py`'s "canonical object-storage-backed
+operational model" section only ever touches the five singular tables;
+`raw_loader.py`/`paginated_loader.py`/`quarantine.py` only ever touch the
+four legacy ones. This separation is enforced by convention (each
+module's own `state.py` functions target one fixed set of table names --
+see `state.py`'s own module docstring, "Two different commit
+disciplines"), not by a database-level constraint; do not add a new
+call site that writes a legacy table from object-storage code or vice
+versa.
+
+### ingestion_run
+
+One row per complete object-storage-backed extraction/load attempt, keyed
+by `run_id` (a UUID -- the same identifier minted for the run's own
+object-storage key prefix, see `object_storage/keys.new_run_id`, never
+re-derived). Records `vendor`, `endpoint`, `load_date`, `storage_bucket`/
+`storage_run_prefix`, `requested_cursor`/`candidate_cursor`, and explicit
+lifecycle `status`. **State machine:** `running` -> `published` ->
+`loading` -> `committed`, or -> `failed` from any of the first three.
+Each transition is its own guarded `UPDATE ... WHERE status = '<expected
+prior status>'`; a zero-row update (the run was not in the expected
+prior status) raises `errors.OperationalStateError` rather than being
+treated as success -- this is what makes a retried `run_id` idempotent
+(`create_ingestion_run`'s `ON CONFLICT (run_id) DO UPDATE`) without ever
+letting an already-`committed` run be silently reset or reprocessed (see
+"Run lifecycle and transaction boundaries" below). `started_at`/
+`published_at`/`load_started_at`/`committed_at`/`failed_at`/`finished_at`
+are each set only by the transition that reaches that status.
+`extracted_count`/`accepted_count`/`rejected_count`/`inserted_count`/
+`duplicate_count`/`page_count` are all `CHECK`-constrained non-negative
+when populated. `failure_category`/`failure_message` are sanitized (see
+`logging_utils.sanitize_error`, and `errors.ConnectorError.category` for
+every exception category that can land here). Indexed by
+`(vendor, endpoint, load_date DESC)` for endpoint history and by
+`(status, started_at DESC)` for status-monitoring/investigation queries
+(see "Operator queries" in `docs/RUNBOOK.md`).
+
+### ingestion_page
+
+One row per page of an ingestion_run, `UNIQUE (run_id, page_number)` (one
+page_number per run) and separately `UNIQUE (object_key)` (every
+published page object, across every run, is globally unique -- the
+immutable-object-key rule). `page_number` is `CHECK`-constrained to
+`BETWEEN 1 AND 999999`; `compressed_size_bytes`/`source_record_count`/
+`accepted_count`/`rejected_count` are non-negative when populated;
+`checksum` is `CHECK`-constrained to a 64-character lowercase hex string
+(this repository's SHA-256 convention, added by migration 008).
+`status` is a documented, `CHECK`-constrained vocabulary (`pending`,
+`verified`, `loaded`, `failed`). An idempotent retry
+(`state.insert_ingestion_page`'s `ON CONFLICT (run_id, page_number) DO
+UPDATE ... WHERE`) may only update the MUTABLE verification/load-result
+columns (`accepted_count`, `rejected_count`, `verified_at`, `status`) --
+the `WHERE` clause on the conflict target requires the existing row's
+`object_key`/`checksum`/`source_record_count` to already match what the
+retry is asserting; if they disagree, the conflicting row is excluded
+from the update (`RETURNING` yields nothing for it) and
+`errors.OperationalStateError` is raised -- conflicting metadata for an
+existing run/page fails loudly, it is never silently resolved either
+way. Indexed by `run_id` (page-level detail for one known run) and by
+`(status, run_id)` (added by migration 008, for "every page currently in
+a given status across every run" investigation queries).
+
+### ingestion_cursor
+
+The sole authoritative cursor source for the object-storage-backed
+workflow (never `source_watermarks`, which remains the legacy paginated
+workflow's own watermark table -- the two are never allowed to both back
+the same running workflow). Primary key `(vendor, endpoint)`. Records
+`committed_cursor`, `successful_run_id` (a foreign key to
+`ingestion_run`), `committed_at`, and `lock_version` (optimistic-
+concurrency metadata, `bigint NOT NULL DEFAULT 0`). See "Cursor
+concurrency and backward-movement protection" below for the full
+locking/validation contract.
+
+### rejected_record
+
+One row per rejected source record, `UNIQUE (run_id, page_number,
+record_position)` so a retried load never duplicates a rejection.
+References `ingestion_run`. Records a stable `reason_code`
+(`CHECK`-constrained, by migration 008, to
+`endpoint_contract.RejectReason`'s exact five values: `not_an_object`,
+`unsupported_endpoint`, `missing_source_id`, `missing_source_timestamp`,
+`invalid_source_timestamp`) and a sanitized, bounded `detail`
+(`CHECK`-constrained to <= 500 characters by migration 008 -- see
+`endpoint_contract.Rejected`'s own docstring: never the raw field value
+itself, only a description of the defect's *shape*). Records
+`source_record_id`/`payload_hash` when safely available, and a durable
+`raw_object_key` pointer back to the immutable page object in object
+storage -- **this table never stores a copy of the rejected record's own
+raw payload**; replay/investigation of the actual content always goes
+through that pointer into immutable object storage, never through this
+table. See "Rejected-record security and access" below for the full
+access-control contract.
+
+### schema_observation
+
+Deterministic, PHI-free schema-drift observation: one row per distinct
+`(vendor, endpoint, field_path, observed_type)` combination ever seen --
+never one row per run/page. Stores the `field_path`/`observed_type`
+themselves (never a field *value*) plus a deterministic SHA-256
+`fingerprint` computed over sorted, canonicalized path/type pairs (see
+`schema_observation.fingerprint`), so the same logical shape always
+produces the same fingerprint regardless of record/observation order.
+Tracks `first_observed_run_id`/`first_observed_page_number`/
+`first_observed_at` (set once, on first insert, never overwritten) and
+`last_observed_run_id`/`last_observed_page_number`/`last_observed_at`
+(updated on every observing call). `occurrence_count` counts distinct
+**occurrences** (distinct `(run_id, page_number)` pairs that have ever
+observed this combination), never distinct *calls*: the upsert's
+`occurrence_count` increment is conditional on this call's
+`(run_id, page_number)` differing from what is already recorded as the
+row's last-observed occurrence (`state.upsert_schema_observations`'s
+`CASE ... IS DISTINCT FROM ...` -- the row's own already-persisted
+`last_observed_run_id`/`last_observed_page_number` serve as the durable
+occurrence identity; no additional column is needed). Replaying the same
+run/page (a retried `load --run-id X`, or a run reprocessed after a
+rollback) therefore never inflates `occurrence_count` -- see
+`tests/integration/test_object_storage_pipeline_integration.py` for the
+real-database proof. Indexed by `(vendor, endpoint, fingerprint)` and by
+`(vendor, endpoint, last_observed_at DESC)` for drift-review queries.
+
+## Run lifecycle and transaction boundaries
+
+```
+running --publish--> published --load-start--> loading --commit--> committed
+   |                     |                         |
+   +---------------------+----- fail (any) --------+---------------> failed
+```
+
+`running` and `published` are set (auto-committing, each its own small
+transaction) entirely BEFORE any PostgreSQL load transaction opens: a
+run is marked `published` only once every page object, the run
+manifest, and the success marker are durable in object storage (see
+`object_storage/publish.py` -- write-then-verify, immutable-once-written).
+`loading` is set (also auto-committing) immediately before the ONE
+atomic load transaction begins. Everything from that point --
+`object_storage.verify.load_and_verify_manifest` re-verifying every page,
+the per-page `COPY`-to-temp-then-merge into the raw table, rejected-
+record inserts, schema-observation upserts, the `ingestion_page` upsert,
+the cursor lock/validate/advance, and the final `committed` status write
+-- happens inside that single transaction (`object_raw_loader.load_verified_run`,
+called by `cli._run_object_load`), committed exactly once by the caller
+after `load_verified_run` returns successfully, or rolled back entirely
+by the caller on any exception, followed by a SEPARATE, freshly-committed
+`state.mark_run_failed` write (never called from inside the transaction
+it is reporting the failure of). No function that participates in that
+atomic transaction (`mark_run_committed`, `insert_ingestion_page`,
+`insert_rejected_records`, `upsert_schema_observations`,
+`lock_cursor_for_update`, `commit_cursor`) ever calls `conn.commit()` or
+`conn.rollback()` itself -- transaction-boundary ownership belongs
+entirely to `cli._run_object_load`.
+
+A zero-row lifecycle-transition update is never treated as success:
+`mark_run_published`/`mark_run_load_started` roll back their own
+single-statement transaction and raise `errors.OperationalStateError`;
+`mark_run_committed` raises the same error without committing or rolling
+back (the caller's rollback covers it). This is also what keeps a
+`committed` run from ever being reset: a second `load --run-id X` for an
+already-committed run fails at `mark_run_load_started` (the run is not
+currently `published`), before any raw data, page, or cursor state is
+touched. `mark_run_failed` is the one exception -- a zero-row update
+there is a documented, intentional no-op (calling it for an
+already-terminal run, e.g. one that raced to `committed` in another
+process, must never overwrite that success).
+
+## Cursor concurrency and backward-movement protection
+
+`state.lock_cursor_for_update` creates the `(vendor, endpoint)` cursor
+row at `(NULL, 0)` if it does not exist yet, then `SELECT ... FOR UPDATE`
+it -- every load for a given `(vendor, endpoint)` serializes on this one
+row regardless of whether it is that endpoint's first-ever load. A
+concurrent second run for the same `(vendor, endpoint)` blocks on this
+`SELECT` until the first run's transaction commits or rolls back, so two
+concurrent runs can never silently overwrite one another's cursor
+advance; runs for different `(vendor, endpoint)` pairs proceed fully
+independently (no shared lock). The caller then compares the locked,
+currently-committed cursor against its own `candidate_cursor`: a
+candidate that would move the cursor backward raises `errors.CursorError`
+immediately, before any commit. `state.commit_cursor` advances the
+cursor via `UPDATE ... WHERE vendor = ... AND endpoint = ... AND
+lock_version = <the version this transaction locked>`, incrementing
+`lock_version`; because the row is held `FOR UPDATE` for the whole
+transaction, a `lock_version` mismatch there can only mean a caller bug,
+never a legitimate race -- it still raises `errors.CursorError` rather
+than assuming success. A rolled-back transaction leaves the prior
+cursor completely unchanged (ordinary PostgreSQL transaction semantics --
+nothing in this cursor path ever writes outside the one transaction).
+
+## Rejected-record security and access
+
+`rejected_record` is treated as PHI-adjacent and access-restricted, more
+so than the raw schema: `PUBLIC` has no access at all (explicit
+`REVOKE`, defense in depth). `TRANSFORM_ROLE` (dbt) is never granted any
+access, and `models/sources.yml` has no entry for it -- **dbt cannot
+read `rejected_record`, in any configuration this repository ships**.
+`INGEST_ROLE` (this connector) is granted **`INSERT` only** (migration
+008 revokes the broader `SELECT`/`INSERT`/`UPDATE` migration 007
+originally granted, matching `quarantined_records`' already-established
+least-privilege pattern) -- `state.insert_rejected_records` only ever
+`INSERT`s; reconciliation counts come from the `INSERT`'s own
+affected-row count within the same transaction, never a `SELECT` against
+this table. **No operational "rejected-record reviewer" role exists in
+this repository's role model** -- an operator must explicitly
+`CREATE ROLE`, then `GRANT SELECT ON <OPS_SCHEMA>.rejected_record TO
+<that role>`, scoped to a specific person/process, before anyone can
+read this table; this repository deliberately does not grant broad read
+access by default. Replay of a rejected record's actual content always
+goes through `raw_object_key` into the immutable, durable object-storage
+page it came from -- this table itself never stores a copy of the raw
+payload.
+
 
 ## Readiness
 
@@ -249,4 +491,4 @@ This repository has no `CODEOWNERS` file or other documented team-ownership conv
 
 ## Last verified
 
-2026-08-16, against the state of this repository after adding the shared bounded-retry policy, OAuth client-credentials support, structural record quarantine, and hardened pagination safety limits (`src/tuva_ingest/{retry,oauth,validators,quarantine}.py`, `migrations/006_record_quarantine.sql`) on top of the paginated extraction/secret-manager/watermark mechanism (`src/tuva_ingest/{secrets,pagination,paginated_loader}.py`, `migrations/005_paginated_extraction_state.sql`). Re-verify this document (and update this date) whenever `src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state,secrets,pagination,paginated_loader,retry,oauth,validators,quarantine}.py`, `docs/API_MANIFEST.md`, or the connected upstream source changes.
+2026-08-27, against the state of this repository after completing the canonical operational-table contract for the object-storage-backed workflow: fixing the duplicate migration version 006 (renumbering `006_object_storage_raw_contract.sql` to 007), adding `migrations/008_operational_table_hardening.sql` (checksum-format validation, an enumerated/bounded `rejected_record.reason_code`/`detail`, least-privilege `INGEST_ROLE` grants on `rejected_record`, and a cross-run page-status index), correcting `state.upsert_schema_observations` so a replayed run/page no longer inflates `occurrence_count`, adding rowcount verification to every `ingestion_run` lifecycle transition and a fail-loudly guard on conflicting `ingestion_page` metadata (both via the new `errors.OperationalStateError`), and adding the seven exception classes (`CursorError`, `RawContractError`, `ObjectKeyError`, `ObjectStorageError`, `ImmutableObjectError`, `ObjectVerificationError`, `RunNotPublishedError`) and nine `IngestConfig` env-var aliases (`STAGING_SCHEMA`, `ANALYTICS_CORE_SCHEMA`, `ANALYTICS_MARTS_SCHEMA`, and the six `OBJECT_STORAGE_*` variables) that were referenced by `object_storage/`/`state.py`/`config.py` but missing from `errors.py`/`config.py`, which had left the entire object-storage-backed workflow unimportable outside a dependency-free sandbox -- see `migrations/008_operational_table_hardening.sql` and `src/tuva_ingest/{errors,config,state,cli}.py` for the exact changes. On top of the shared bounded-retry policy, OAuth client-credentials support, structural record quarantine, and hardened pagination safety limits (`src/tuva_ingest/{retry,oauth,validators,quarantine}.py`, `migrations/006_record_quarantine.sql`) on top of the paginated extraction/secret-manager/watermark mechanism (`src/tuva_ingest/{secrets,pagination,paginated_loader}.py`, `migrations/005_paginated_extraction_state.sql`). Re-verify this document (and update this date) whenever `src/tuva_ingest/{config,api_client,manifest,extract,raw_loader,state,secrets,pagination,paginated_loader,retry,oauth,validators,quarantine,errors,object_raw_loader,schema_observation}.py`, `docs/API_MANIFEST.md`, or the connected upstream source changes.

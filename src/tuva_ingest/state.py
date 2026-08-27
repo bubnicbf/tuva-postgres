@@ -348,7 +348,7 @@ def commit_watermark(conn, ops_schema, source, endpoint, *, high_water_mark, suc
         )
 
 
-# --- canonical object-storage-backed operational model (migrations/006) ---
+# --- canonical object-storage-backed operational model (migrations/007-008) ---
 #
 # Everything below writes to the five NEW singular tables
 # (ingestion_run, ingestion_page, ingestion_cursor, rejected_record,
@@ -420,7 +420,12 @@ def mark_run_published(conn, ops_schema, run_id, *, candidate_cursor, page_count
     """Transition a `running` run to `published` -- called once every
     page and the manifest and the success marker are durable in object
     storage (see object_storage/publish.py), still before any PostgreSQL
-    load transaction begins. Auto-commits immediately."""
+    load transaction begins. Auto-commits immediately on success.
+
+    Raises `errors.OperationalStateError` -- rolling back this function's
+    own single-statement transaction first, so the connection is left
+    usable -- if the run was not currently `running` (a zero-row update
+    is never treated as success; see that error's own docstring)."""
     relation = _relation(ops_schema, _INGESTION_RUN)
     with conn.cursor() as cur:
         cur.execute(
@@ -430,14 +435,32 @@ def mark_run_published(conn, ops_schema, run_id, *, candidate_cursor, page_count
             "WHERE run_id = %s AND status = 'running'",
             (datetime.now(timezone.utc), candidate_cursor, page_count, extracted_count, run_id),
         )
+        if cur.rowcount != 1:
+            from .errors import OperationalStateError
+
+            conn.rollback()
+            raise OperationalStateError(
+                f"failed to transition ingestion_run {run_id!r} to 'published': expected it to currently be "
+                "'running' (0 rows updated) -- either run_id does not exist, or the run has already left "
+                "'running' via a concurrent or prior attempt"
+            )
     conn.commit()
 
 
 def mark_run_load_started(conn, ops_schema, run_id) -> None:
     """Transition a `published` run to `loading`, immediately before the
-    one atomic load transaction opens. Auto-commits immediately -- a
-    crash during loading still leaves 'loading' (not 'published')
-    visible to operators."""
+    one atomic load transaction opens. Auto-commits immediately on
+    success -- a crash during loading still leaves 'loading' (not
+    'published') visible to operators.
+
+    Raises `errors.OperationalStateError` -- rolling back this function's
+    own single-statement transaction first -- if the run was not
+    currently `published` (e.g. `load --run-id X` was invoked for a run
+    still `running`, already `loading` in a concurrent attempt, or
+    already terminal). This is the guard that keeps a `committed` run
+    from ever silently being reprocessed: reloading an already-committed
+    run raises here, before any raw data or cursor state is touched,
+    rather than re-running the whole load transaction unnecessarily."""
     relation = _relation(ops_schema, _INGESTION_RUN)
     with conn.cursor() as cur:
         cur.execute(
@@ -445,6 +468,15 @@ def mark_run_load_started(conn, ops_schema, run_id) -> None:
             "WHERE run_id = %s AND status = 'published'",
             (datetime.now(timezone.utc), run_id),
         )
+        if cur.rowcount != 1:
+            from .errors import OperationalStateError
+
+            conn.rollback()
+            raise OperationalStateError(
+                f"failed to transition ingestion_run {run_id!r} to 'loading': expected it to currently be "
+                "'published' (0 rows updated) -- either run_id does not exist, or the run is not currently "
+                "in a loadable state (running/loading/committed/failed)"
+            )
     conn.commit()
 
 
@@ -469,9 +501,21 @@ def mark_run_failed(conn, ops_schema, run_id, *, failure_category, failure_messa
 def mark_run_committed(
     conn, ops_schema, run_id, *, accepted_count, rejected_count, inserted_count, duplicate_count,
 ) -> None:
-    """Transition a `loading` run to `committed`. NEVER commits (see
-    module section docstring) -- must be the last operational write
-    before the caller's own `conn.commit()`, alongside `commit_cursor`."""
+    """Transition a `loading` run to `committed`. NEVER commits OR rolls
+    back (see module section docstring) -- must be the last operational
+    write before the caller's own `conn.commit()`, alongside
+    `commit_cursor`; transaction-boundary ownership belongs entirely to
+    the caller (`object_raw_loader.load_verified_run`'s caller,
+    `cli._run_object_load`), which rolls back the whole transaction on
+    any exception raised here.
+
+    Raises `errors.OperationalStateError` if the run was not currently
+    `loading` (0 rows updated) -- a zero-row update here must never be
+    treated as success: it would otherwise mean `conn.commit()` makes
+    the raw merge and cursor advance durable while `ingestion_run.status`
+    itself silently never reached 'committed', which is exactly the
+    "committed run reset or overwritten accidentally" failure mode this
+    function must prevent (see docs/RUNBOOK.md "Recovery")."""
     relation = _relation(ops_schema, _INGESTION_RUN)
     with conn.cursor() as cur:
         cur.execute(
@@ -484,6 +528,14 @@ def mark_run_committed(
                 inserted_count, duplicate_count, run_id,
             ),
         )
+        if cur.rowcount != 1:
+            from .errors import OperationalStateError
+
+            raise OperationalStateError(
+                f"failed to transition ingestion_run {run_id!r} to 'committed': expected it to currently be "
+                "'loading' (0 rows updated) -- refusing to commit the transaction with an inconsistent "
+                "ingestion_run status; the caller must roll back"
+            )
 
 
 def insert_ingestion_page(
@@ -494,7 +546,20 @@ def insert_ingestion_page(
     """Upsert one page's audit row. NEVER commits. `ON CONFLICT (run_id,
     page_number)` makes retrying the same run's load safe -- a repeated
     load of the same page re-affirms the identical, immutable
-    object_key/checksum rather than erroring or duplicating."""
+    object_key/checksum rather than erroring or duplicating.
+
+    An idempotent retry may only update the MUTABLE verification/load-
+    result columns (`accepted_count`, `rejected_count`, `verified_at`,
+    `status`) -- the `DO UPDATE ... WHERE` clause below only applies when
+    the existing row's immutable identity (`object_key`, `checksum`,
+    `source_record_count`) already matches what this call is asserting.
+    If a row already exists for `(run_id, page_number)` with DIFFERENT
+    immutable identity, the `WHERE` clause excludes it from the update,
+    `RETURNING` yields no row, and this function raises
+    `errors.OperationalStateError` rather than silently keeping
+    whichever value was already on file -- conflicting metadata for an
+    existing run/page must fail loudly, never be silently resolved
+    either way."""
     relation = _relation(ops_schema, _INGESTION_PAGE)
     with conn.cursor() as cur:
         cur.execute(
@@ -505,13 +570,27 @@ def insert_ingestion_page(
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (run_id, page_number) DO UPDATE SET "
             "accepted_count = EXCLUDED.accepted_count, rejected_count = EXCLUDED.rejected_count, "
-            "verified_at = EXCLUDED.verified_at, status = EXCLUDED.status",
+            "verified_at = EXCLUDED.verified_at, status = EXCLUDED.status "
+            f"WHERE {relation}.object_key = EXCLUDED.object_key "
+            f"AND {relation}.checksum = EXCLUDED.checksum "
+            f"AND {relation}.source_record_count = EXCLUDED.source_record_count "
+            "RETURNING 1",
             (
                 run_id, page_number, object_key, checksum, compressed_size_bytes, source_record_count,
                 accepted_count, rejected_count, request_cursor, response_cursor, next_page_cursor,
                 retrieved_at, datetime.now(timezone.utc), status,
             ),
         )
+        if cur.fetchone() is None:
+            from .errors import OperationalStateError
+
+            raise OperationalStateError(
+                f"conflicting ingestion_page metadata for (run_id={run_id!r}, page_number={page_number}): "
+                f"an existing row has a different object_key, checksum, or source_record_count than this "
+                f"call is asserting (object_key={object_key!r}, checksum={checksum!r}, "
+                f"source_record_count={source_record_count!r}) -- immutable page identity must never be "
+                "silently overwritten"
+            )
 
 
 def lock_cursor_for_update(conn, ops_schema, vendor, endpoint):
@@ -600,11 +679,23 @@ def upsert_schema_observations(
     conn, ops_schema, *, vendor, endpoint, run_id, page_number, observations: dict, fingerprint: str,
 ) -> None:
     """Idempotently upsert `{field_path: {type_names}}` observations
-    (see schema_observation.py). NEVER commits. Each (vendor, endpoint,
-    field_path, observed_type) row's occurrence_count increments and
-    last_observed_* updates on every call that observes it again; a
-    path/type never observed before is inserted fresh with
-    occurrence_count = 1."""
+    (see schema_observation.py). NEVER commits.
+
+    `occurrence_count` must count distinct (run_id, page_number)
+    OCCURRENCES of a (vendor, endpoint, field_path, observed_type)
+    combination, never distinct CALLS -- replaying the same page (a
+    retried `load --run-id X`, or a run reprocessed after a rollback)
+    must not inflate it. The durable occurrence identity that
+    distinguishes a genuinely new observation from a replay is exactly
+    the row's own `last_observed_run_id`/`last_observed_page_number`
+    (already persisted from the previous call that touched this row) --
+    no new column is needed: the `CASE` below only increments when this
+    call's `(run_id, page_number)` differs from what is already on file
+    as the row's last-observed occurrence (`IS DISTINCT FROM` so a NULL
+    `last_observed_page_number` -- not expected in practice, since every
+    caller always supplies a page_number, but handled defensively --
+    compares correctly). A path/type never observed before is inserted
+    fresh with occurrence_count = 1, unaffected by this logic."""
     if not observations:
         return
     relation = _relation(ops_schema, _SCHEMA_OBSERVATION)
@@ -625,7 +716,12 @@ def upsert_schema_observations(
             "fingerprint = EXCLUDED.fingerprint, last_observed_run_id = EXCLUDED.last_observed_run_id, "
             "last_observed_page_number = EXCLUDED.last_observed_page_number, "
             "last_observed_at = EXCLUDED.last_observed_at, "
-            "occurrence_count = so.occurrence_count + 1",
+            "occurrence_count = CASE "
+            "WHEN so.last_observed_run_id IS DISTINCT FROM EXCLUDED.last_observed_run_id "
+            "OR so.last_observed_page_number IS DISTINCT FROM EXCLUDED.last_observed_page_number "
+            "THEN so.occurrence_count + 1 "
+            "ELSE so.occurrence_count "
+            "END",
             rows,
         )
 

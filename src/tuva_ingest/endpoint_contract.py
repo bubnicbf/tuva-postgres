@@ -1,6 +1,6 @@
 """The centralized, authoritative contract for deriving every raw-table
 metadata column from one source record (see docs/SOURCE_CONTRACT.md
-"Raw metadata definitions" and migrations/006_object_storage_raw_contract.sql
+"Raw metadata definitions" and migrations/007_object_storage_raw_contract.sql
 for the physical columns this feeds).
 
 This is the single place `object_raw_loader.py` (and any future caller)
@@ -49,7 +49,7 @@ from .errors import RawContractError
 
 class RejectReason(str, Enum):
     """Stable, machine-readable reason codes for `rejected_record.reason_code`
-    (see migrations/006_object_storage_raw_contract.sql). Never change the
+    (see migrations/007_object_storage_raw_contract.sql). Never change the
     string value of an existing member -- these are persisted data, not
     just in-process constants."""
 

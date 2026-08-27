@@ -23,7 +23,7 @@ contract, rejection handling, schema observations, and cursor safety):
   4-6. Accepted rows for each page are `COPY`'d into a transaction-local
      TEMP TABLE, then merged into the permanent raw table via
      `INSERT ... SELECT ... ON CONFLICT (...) DO NOTHING` against the
-     source-stable partial unique index (migrations/006).
+     source-stable partial unique index (migrations/007).
   7-9. Per-page and run-level counts are accumulated and reconciled:
      `source records == accepted + rejected` and
      `accepted == inserted + exact duplicates` (see `_reconcile`).

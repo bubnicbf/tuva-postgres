@@ -51,6 +51,21 @@ _ENV_KEYS = [
     "TUVA_OAUTH_CLIENT_SECRET",
     "TUVA_OAUTH_SCOPES",
     "TUVA_OAUTH_REFRESH_SKEW_SECONDS",
+    # Six-schema lineage + object-storage config keys (see
+    # tuva_ingest.config.IngestConfig._ENV_ALIASES) -- these MUST be
+    # kept in this list too, not just in _ENV_ALIASES, or a test that
+    # sets one of them (e.g. an invalid-value rejection test) leaks it
+    # into every later test in the whole pytest process: this class's
+    # setUp()/_restore() only saves and restores keys listed here.
+    "STAGING_SCHEMA",
+    "ANALYTICS_CORE_SCHEMA",
+    "ANALYTICS_MARTS_SCHEMA",
+    "OBJECT_STORAGE_PROVIDER",
+    "OBJECT_STORAGE_BUCKET",
+    "OBJECT_STORAGE_PREFIX",
+    "OBJECT_STORAGE_REGION",
+    "OBJECT_STORAGE_ENDPOINT_URL",
+    "OBJECT_STORAGE_LOCAL_ROOT",
 ]
 
 

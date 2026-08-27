@@ -23,9 +23,18 @@ class TestDiscoverRealMigrations(unittest.TestCase):
     directory -- proves the three shipped files are well-formed, unique,
     and discoverable, not just that discover() works in the abstract."""
 
-    def test_discovers_six_migrations_in_order(self):
+    def test_discovers_eight_migrations_in_order(self):
+        # migrations/006_object_storage_raw_contract.sql was renumbered
+        # to 007 (see that file's own header note) to resolve a
+        # duplicate-version conflict with the already-established
+        # 006_record_quarantine.sql; 008_operational_table_hardening.sql
+        # is new. discover() itself is the authority here -- this test
+        # would fail loudly again if either file ever regains a
+        # conflicting version.
         found = migrations.discover(REPO_ROOT / "migrations")
-        self.assertEqual([m.version for m in found], ["001", "002", "003", "004", "005", "006"])
+        self.assertEqual(
+            [m.version for m in found], ["001", "002", "003", "004", "005", "006", "007", "008"]
+        )
         self.assertEqual(
             [m.filename for m in found],
             [
@@ -35,20 +44,22 @@ class TestDiscoverRealMigrations(unittest.TestCase):
                 "004_endpoint_scoped_ingestion.sql",
                 "005_paginated_extraction_state.sql",
                 "006_record_quarantine.sql",
+                "007_object_storage_raw_contract.sql",
+                "008_operational_table_hardening.sql",
             ],
         )
 
-    def test_migration_006_mentions_every_new_canonical_table(self):
-        # A structural (not checksum-weakening) proof that 006 actually
+    def test_migration_007_mentions_every_new_canonical_table(self):
+        # A structural (not checksum-weakening) proof that 007 actually
         # defines every required new operational/raw object -- catches an
         # accidental partial migration without needing a live database.
-        sql_text = (REPO_ROOT / "migrations" / "006_object_storage_raw_contract.sql").read_text(encoding="utf-8")
+        sql_text = (REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql").read_text(encoding="utf-8")
         for expected in (
             "ingestion_run", "ingestion_page", "ingestion_cursor", "rejected_record", "schema_observation",
             "_ingestion_run_id", "_ingested_at", "_source_endpoint", "_source_record_id",
             "_source_updated_at", "_payload_hash", "_raw_payload",
         ):
-            self.assertIn(expected, sql_text, f"migration 006 does not mention {expected!r}")
+            self.assertIn(expected, sql_text, f"migration 007 does not mention {expected!r}")
 
     def test_checksums_are_stable_across_repeated_discovery(self):
         first = migrations.discover(REPO_ROOT / "migrations")
@@ -338,6 +349,188 @@ class TestMigration006RecordQuarantine(unittest.TestCase):
             path = REPO_ROOT / "migrations" / filename
             self.assertTrue(path.is_file(), f"migration {filename} must still exist unmodified")
 
+
+
+class TestMigration007ObjectStorageRawContract(unittest.TestCase):
+    """migrations/007_object_storage_raw_contract.sql (renumbered from
+    006 -- see that file's own header note, and
+    test_discovers_eight_migrations_in_order above) creates the five
+    canonical object-storage-backed operational tables plus the seven
+    new raw-metadata columns state.py/object_raw_loader.py depend on --
+    a lightweight structural check against the real shipped file,
+    without requiring a live PostgreSQL connection. Runtime behavior
+    (grants actually taking effect, constraints actually rejecting bad
+    data) is covered by tests/integration/test_object_storage_pipeline_integration.py
+    against a disposable database."""
+
+    def test_file_is_discovered_with_a_stable_checksum(self):
+        found = migrations.discover(REPO_ROOT / "migrations")
+        migration_007 = next(m for m in found if m.version == "007")
+        self.assertEqual(migration_007.filename, "007_object_storage_raw_contract.sql")
+        self.assertEqual(migration_007.checksum, migrations.compute_checksum(migration_007.path))
+
+    def test_creates_all_five_canonical_tables_in_the_configured_ops_schema(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        for table in ("ingestion_run", "ingestion_page", "ingestion_cursor", "rejected_record", "schema_observation"):
+            self.assertIn(f':"ops_schema".{table}', sql, f"{table} must be created in the configured ops_schema, never a hard-coded schema")
+        # Never a hard-coded schema literal such as "ops"."ingestion_run".
+        self.assertNotIn('"ops".ingestion_run', sql)
+        self.assertNotIn('"ops".ingestion_page', sql)
+
+    def test_ingestion_run_has_required_lifecycle_columns_and_status_check(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        for column in (
+            "run_id", "vendor", "endpoint", "load_date", "storage_run_prefix", "requested_cursor",
+            "candidate_cursor", "status", "started_at", "published_at", "load_started_at", "committed_at",
+            "failed_at", "finished_at", "extracted_count", "accepted_count", "rejected_count",
+            "inserted_count", "duplicate_count", "page_count", "failure_category", "failure_message",
+            "app_version", "environment",
+        ):
+            self.assertIn(column, sql)
+        self.assertIn("CHECK (status IN ('running', 'published', 'loading', 'committed', 'failed'))", sql)
+
+    def test_run_level_counts_are_nonnegative(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        for column in ("extracted_count", "accepted_count", "rejected_count", "inserted_count", "duplicate_count"):
+            pattern = rf"{column}\s+bigint CHECK \({column} IS NULL OR {column} >= 0\)"
+            self.assertRegex(sql, pattern)
+        self.assertRegex(sql, r"page_count\s+integer CHECK \(page_count IS NULL OR page_count >= 0\)")
+
+    def test_ingestion_page_enforces_one_page_number_per_run_and_unique_object_key(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("UNIQUE (run_id, page_number)", sql)
+        self.assertIn("UNIQUE (object_key)", sql)
+        self.assertRegex(sql, r"page_number\s+integer NOT NULL CHECK \(page_number BETWEEN 1 AND 999999\)")
+        self.assertIn('REFERENCES :"ops_schema".ingestion_run (run_id)', sql)
+
+    def test_ingestion_cursor_uses_vendor_endpoint_primary_key_and_lock_version(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("PRIMARY KEY (vendor, endpoint)", sql)
+        self.assertRegex(sql, r"lock_version\s+bigint NOT NULL DEFAULT 0")
+        self.assertRegex(sql, r"successful_run_id\s+uuid REFERENCES")
+
+    def test_rejected_record_enforces_idempotent_uniqueness_and_never_duplicates_raw_payload(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("UNIQUE (run_id, page_number, record_position)", sql)
+        self.assertIn("raw_object_key        text NOT NULL", sql)
+        # Isolate just this table's own column block and confirm it never
+        # carries a full raw-payload-shaped column (only a durable
+        # pointer, raw_object_key, back to immutable object storage).
+        table_start = sql.index('CREATE TABLE IF NOT EXISTS :"ops_schema".rejected_record')
+        table_end = sql.index("CREATE INDEX", table_start)
+        rejected_record_block = sql[table_start:table_end]
+        self.assertNotIn("raw_payload", rejected_record_block)
+
+    def test_rejected_record_public_and_transform_role_are_revoked(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn('REVOKE ALL ON :"ops_schema".rejected_record FROM PUBLIC;', sql)
+        self.assertIn(':"ops_schema".rejected_record', sql.split('FROM :"transform_role"')[0][-400:])
+
+    def test_schema_observation_enforces_deterministic_uniqueness_grain(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("UNIQUE (vendor, endpoint, field_path, observed_type)", sql)
+        self.assertIn("occurrence_count          bigint NOT NULL DEFAULT 1 CHECK (occurrence_count >= 1)", sql)
+
+    def test_never_creates_a_tuva_managed_schema(self):
+        path = REPO_ROOT / "migrations" / "007_object_storage_raw_contract.sql"
+        sql = path.read_text(encoding="utf-8")
+        for tuva_schema_var in ("staging_schema", "input_layer_schema", "analytics_core_schema", "analytics_marts_schema"):
+            self.assertNotIn(tuva_schema_var, sql)
+
+    def test_is_forward_only_never_rewrites_prior_migrations(self):
+        for filename in (
+            "001_operational_schemas.sql",
+            "002_ingestion_control.sql",
+            "003_roles_and_grants.sql",
+            "004_endpoint_scoped_ingestion.sql",
+            "005_paginated_extraction_state.sql",
+            "006_record_quarantine.sql",
+        ):
+            path = REPO_ROOT / "migrations" / filename
+            self.assertTrue(path.is_file(), f"migration {filename} must still exist unmodified")
+
+
+class TestMigration008OperationalTableHardening(unittest.TestCase):
+    """migrations/008_operational_table_hardening.sql closes the gaps
+    identified auditing migrations/007_object_storage_raw_contract.sql
+    against the required canonical-table contract: checksum format
+    validation, a bounded/enumerated rejected_record.reason_code and
+    detail, least-privilege ingest_role grants on rejected_record, and
+    an index supporting cross-run page-status investigation."""
+
+    def test_file_is_discovered_with_a_stable_checksum(self):
+        found = migrations.discover(REPO_ROOT / "migrations")
+        migration_008 = next(m for m in found if m.version == "008")
+        self.assertEqual(migration_008.filename, "008_operational_table_hardening.sql")
+        self.assertEqual(migration_008.checksum, migrations.compute_checksum(migration_008.path))
+
+    def test_validates_checksum_is_sha256_hex(self):
+        path = REPO_ROOT / "migrations" / "008_operational_table_hardening.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("ingestion_page_checksum_format_check", sql)
+        self.assertIn("checksum ~ ''^[0-9a-f]{64}$''", sql)
+
+    def test_reason_code_is_constrained_to_the_rejectreason_allowlist(self):
+        path = REPO_ROOT / "migrations" / "008_operational_table_hardening.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("rejected_record_reason_code_check", sql)
+        for reason_code in (
+            "not_an_object", "unsupported_endpoint", "missing_source_id",
+            "missing_source_timestamp", "invalid_source_timestamp",
+        ):
+            self.assertIn(reason_code, sql)
+
+    def test_detail_length_is_bounded(self):
+        path = REPO_ROOT / "migrations" / "008_operational_table_hardening.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("rejected_record_detail_length_check", sql)
+        self.assertIn("char_length(detail) <= 500", sql)
+
+    def test_revokes_before_granting_insert_only_to_ingest_role(self):
+        path = REPO_ROOT / "migrations" / "008_operational_table_hardening.sql"
+        sql = path.read_text(encoding="utf-8")
+        revoke_idx = sql.index('REVOKE ALL ON :"ops_schema".rejected_record FROM :"ingest_role";')
+        grant_idx = sql.index('GRANT INSERT ON :"ops_schema".rejected_record TO :"ingest_role";')
+        self.assertLess(revoke_idx, grant_idx)
+        self.assertNotIn('GRANT SELECT ON :"ops_schema".rejected_record', sql)
+        self.assertNotIn('GRANT UPDATE ON :"ops_schema".rejected_record', sql)
+
+    def test_adds_status_index_for_cross_run_investigation(self):
+        path = REPO_ROOT / "migrations" / "008_operational_table_hardening.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertIn("ingestion_page_status_idx", sql)
+        self.assertIn("(status, run_id)", sql)
+
+    def test_uses_do_blocks_for_idempotent_check_constraints(self):
+        # PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS -- constraints
+        # must be guarded by an existence check, the same DO-block
+        # pattern migrations/003_roles_and_grants.sql already uses for
+        # idempotent role creation.
+        path = REPO_ROOT / "migrations" / "008_operational_table_hardening.sql"
+        sql = path.read_text(encoding="utf-8")
+        self.assertGreaterEqual(sql.count("DO $do$"), 3)
+        self.assertIn("pg_constraint", sql)
+
+    def test_is_forward_only_never_rewrites_prior_migrations(self):
+        for filename in (
+            "001_operational_schemas.sql",
+            "002_ingestion_control.sql",
+            "003_roles_and_grants.sql",
+            "004_endpoint_scoped_ingestion.sql",
+            "005_paginated_extraction_state.sql",
+            "006_record_quarantine.sql",
+            "007_object_storage_raw_contract.sql",
+        ):
+            path = REPO_ROOT / "migrations" / filename
+            self.assertTrue(path.is_file(), f"migration {filename} must still exist unmodified")
 
 if __name__ == "__main__":
     unittest.main()

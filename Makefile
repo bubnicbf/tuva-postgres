@@ -30,7 +30,7 @@ init:
 deps:
 	uv sync --locked
 
-# Applies pending migrations/001-006 (see src/tuva_ingest/migrations.py).
+# Applies pending migrations/001-008 (see src/tuva_ingest/migrations.py).
 # Never creates or touches any Tuva-managed core/terminology/output
 # schema -- only the configured raw and operational-control schemas.
 # Idempotent and safe to rerun.

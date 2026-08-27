@@ -134,3 +134,126 @@ class QuarantineError(ConnectorError):
     committed."""
 
     category = "quarantine"
+
+
+class RawContractError(ConnectorError):
+    """Raised by `endpoint_contract.py` for a violation of the per-endpoint
+    raw-record identity contract that is a caller/configuration bug, not a
+    per-record data-quality problem (compare `Rejected`, which represents an
+    individual record's own defect and never raises): today, only "no
+    source-record-id contract registered for this endpoint" -- reaching
+    `object_raw_loader.py`/`object_extract.py` with an endpoint that has no
+    registered `derive_source_record_id`/`derive_source_updated_at` mapping
+    means an endpoint was wired into the object-storage-backed workflow
+    without its identity contract ever being defined."""
+
+    category = "raw_contract"
+
+
+class ObjectKeyError(ConnectorError):
+    """Raised by `object_storage/keys.py` for a malformed object-storage key
+    component: an unsafe/invalid storage prefix, a `run_id` that is not a
+    valid UUID, a `load_date` that was not derived from a timezone-aware
+    datetime, or a `page_number` outside the valid 1-999999 range. Always a
+    caller/programming-contract violation caught before any object-storage
+    I/O is attempted."""
+
+    category = "object_key"
+
+
+class ObjectStorageError(ConnectorError):
+    """Raised by an `object_storage/` backend (`local.py`/`s3.py`) for an
+    I/O-level failure: an unsafe relative path outside the configured root,
+    or an underlying S3 API failure (`put_object`/`get_object`/
+    `head_object`). Never includes credentials in its message."""
+
+    category = "object_storage"
+
+
+class ImmutableObjectError(ConnectorError):
+    """Raised by `object_storage/publish.py` when a conditional
+    (create-if-absent) write to an immutable object-storage key would
+    overwrite existing content -- a page, manifest, or success-marker key is
+    only ever written once; a second, conflicting write attempt for the
+    same key is a bug (a reused `run_id`/page number, or a real concurrent
+    publisher) and must fail loudly rather than silently overwrite durable,
+    already-published data."""
+
+    category = "immutable_object"
+
+
+class ObjectVerificationError(ConnectorError):
+    """Raised by `object_storage/verify.py` when a published run's success
+    marker, manifest, or a page object fails re-verification at load time:
+    malformed JSON, a checksum/size mismatch, or any other structural
+    inconsistency between what was published and what is now being read
+    back. Always treated as a failed load -- the load transaction is never
+    started (or is rolled back) and `state.mark_run_failed` is called
+    separately (see `object_raw_loader.py`, `cli._run_object_load`)."""
+
+    category = "object_verification"
+
+
+class RunNotPublishedError(ConnectorError):
+    """Raised by `object_storage/verify.py` when a run's success marker (or
+    manifest) does not exist in object storage at all -- distinct from
+    `ObjectVerificationError` (marker/manifest exists but fails
+    verification) and from `RunNotFoundError` (no `ingestion_run` database
+    row for the given run_id). A `load --run-id X` for a run whose
+    extraction never reached "published" (crashed mid-extraction, or the
+    wrong run_id) raises this before any database transaction is opened."""
+
+    category = "object_verification"
+
+
+class CursorError(ConnectorError):
+    """Raised by `state.py`'s canonical object-storage-backed cursor
+    functions for either of two distinct cursor-safety violations, both
+    always fatal to the current load (see `object_raw_loader.py`,
+    `cli._run_object_load`): (1) a candidate cursor that would move
+    `ops.ingestion_cursor.committed_cursor` backward for a (vendor,
+    endpoint) pair (checked by the caller after `state.lock_cursor_for_update`
+    returns the currently committed value); (2) an optimistic-concurrency
+    `lock_version` mismatch on `state.commit_cursor`'s UPDATE -- which,
+    since the row is held with `SELECT ... FOR UPDATE` for the whole
+    transaction, can only happen because of a caller bug, never a
+    legitimate concurrent race. Never includes cursor values from an
+    untrusted source verbatim beyond what the source itself already
+    returned as the high-water mark."""
+
+    category = "cursor"
+
+
+class OperationalStateError(ConnectorError):
+    """Raised by `state.py`'s canonical object-storage-backed lifecycle
+    functions when a write that is supposed to represent forward progress
+    through `ops.ingestion_run.status`'s state machine (running ->
+    published -> loading -> committed) or a page's immutable identity
+    affects zero rows, or affects a row whose immutable fields disagree
+    with what the caller is asserting -- distinct from `mark_run_failed`,
+    for which a zero-row update is a deliberate, documented, safe no-op
+    (see that function's own docstring). Two distinct situations raise
+    this:
+
+    (1) `mark_run_published`/`mark_run_load_started`/`mark_run_committed`
+        matched zero rows -- the run was not in the exact prior status the
+        transition requires (e.g. `mark_run_committed` requires the run to
+        currently be `loading`). This is never silently treated as
+        success: an operator/caller must not be told a run committed when
+        its own `ingestion_run` row never actually made that transition
+        (see "Do not allow a committed run to be reset or overwritten
+        accidentally" in docs/RUNBOOK.md).
+
+    (2) `insert_ingestion_page` was called for a `(run_id, page_number)`
+        that already has a row on file, but with a different `object_key`,
+        `checksum`, or `source_record_count` than the row already
+        recorded -- an idempotent retry may only update mutable
+        verification/load-result columns (`accepted_count`,
+        `rejected_count`, `verified_at`, `status`); it must never silently
+        replace an already-recorded page's immutable identity with
+        conflicting values. This always indicates either a caller bug (a
+        `run_id`/page number reused for genuinely different content) or
+        upstream data corruption, and must fail loudly rather than
+        accept whichever value happened to arrive most recently."""
+
+    category = "operational_state"

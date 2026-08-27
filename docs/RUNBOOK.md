@@ -36,7 +36,7 @@ committed watermark. Repeat for each endpoint (`medical-claims`,
 `pharmacy-claims`, `eligibility`) your operational schedule needs -- each
 progresses independently; loading one never truncates or touches
 another endpoint's raw table, and each endpoint has its own watermark
-row in `ingest_ops.source_watermarks`.
+row in `<OPS_SCHEMA>.source_watermarks` (default schema name `ops`).
 
 Legacy full pipeline (all three tables, one manifest request), one
 command (requires `.env` populated -- see `scripts/setup_env.example`;
@@ -91,12 +91,12 @@ make health            # db_connect / migrations / freshness, exit 0 if healthy
 ## Recovering from a failed run
 
 Every run's stage, status, and error are recorded in
-`ingest_ops.ingestion_runs`/`table_loads` (see
+`<OPS_SCHEMA>.ingestion_runs`/`table_loads` (default schema name `ops`; see
 `migrations/002_ingestion_control.sql`). To inspect the most recent run:
 
 ```sql
 SELECT run_id, status, current_stage, error_category, error_message, started_at, finished_at
-FROM ingest_ops.ingestion_runs
+FROM ops.ingestion_runs
 ORDER BY started_at DESC
 LIMIT 5;
 ```
@@ -360,11 +360,41 @@ schema pair instead of its existing data. A deployment that already sets
 either variable explicitly is unaffected -- only the default changed,
 never override behavior.
 
-`migrations/006_object_storage_raw_contract.sql` is purely additive
-(new tables, new nullable columns, new grants) and safe to apply to any
-existing database regardless of whether you adopt the object-storage
-workflow -- the legacy CSV and local-filesystem-paginated workflows are
-completely unaffected by it.
+`migrations/007_object_storage_raw_contract.sql` (see "Migration
+numbering" below for why it is 007, not 006) and
+`008_operational_table_hardening.sql` are both purely additive (new
+tables, new nullable columns, new constraints/indexes, tightened grants)
+and safe to apply to any existing database regardless of whether you
+adopt the object-storage workflow -- the legacy CSV and
+local-filesystem-paginated workflows are completely unaffected by
+either.
+
+### Migration numbering
+
+`006_object_storage_raw_contract.sql` was renumbered to
+`007_object_storage_raw_contract.sql`. It was originally authored and
+committed under the `006_object_storage_raw_contract.sql` filename,
+landing on `dev` with the same numeric version as the already-present
+`006_record_quarantine.sql` (from an earlier PR). Two migration files
+sharing one numeric version is rejected outright by
+`migrations.discover()` (`MigrationError: duplicate migration version`)
+-- confirmed by running this repository's own unit test suite against
+its `migrations/` directory before the rename, which failed with
+exactly that error -- so neither file could ever have been successfully
+applied through `tuva-ingest migrate` while both existed under `006`.
+The file was therefore renumbered 006 -> 007 (a pure filename change;
+every byte of its SQL content is unchanged, so its checksum-tracked
+identity is unaffected for any deployment that never actually reached
+applying it) rather than renumbering `006_record_quarantine.sql`, since
+that file's version was established on `dev` first, chronologically. If
+you have a database where `006_object_storage_raw_contract.sql` was
+somehow applied directly (e.g. by hand, bypassing `tuva-ingest migrate`,
+which is the only scenario under which this could have happened),
+manually rename its `<OPS_SCHEMA>.schema_migrations` row's `version`/
+`filename` from `006`/`006_object_storage_raw_contract.sql` to
+`007`/`007_object_storage_raw_contract.sql` before running `tuva-ingest
+migrate` again, so the runner recognizes it as already applied rather
+than attempting to reapply it under its new filename.
 
 ## Building and validating the Input Layer transformation
 
@@ -436,8 +466,8 @@ OBJECT_STORAGE_TEST_SECRET_ACCESS_KEY=local-only-example-minio-secret-change-me 
 
 `tests/integration/` creates its own uniquely-suffixed
 `raw_test_<suffix>`/`ops_test_<suffix>` schemas and drops them (plus
-their throwaway roles) on teardown -- it never touches `raw`,
-`ingest_ops`, `input_layer`, or any name a real deployment would use.
+their throwaway roles) on teardown -- it never touches `raw_incoming`,
+`ops`, `input_layer`, or any name a real deployment would use.
 
 ## Upgrading the pinned Tuva package version
 
@@ -474,7 +504,7 @@ upgrade is a deliberate, single-commit, reviewed change.
   tokens themselves are never persisted anywhere by this connector
   (memory-only, per process), so there is nothing to rotate or revoke
   on this side beyond the client secret itself.
-- `ingest_ops.quarantined_records` contains PHI (see "Quarantined
+- `<OPS_SCHEMA>.quarantined_records` (default schema name `ops`) contains PHI (see "Quarantined
   records" below) and is access-restricted at the database level --
   `PUBLIC` and `TRANSFORM_ROLE` have no access, and `INGEST_ROLE` can
   only `INSERT`, never read it back. No dbt model or downstream
@@ -484,7 +514,7 @@ upgrade is a deliberate, single-commit, reviewed change.
 
 A structurally invalid record (missing/blank required identifier,
 wrong type, unrecognizable date shape) is written to
-`ingest_ops.quarantined_records` instead of its endpoint's raw table --
+`<OPS_SCHEMA>.quarantined_records` instead of its endpoint's raw table --
 see README.md's "Quarantine" section for the exact structural rules and
 the fixed reason-code allowlist. `load`/`sync`'s JSON result reports
 `quarantined_count`/`quarantined_by_reason` for the run, and each
@@ -495,7 +525,7 @@ non-reversible fingerprint -- never the record itself).
 No operational "quarantine review" role exists in this repository's
 role model yet -- `INGEST_ROLE` itself cannot read this table back (by
 design), so an operator must explicitly `GRANT SELECT ON
-ingest_ops.quarantined_records TO <a role you create and control>`
+<OPS_SCHEMA>.quarantined_records TO <a role you create and control>`
 before anyone can review quarantined records, and should scope that
 role as narrowly as any other PHI-bearing access in your environment
 (audited, time-limited, least-privilege). This repository deliberately
@@ -510,6 +540,141 @@ retried automatically -- if the source later sends a corrected version
 of the same logical record, it arrives as a new record in a later
 `extract` run and is reclassified independently; there is no
 "un-quarantine" operation in this connector today.
+
+## Operational tables: operator queries and recovery
+
+Covers the object-storage-backed workflow's five canonical tables
+(`ingestion_run`, `ingestion_page`, `ingestion_cursor`, `rejected_record`,
+`schema_observation`, all in `<OPS_SCHEMA>`, default `ops`) -- see
+`docs/SOURCE_CONTRACT.md` "Operational tables" for the full contract
+each query below is exercising. `<OPS_SCHEMA>` below is a placeholder
+for your actual configured schema name -- substitute it (or `ops`, the
+default) before running any of these; never hard-code a different
+literal schema name into a saved query without re-checking your
+deployment's `OPS_SCHEMA` value first.
+
+**Recent runs and their status:**
+
+```sql
+SELECT run_id, vendor, endpoint, load_date, status,
+       started_at, published_at, load_started_at, committed_at, failed_at
+FROM <OPS_SCHEMA>.ingestion_run
+ORDER BY started_at DESC
+LIMIT 20;
+```
+
+**Failed pages, across every run:**
+
+```sql
+SELECT run_id, page_number, object_key, status, retrieved_at, verified_at
+FROM <OPS_SCHEMA>.ingestion_page
+WHERE status = 'failed'
+ORDER BY run_id, page_number;
+```
+
+**Rejection reasons for a given endpoint (or run):**
+
+```sql
+SELECT reason_code, count(*)
+FROM <OPS_SCHEMA>.rejected_record r
+JOIN <OPS_SCHEMA>.ingestion_run ir ON ir.run_id = r.run_id
+WHERE ir.endpoint = 'eligibility'   -- or: WHERE r.run_id = '<run_id>'
+GROUP BY reason_code
+ORDER BY count(*) DESC;
+```
+
+This query only reaches `reason_code`/counts -- `INGEST_ROLE` cannot
+`SELECT` `rejected_record` at all (INSERT-only, see
+`docs/SOURCE_CONTRACT.md` "Rejected-record security and access"), so run
+it as a role with an explicit, narrowly-scoped `GRANT SELECT` on this
+one table, never as `INGEST_ROLE` itself.
+
+**Current cursor state for every endpoint:**
+
+```sql
+SELECT vendor, endpoint, committed_cursor, successful_run_id, committed_at, lock_version
+FROM <OPS_SCHEMA>.ingestion_cursor
+ORDER BY vendor, endpoint;
+```
+
+**Recent schema-drift observations for an endpoint:**
+
+```sql
+SELECT field_path, observed_type, occurrence_count, first_observed_at, last_observed_at
+FROM <OPS_SCHEMA>.schema_observation
+WHERE vendor = 'acme' AND endpoint = 'medical_claim'
+ORDER BY last_observed_at DESC
+LIMIT 50;
+```
+
+A field path that recently gained a *new* `observed_type` for the same
+`field_path` (two rows, same `field_path`, different `observed_type`,
+both with a recent `last_observed_at`) is the drift signal to
+investigate -- this table never records a value, only the shape.
+
+### Recovering a run left in `running`, `published`, or `loading` after a crash
+
+Every object-storage-backed transition is either auto-committed
+immediately (so a crash a moment later still leaves accurate status
+visible) or part of the one atomic load transaction (so a crash mid-load
+rolls the whole transaction back automatically on the next connection
+that touches it -- PostgreSQL itself abandons an uncommitted transaction
+when its connection drops). Recovery is always **inspect the run's
+current status, then re-run the same command** -- never manually
+`UPDATE ... SET status = ...` (that bypasses every guard
+`errors.OperationalStateError`/`errors.CursorError` exist to enforce):
+
+- **`running`** (crashed during extraction, before any page was
+  published): nothing was durably published to object storage yet.
+  Just re-run `tuva-ingest extract --storage object-storage --endpoint
+  <name> ...` -- it mints a fresh `run_id`; the stale `running` row for
+  the old `run_id` is harmless, inert history (it will never transition
+  further, since nothing will ever call `mark_run_load_started` for a
+  `run_id` extraction never got to `--run-id`).
+- **`published`** (extraction completed and every page/manifest/success
+  marker is durable, but `load --run-id <run_id>` was never run or
+  crashed before opening its transaction): the run is fully replayable.
+  Run `tuva-ingest load --run-id <run_id>` -- `object_storage.verify`
+  re-verifies every page from durable storage before touching the
+  database, so this is exactly as safe as the first attempt would have
+  been.
+- **`loading`** (crashed inside the one atomic load transaction, after
+  `mark_run_load_started` committed but before `mark_run_committed`
+  committed): PostgreSQL has already rolled back the abandoned
+  transaction -- no raw rows, page rows, rejected records, or schema
+  observations from the interrupted attempt are visible, and the cursor
+  is untouched. The `ingestion_run` row itself is left showing `loading`
+  (a true, accurate record that the last attempt did not finish) until
+  you act. Simply re-run `tuva-ingest load --run-id <run_id>` --
+  `mark_run_load_started`'s guard requires the run to currently be
+  `published`, not `loading`, so **this one case needs a manual
+  decision first**: confirm no *other* `load` process is still actually
+  running for this `run_id` (check for an open, long-running transaction
+  against `<OPS_SCHEMA>.ingestion_cursor`/`ingestion_run` for this
+  `run_id`, e.g. via `pg_stat_activity`), then reset the row back to
+  `published` so the retry's guard accepts it:
+
+  ```sql
+  UPDATE <OPS_SCHEMA>.ingestion_run
+  SET status = 'published', load_started_at = NULL
+  WHERE run_id = '<run_id>' AND status = 'loading';
+  ```
+
+  This is the one operator-performed exception to "never manually
+  UPDATE status" -- it is only ever safe because `loading` with no live
+  transaction behind it is, by construction, byte-for-byte equivalent to
+  `published` (every actual data change from the interrupted attempt was
+  already rolled back by PostgreSQL itself). Never do this while any
+  process might still be genuinely mid-load for that `run_id`.
+- **`committed`**: terminal success. Re-running `load --run-id <run_id>`
+  for a `committed` run now correctly raises
+  `errors.OperationalStateError` (`mark_run_load_started` requires
+  `published`) rather than silently reprocessing it -- this is
+  intentional, not a bug to work around.
+- **`failed`**: terminal. Investigate `failure_category`/
+  `failure_message` (both sanitized), fix the underlying cause, and
+  start a **new** `extract` (a `failed` run's `run_id` is never reused).
+
 
 ## Known limitations (Input Layer transformation)
 

@@ -1,6 +1,6 @@
 """Deterministic, PHI-free schema drift observation for one source
 record (see docs/SOURCE_CONTRACT.md "Schema observation" and
-migrations/006_object_storage_raw_contract.sql for the
+migrations/007_object_storage_raw_contract.sql for the
 `schema_observation` table this feeds).
 
 Walks a decoded JSON object recursively and records exactly two things

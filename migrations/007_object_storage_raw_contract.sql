@@ -1,4 +1,20 @@
--- migrations/006_object_storage_raw_contract.sql
+-- migrations/007_object_storage_raw_contract.sql
+--
+-- NOTE on numbering: this file was originally authored/committed as
+-- "006_object_storage_raw_contract.sql", landing on `dev` with the same
+-- numeric version as the already-present migrations/006_record_quarantine.sql
+-- (committed earlier, in PR #22). Two files sharing one numeric prefix is
+-- rejected outright by src/tuva_ingest/migrations.py's discover() ("duplicate
+-- migration version"), so neither file could ever have been successfully
+-- applied through the migration runner in that state -- confirmed by running
+-- the existing unit test suite against this repository's own migrations/
+-- directory before this rename, which failed with exactly that error. This
+-- migration is therefore renumbered 006 -> 007 (a pure filename change --
+-- every byte of this file's SQL content is unchanged) rather than renumbering
+-- 006_record_quarantine.sql, since that file's version was established on
+-- `dev` first, chronologically. See docs/RUNBOOK.md "Migration numbering"
+-- and migrations/008_operational_table_hardening.sql for the follow-up
+-- migration that completes the gaps this renumbering exposed.
 --
 -- Forward-only addition supporting the object-storage-backed ingestion
 -- workflow (see src/tuva_ingest/object_storage/, object_extract.py,

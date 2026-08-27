@@ -98,7 +98,7 @@ every problem found) before any artifact is downloaded.
 ## Run identifiers in this legacy path
 
 `tuva-ingest run` mints its own `run_id` (`run-<uuid4 prefix>`) for its
-`ingest_ops.ingestion_runs` bookkeeping row, independent of the
+`<OPS_SCHEMA>.ingestion_runs` (default schema name `ops`) bookkeeping row, independent of the
 manifest's own `snapshot_id`. `tuva-ingest load-raw [--snapshot-id ...]`
 does the same (`load-<snapshot_id>-<random suffix>`). Neither is the
 same `run_id` concept the paginated `extract`/`load`/`sync` commands use

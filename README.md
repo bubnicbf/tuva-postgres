@@ -548,7 +548,7 @@ record present in both raw and quarantine) is ever left visible.
 
 ### High-water mark semantics
 
-`ingest_ops.source_watermarks` (`migrations/005_paginated_extraction_state.sql`)
+`<OPS_SCHEMA>.source_watermarks` (default schema name `ops`; `migrations/005_paginated_extraction_state.sql`)
 stores one durable, committed high-water mark per `(source, endpoint)`.
 `sync` (and a plain `extract --endpoint <name>` with no `--since`)
 resolves the endpoint's last committed watermark automatically
@@ -666,40 +666,61 @@ make local-db-reset     # DESTRUCTIVE: also drops the data volume
 
 ## Migrations
 
-`migrations/001_operational_schemas.sql`, `002_ingestion_control.sql`,
-`003_roles_and_grants.sql`, `004_endpoint_scoped_ingestion.sql`,
-`005_paginated_extraction_state.sql`, and
-`006_object_storage_raw_contract.sql` are the only DDL this repository
-owns: the raw and operational-control schemas, run/table-load
-bookkeeping tables, least-privilege role grants, (004) the
-`endpoint`/`requested_since` columns on `ingestion_runs` plus the unique
-index on `table_loads (run_id, table_name)` that makes
+`migrations/001_operational_schemas.sql` through
+`008_operational_table_hardening.sql` (eight files, versions 001-008,
+one unique numeric version each -- enforced by `migrations.discover()`,
+which raises `MigrationError` outright on a duplicate) are the only DDL
+this repository owns: (001-003) the raw and operational-control schemas,
+run/table-load bookkeeping tables, least-privilege role grants, (004)
+the `endpoint`/`requested_since` columns on `ingestion_runs` plus the
+unique index on `table_loads (run_id, table_name)` that makes
 `tuva-ingest load --run-id ...` safe to repeat, (005) the
-`ingest_ops.source_watermarks` table (the durable per-`(source,
+`<OPS_SCHEMA>.source_watermarks` table (the durable per-`(source,
 endpoint)` high-water mark `load`/`sync` commit into -- see "High-water
 mark semantics" above) plus five new nullable metadata columns and a new
 unique index (`(_snapshot_id, _source_row_number)`) on each of the three
 raw tables, which is what makes the paginated loader's `INSERT ... ON
-CONFLICT DO NOTHING` idempotency possible, and (006) the object-storage-
-backed workflow's canonical operational model -- five new SINGULAR
-tables (`ingestion_run`, `ingestion_page`, `ingestion_cursor`,
-`rejected_record`, `schema_observation`; the pre-existing PLURAL
-`ingestion_runs`/`table_loads`/`source_watermarks` above are untouched
-and remain the legacy/local-filesystem workflows' own tables) plus seven
-new nullable raw-metadata columns and a source-stable partial unique
-index on each raw table, and least-privilege grants for the new tables
--- see `docs/SOURCE_CONTRACT.md` "Object storage" for the full contract.
-They are checksum-tracked
-(`src/tuva_ingest/migrations.py`), applied at most once each, and
-rerunning `tuva-ingest migrate` against an already-migrated database is
-always a true no-op. Dynamic identifiers (schema/role names) use
-psql-style `:"name"` substitution, validated against the same shared
-identifier policy every other dynamic-SQL call site uses -- see
-`migrations.py`'s module docstring for why static SQL alone can't
-express this. Migrations are immutable once applied -- 004 and 005 each
-only add nullable columns and new indexes/tables; neither rewrites an
-earlier migration, and any future change is a new, forward-only,
-numbered migration file.
+CONFLICT DO NOTHING` idempotency possible, (006) the restricted
+`quarantined_records` table for the legacy/local-filesystem structural-
+validation workflow, (007) the object-storage-backed workflow's
+canonical operational model -- five new SINGULAR tables (`ingestion_run`,
+`ingestion_page`, `ingestion_cursor`, `rejected_record`,
+`schema_observation`; the pre-existing PLURAL `ingestion_runs`/
+`table_loads`/`source_watermarks` above, and `quarantined_records`, are
+untouched and remain the legacy/local-filesystem workflows' own tables
+-- see `docs/SOURCE_CONTRACT.md` "Operational tables" for exactly which
+workflow owns which table) plus seven new nullable raw-metadata columns
+and a source-stable partial unique index on each raw table, and
+least-privilege grants for the new tables, and (008) hardening on top of
+007: a SHA-256-format `CHECK` on `ingestion_page.checksum`, an enumerated
+`reason_code` and bounded `detail` on `rejected_record` (matching 006's
+already-established pattern for `quarantined_records`), tightened
+`INGEST_ROLE` grants on `rejected_record` (INSERT-only, not the
+SELECT/INSERT/UPDATE 007 granted uniformly to all five new tables), and
+an index supporting cross-run page-status investigation -- see
+`docs/SOURCE_CONTRACT.md` "Operational tables" for the full contract.
+
+(007 was originally authored as `006_object_storage_raw_contract.sql`
+and landed on `dev` sharing that numeric version with the
+already-present `006_record_quarantine.sql` -- a genuine duplicate that
+`migrations.discover()` rejects outright, so neither file could ever
+have been successfully applied through the migration runner while both
+existed. It was renumbered 006 -> 007, a pure filename change with the
+SQL content byte-for-byte unchanged, rather than renumbering
+`006_record_quarantine.sql`, since that file's version was established
+on `dev` first. See that file's own header note.)
+
+Every migration is checksum-tracked (`src/tuva_ingest/migrations.py`),
+applied at most once each, and rerunning `tuva-ingest migrate` against
+an already-migrated database is always a true no-op. Dynamic identifiers
+(schema/role names) use psql-style `:"name"` substitution, validated
+against the same shared identifier policy every other dynamic-SQL call
+site uses -- see `migrations.py`'s module docstring for why static SQL
+alone can't express this. Migrations are immutable once applied -- every
+migration after 003 only adds nullable columns, new tables, new
+indexes, new constraints, or tightens grants; none rewrites an earlier
+migration, and any future change is a new, forward-only, numbered
+migration file.
 
 ## dbt project
 
@@ -1055,12 +1076,12 @@ where table_name in ('eligibility', 'medical_claim', 'pharmacy_claim');
 - **Migrations**: checksum-tracked and applied at most once;
   `apply_pending` takes a PostgreSQL advisory lock so concurrent runs
   never race.
-- **Run state**: `ingest_ops.ingestion_runs`/`table_loads` (see
+- **Run state**: `<OPS_SCHEMA>.ingestion_runs`/`table_loads` (default schema name `ops`; see
   `migrations/002_ingestion_control.sql`, extended by
   `migrations/004_endpoint_scoped_ingestion.sql`) record every run's
   stage, status, endpoint, row counts, and errors. A run can only leave
   `running` exactly once per attempt (see `src/tuva_ingest/state.py`).
-- **Watermark state**: `ingest_ops.source_watermarks` (see
+- **Watermark state**: `<OPS_SCHEMA>.source_watermarks` (default schema name `ops`; see
   `migrations/005_paginated_extraction_state.sql`) records one durable
   high-water mark per `(source, endpoint)`, advanced only by a fully
   successful `load`/`sync` transaction -- see "High-water mark
